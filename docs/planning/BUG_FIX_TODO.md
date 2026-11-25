@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 daemon repairs — integration qualification in progress
+## November 25 daemon repairs — qualified, publication pending
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
 The separate overdue-turn repair is `bd-daemon-overdue-tick-cooperation-z3qax`;
@@ -8,6 +8,47 @@ its code and native regression coverage stay together and block final startup
 repair qualification. Close the two bugs only on their own original criteria.
 Retire this active block at qualified publication or handoff with explicit
 unmet criteria; preserve its history. Beads remains the task authority.
+
+Final qualified code: `e8043378ad24db7d892e32f87c8bb2182e86e860`.
+All eighteen unchanged stock labels PASS, terminal 0, no label skips,
+08:54:40–09:55:39 UTC, 3,659.25 seconds. `stock-gate-v9-result.json` binds
+the clean unchanged source and log SHA256
+`45f5c19e525ae30987e2fe7b06d845ce34343db0fd71b94e030681622f97ec68`.
+Execution is native thinkstation1, original UID/groups, private 4 GiB tmpfs;
+remote admission refusals earn no test credit. The lockfile and stock script
+are unchanged, and `fast_cmaes` remains clean at `18b39102`. Results include
+fsfs 3,366/0/16, schema/conformance 120/0/0, facade library 618/0/0 and native
+CLI 407/0/0. The original sixteen ignored fsfs tests are unchanged; the named
+real-model startup probe is explicitly executed. Same-source optional graph
+strict Clippy and 26/0/0 regressions pass; `graph-feature-tests-v4-result.json`
+records log SHA256 `b2159bffdfa83fb5ccea0aa459cf4805711b4f3678103d696585f08538472559`.
+
+Fresh solo original acceptance is complete. `final-v9-fairness-result.json`
+binds three intended old-ELF failures (exit 101) and three repaired passes
+(exit 0), retaining the exact count/drop/socket/shutdown oracles. Final unit
+ELF SHA256: `3661ccde714173820dcb79408bf647b98d86ca7a4e273d03d0a1ea0990773f22`.
+`final-v9-acceptance-result.json` binds the real-model startup baseline's
+main-count failure and all seven installed-default scenarios passing in
+77.09 seconds. Installed default ELF SHA256:
+`7aaad237a1241ffd422f2e5bf93c56d20dcfa9bb14cc5b6b131d74709a297a02`;
+harness SHA256: `2166ceb8ee1c394b1cc4bbd26415d8ef7b1475b59a7eeb8b0bc88edc0eaf0c56`.
+Both original Bead descriptions remain byte-identical to their creation files.
+
+`post-v9-product-checks-result.json` completes at terminal 0 with clean
+unchanged source. The retained normal native CLI ELF is
+`/data/tmp/fs-daemon-startup.sKDROXdS/native-cli-e8043378`, SHA256
+`82ec438f6c8e8f0fd008981fe4cf52b3a4c0aec01bd66a5b4e791bbff1613f24`.
+`native-preview-product-v2-result.json` records all twelve predeclared actual
+Potion/MiniLM command outcomes, including both proper refusals, in 104.97s.
+`warm-coverage-product-v1-result.json` records fourteen actual-model
+observations in 74.85s: exact promotes partial coverage to full; HNSW retires
+quality; denied requests preserve authority/lock and create no successor;
+same-stream and fresh-process queries use the committed default and IDs.
+Artifact roots: `/home/ubuntu/.native-preview-s4kkncyo` and
+`/home/ubuntu/.native-warm-coverage-rfdjyzl6`. These are solo functional checks,
+not independent certification, performance wins, full Quill campaigns or
+binary/crate release qualification. Both bugs remain in progress until code
+publication and original-criteria closure; broader Beads remain unchanged.
 
 - [x] Refresh current source and governing instructions; preserve the dirty
   shared checkout and fast-forward the clean isolated checkout to `b27feb94`.
@@ -91,7 +132,7 @@ startup production/test implementation are byte-identical to `b692f5d4`.
 - [x] Repair the demonstrated default-feature graph integration lint with a
   feature-gated private argument and conditional local mutability. Preserve the
   graph algorithm and all strict lint settings.
-- [ ] Freeze the combined source; pass all eighteen unchanged stock labels.
+- [x] Freeze the combined source; pass all eighteen unchanged stock labels.
 - [x] Pass strict Clippy with the optional graph feature and execute its actual
   graph-filtered library regressions at clean `7a7dee9a`: 26 passed, zero failed
   or ignored, including the incoming refinement cases. Retain this separate
@@ -124,7 +165,7 @@ startup production/test implementation are byte-identical to `b692f5d4`.
 - [x] Preserve the additional upstream cache/recovery work at `de47fbda` before
   freezing the next combined source. Review producer-contract invalidation,
   cancellation/epoch fencing, legacy raw adapters and neutral recovery advice.
-- [ ] Requalify the optional graph feature on this combined source: its cache
+- [x] Requalify the optional graph feature on this combined source: its cache
   dependency changed, so the earlier graph result cannot qualify this tree.
 - [x] Retain v7's strict-Clippy failure in the incoming legacy sync test
   provider. Return its literal as `&'static str`, preserving the trait contract,
@@ -170,13 +211,13 @@ Strict fsfs all-target Clippy and formatting pass. Two-file UBS exits 0:
 0 critical, 437 warnings, 88 informational; all nineteen touched findings are
 test assertions/unwraps, fixed 0/1 diagnostic indices or checks after length
 validation. No annotation is added. This admits exactly two diagnostic kinds;
-no performance rows or WIN/LOSE decisions are admitted. Full clean-source
-qualification remains pending. The refreshed Mac admission at 08:30 UTC is
+no performance rows or WIN/LOSE decisions are admitted. V8 is failed history;
+the later full clean-source qualification is recorded above. Mac admission at 08:30 UTC is
 still refused: 20.26 GiB available against the unchanged 40 GiB requirement;
 `macos-admission-refresh-v2-command.json` records actual exit 1.
-- [ ] Repeat the original baseline/default-installed-binary acceptance pair on
+- [x] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
-- [ ] Repeat the twelve actual-model native preview command outcomes and add
+- [x] Repeat the twelve actual-model native preview command outcomes and add
   fourteen predeclared actual-model warm coverage observations: exact promotes
   partial coverage to full, HNSW retires quality, denied requests preserve the
   authority, and same-stream/fresh-process queries use the committed selection.
@@ -283,11 +324,13 @@ the three touched-line findings are deliberate native test setup unwraps.
 Strict fsfs all-target Clippy passes. Both bug closures still require the full
 combined stock run, fresh solo original-criteria re-execution and publication.
 
-Real-work worksheet (this startup repair and its integrated validation): the
+Real-work worksheet (these repairs and their integrated validation): the
 README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:
 `b692f5d4` fixes startup compaction with its real-model test; `b286a61d` connects
 the missing native preview APIs and repairs demonstrated test-driver defects;
-the merge preserves identical qualified bytes. By work item: USER 2, ENABLER 1
+`d327790c` fixes overdue daemon cooperation with its native regressions;
+upstream warm/graph/cache/recovery changes retain their authorship. By work
+item: USER 3, ENABLER 1
 (executed qualification), PROCESS 1 (requested tracking/publication record),
 UNKNOWN 0. The two-minute demonstration is append, start daemon, inspect both
 merged tiers and query the appended document. Removing the tracking would not
@@ -308,25 +351,30 @@ Honesty inventory (bounded to these changes and retained attempts):
 3. No (checked: golden/config/dependency diffs): no golden regeneration.
 4. Yes: three explained local UBS annotations classify existing test-only panic
    sentinels; their bodies remain intact and the unannotated production control
-   still blocks. Two demonstrated test-driver defects are corrected above,
-   preserving/strengthening assertions; production cache behavior is unchanged.
+   still blocks. Three earlier driver defects and two consumers of the expanded
+   advice fixture are corrected above, preserving/strengthening old assertions.
+   Those corrections change no production cache, policy, threshold or budget;
+   the separately preserved upstream cache change is qualified on final source.
 5. No (checked: runtime/API diffs): no demo-path, environment or benchmark branch.
-6. No (checked: actual result counts): named probe 1/7 scenarios, native 402,
-   corrected core 2, live native commands 12 and all eighteen terminal labels.
+6. No (checked: actual result counts): startup 1/7 scenarios, three paired
+   ownership probes, graph 26, fsfs 3,366/0/16, facade 618/0/0, native 407/0/0,
+   twelve live command outcomes, fourteen warm observations, eighteen labels.
 7. No (checked: command logs/receipts): no unexecuted check reported as passed.
 8. No (checked: execution classes): baseline remote build is distinguished from
    native qualification; synthetic existing unit providers are not live proof.
 9. No (checked: failed receipts and progress comments): copy race, wrong expected
    CRC diagnostic, WAL-quarantine defect, upstream compile/lint failures, both
-   failed native tests and the retired first stock run remain visible.
+   failed native tests, all retired gates, the missed work-path collision,
+   overdue-turn failures and both fixture-consumer failures remain visible.
 10. No (checked: command redirections): stdout/stderr evidence is retained.
-11. No (checked: Beads): the owned bug remains in progress until publication;
+11. No (checked: Beads): both owned bugs remain in progress until publication;
     broader migration, performance and release acceptance remains open.
 12. No (checked: original Bead description): acceptance/specification unchanged.
 13–17. Not applicable: truly solo; the prior prototype is credited and rechecked,
     and no peer report or agreement substitutes for executed verification.
-18. No (checked: declarations): seven scenarios, eighteen labels and twelve live
-    command outcomes were selected before their results.
+18. No (checked: declarations): seven startup scenarios, three ownership probes,
+    eighteen labels, twelve live outcomes, fourteen warm observations and both
+    explicit new diagnostic-kind checks were selected before their results.
 19. The copy race and initial test assumptions warranted explanation; both were
     disclosed and corrected, with failed runs preserved. No independent review
     or competitive/performance/binary-release qualification is claimed.
