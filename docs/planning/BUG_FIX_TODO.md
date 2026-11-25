@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 idle compactor writer progress — qualified, publication pending
+## November 25 idle compactor writer progress — qualified source published
 
 `bd-idle-compactor-writer-progress-u5mm1`, OrangeSparrow. Existing ready
 queue is empty; blocked publisher migration and peer-owned work remain intact.
@@ -38,10 +38,12 @@ Cargo cache and retained separately, as recorded in
   and native versus remote execution class; do not weaken acceptance.
 - [x] Review the final production/test changes, run UBS and diff checks,
   then perform fresh solo original acceptance against the frozen revision.
-- [ ] Publish only qualified source and this scoped Bead row; verify both
+- [x] Publish only qualified source and this scoped Bead row; verify both
   remote refs and preserve every unrelated published tracker row.
-- [ ] Close only with cited published evidence, export status, release the
-  exact owned leases, and report remaining release/migration limits.
+- [x] Close only with cited published evidence and export the closed status;
+  keep release/migration limits explicit. Post-commit ref verification and
+  release of the exact seven owned leases are recorded in
+  `idle-final-publication-result.json` after the final status push.
 
 Initial focused controls: 25/0/0 native tests; preserved log
 `/data/tmp/fs-idle-compactor-focused-unit-v1.log`. Remote compiler check
@@ -161,6 +163,22 @@ before closure. Earlier 605fcb87 CLI checks are separate subjects, not the
 installed-default proof. All referenced run receipts live under
 `/data/tmp/fs-daemon-startup.sKDROXdS` unless otherwise stated.
 
+Qualified code and its in-progress Bead evidence were published and both
+remote refs verified at `ccf5d50f666c5f569e2425587c2e8c17a09265fd`,
+12:24:03 UTC, before closure. `idle-source-publication-result.json` binds that
+ordering and confirms the production/test/gate/lock body is unchanged from
+qualified `b39f432d`. Only then was the bug closed at 12:24:26 UTC on its
+original description, and closed status exported. Initial source publication
+preserves all 1,491 unrelated published rows. The final status export also
+updates the owned release Bead's two scoped comments (5454 and 5460), retaining
+its original description and in-progress state; all 1,490 other rows remain
+byte-identical. Active dependency cycles are zero and no ready work remains.
+This block records a completed product repair. After the final status push,
+`idle-final-publication-result.json` records the actual final refs and exact
+reservation release; this document does not pretend to contain its own Git
+commit ID or a post-commit event before it happens. The dated block retires
+from active work after that recorded confirmation; broader Beads stay open.
+
 Release remains open. Fresh unchanged DSR Mac admission at 12:10:37 UTC
 refuses 22.20 GiB free against the configured two-slot 40 GiB floor:
 `/data/tmp/fs-idle-compactor-macos-admission-v2.json`, SHA256
@@ -212,8 +230,8 @@ skill's worksheet):
    old failed/withdrawn receipts are preserved, not silently replaced.
 10. No (checked runner redirections): all cited stderr is retained in combined
     or separate logs; no evidence command silences it.
-11. No (checked statuses): this bug stays in progress until qualified source
-    is published; no release or peer task is closed from these checks.
+11. No (checked statuses/publication timestamps): this bug closed only after
+    both refs held the qualified source. No release or peer task is closed.
 12. No (checked creation description and unrelated rows): original acceptance
     is byte-identical; no requirement or plan was rewritten as implementation.
 13–17. N/A, genuinely solo: no agent/pane delegation, peer certification or
