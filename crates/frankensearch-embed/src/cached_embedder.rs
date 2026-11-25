@@ -5,6 +5,8 @@
 //! entries retain the provider's actual complete response and are keyed by its
 //! independently admitted identity and the query. Raw entries can never supply
 //! bound requests. Bound batches bypass the cache and are never deduplicated.
+//! Raw entries retain one observed producer contract: changing that contract
+//! invalidates them and fences outstanding fills without disturbing bound data.
 //!
 //! The cache uses FIFO eviction with a bounded capacity (default 128 entries).
 //! Cache hits return a cloned `Vec<f32>`, which is cheap (~1.5 KiB for 384-dim).
@@ -70,6 +72,16 @@ enum CacheKey {
     Bound(BoundCacheKey),
 }
 
+/// Cache invalidation observations, never authority for a bound response.
+/// A legacy provider may explicitly lack identity; its name and dimension can
+/// reject obvious drift but cannot establish embedding-space compatibility.
+#[derive(Clone, PartialEq, Eq)]
+struct RawProviderContract {
+    identity: Option<Arc<EmbeddingIdentityBundleV1>>,
+    id: String,
+    dimension: usize,
+}
+
 /// S3-FIFO query-embedding cache (Yang et al., SOSP 2023), entry-count form.
 ///
 /// Three queues over both entry maps: **Small** (new/one-hit-wonder admissions,
@@ -83,6 +95,8 @@ enum CacheKey {
 /// never gives raw callers an entry or allocates a second independent budget.
 struct CacheState {
     entries: HashMap<String, CacheEntry<Vec<f32>>>,
+    raw_contract: Option<RawProviderContract>,
+    raw_epoch: Arc<()>,
     bound_entries: HashMap<BoundCacheKey, CacheEntry<IdentityBoundEmbedding>>,
     small: VecDeque<CacheKey>,
     main: VecDeque<CacheKey>,
@@ -102,6 +116,8 @@ impl CacheState {
     fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(capacity),
+            raw_contract: None,
+            raw_epoch: Arc::new(()),
             bound_entries: HashMap::new(),
             small: VecDeque::new(),
             main: VecDeque::new(),
@@ -117,10 +133,23 @@ impl CacheState {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Vec<f32>> {
-        if let Some(entry) = self.entries.get_mut(key) {
-            self.hits += 1;
-            entry.freq = entry.freq.saturating_add(1).min(FREQ_CAP);
+    fn select_raw_contract(&mut self, contract: &RawProviderContract) {
+        if self.raw_contract.as_ref() == Some(contract) {
+            return;
+        }
+        self.raw_contract = Some(contract.clone());
+        self.raw_epoch = Arc::new(());
+        self.entries.clear();
+        self.small.retain(|key| matches!(key, CacheKey::Bound(_)));
+        self.main.retain(|key| matches!(key, CacheKey::Bound(_)));
+        self.ghost.retain(|key| matches!(key, CacheKey::Bound(_)));
+        self.ghost_set.retain(|key| matches!(key, CacheKey::Bound(_)));
+    }
+
+    fn lookup_raw(&mut self, key: &str) -> Option<Vec<f32>> {
+        if let Some(entry) = self.entries.get(key) {
+            // Producer callbacks must run outside the mutex before a hit is
+            // accepted, just as for an identity-bound entry.
             Some(entry.value.clone())
         } else {
             self.misses += 1;
@@ -128,11 +157,11 @@ impl CacheState {
         }
     }
 
-    /// Record a hit that was served without a fresh lookup — used for an in-batch
-    /// duplicate query that folds onto another slot's just-computed embedding, so
-    /// batch stats match the old per-text loop (dup = hit, not a second miss).
-    fn record_hit(&mut self) {
+    fn record_raw_hit(&mut self, key: &str) {
         self.hits += 1;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.freq = entry.freq.saturating_add(1).min(FREQ_CAP);
+        }
     }
 
     fn lookup_bound(&mut self, key: &BoundCacheKey) -> Option<IdentityBoundEmbedding> {
@@ -263,6 +292,8 @@ impl CacheState {
 
     fn clear(&mut self) {
         self.epoch = Arc::new(());
+        self.raw_epoch = Arc::new(());
+        self.raw_contract = None;
         self.entries.clear();
         self.bound_entries.clear();
         self.small.clear();
@@ -295,6 +326,10 @@ impl CacheState {
 /// one finite, correctly sized vector per distinct miss. An invalid batch never
 /// inserts a valid-looking prefix into the cache. Cancellation after inference
 /// takes precedence over either a successful response or a provider error.
+/// Raw cache hits and fills require the provider to retain its observed complete
+/// identity, dimension and identifier. A changed contract invalidates only raw
+/// entries. Explicitly identity-less custom providers remain usable, with name
+/// and dimension checks that reject drift without attesting a semantic space.
 ///
 /// # Construction
 ///
@@ -375,24 +410,102 @@ impl CachedEmbedder {
         }
     }
 
+    fn native_identity_matches_dimension(
+        identity: &EmbeddingIdentityBundleV1,
+        dimension: usize,
+    ) -> bool {
+        identity.validate().is_ok()
+            && usize::try_from(identity.space.dimension).ok() == Some(dimension)
+            && identity.storage.quantization == QuantizationFormat::F32
+            && identity.storage.format.starts_with("in-memory-")
+            && matches!(
+                identity.storage.endianness.as_str(),
+                "native-f32-values" | "native-test-only"
+            )
+    }
+
     fn capture_bound_identity(&self) -> SearchResult<EmbeddingIdentityBundleV1> {
         let identity = self
             .inner
             .identity()
             .map_err(|_| Self::bound_identity_error())?
             .clone();
-        if identity.validate().is_err()
-            || usize::try_from(identity.space.dimension).ok() != Some(self.inner.dimension())
-            || identity.storage.quantization != QuantizationFormat::F32
-            || !identity.storage.format.starts_with("in-memory-")
-            || !matches!(
-                identity.storage.endianness.as_str(),
-                "native-f32-values" | "native-test-only"
-            )
-        {
+        if !Self::native_identity_matches_dimension(&identity, self.inner.dimension()) {
             return Err(Self::bound_identity_error());
         }
         Ok(identity)
+    }
+
+    fn raw_identity_error() -> SearchError {
+        SearchError::UnverifiableRemoteSpace {
+            producer: "embedding.cache.raw".to_owned(),
+            reason: "raw producer does not retain the observed identity, identifier and native-f32 dimension"
+                .to_owned(),
+        }
+    }
+
+    fn raw_identity_is_absent(field: &str) -> bool {
+        matches!(field, "embedder.identity" | "sync_embedder.identity")
+    }
+
+    fn capture_raw_contract(&self) -> SearchResult<RawProviderContract> {
+        let identity = match self.inner.identity() {
+            Ok(identity) => Some(Arc::new(identity.clone())),
+            Err(SearchError::InvalidConfig { field, .. })
+                if Self::raw_identity_is_absent(&field) =>
+            {
+                None
+            }
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            Err(_) => return Err(Self::raw_identity_error()),
+        };
+        let dimension = self.inner.dimension();
+        if identity
+            .as_ref()
+            .is_some_and(|identity| !Self::native_identity_matches_dimension(identity, dimension))
+        {
+            return Err(Self::raw_identity_error());
+        }
+        Ok(RawProviderContract {
+            identity,
+            id: self.inner.id().to_owned(),
+            dimension,
+        })
+    }
+
+    fn validate_raw_producer(&self, expected: &RawProviderContract) -> SearchResult<()> {
+        let identity_matches = match (&expected.identity, self.inner.identity()) {
+            (Some(expected), Ok(actual)) => actual == expected.as_ref(),
+            (None, Err(SearchError::InvalidConfig { field, .. })) => {
+                Self::raw_identity_is_absent(&field)
+            }
+            (_, Err(error @ SearchError::Cancelled { .. })) => return Err(error),
+            _ => false,
+        };
+        if identity_matches
+            && self.inner.dimension() == expected.dimension
+            && self.inner.id() == expected.id
+        {
+            Ok(())
+        } else {
+            Err(Self::raw_identity_error())
+        }
+    }
+
+    fn admit_raw_outcome<T>(
+        &self,
+        cx: &Cx,
+        expected: &RawProviderContract,
+        outcome: SearchResult<T>,
+    ) -> SearchResult<T> {
+        cache_checkpoint(cx)?;
+        if matches!(&outcome, Err(SearchError::Cancelled { .. })) {
+            return outcome;
+        }
+        let producer = self.validate_raw_producer(expected);
+        cache_checkpoint(cx)?;
+        producer?;
+        outcome
     }
 
     fn validate_bound_producer(&self, expected: &EmbeddingIdentityBundleV1) -> SearchResult<()> {
@@ -428,8 +541,7 @@ impl CachedEmbedder {
         outcome
     }
 
-    fn validate_vector(&self, values: &[f32]) -> SearchResult<()> {
-        let expected = self.inner.dimension();
+    fn validate_vector(&self, values: &[f32], expected: usize) -> SearchResult<()> {
         if values.len() != expected {
             return Err(SearchError::DimensionMismatch {
                 expected,
@@ -443,7 +555,12 @@ impl CachedEmbedder {
         Ok(())
     }
 
-    fn validate_batch(&self, embedded: &[Vec<f32>], expected: usize) -> SearchResult<()> {
+    fn validate_batch(
+        &self,
+        embedded: &[Vec<f32>],
+        expected: usize,
+        dimension: usize,
+    ) -> SearchResult<()> {
         // Validate the entire response before indexing it or mutating the cache.
         // Short and oversized batches used to panic after caching a partial prefix.
         if embedded.len() != expected {
@@ -453,7 +570,7 @@ impl CachedEmbedder {
             )));
         }
         for values in embedded {
-            self.validate_vector(values)?;
+            self.validate_vector(values, dimension)?;
         }
         Ok(())
     }
@@ -517,25 +634,38 @@ impl Embedder for CachedEmbedder {
             // Resolve lazily: constructing an unpolled future must not capture
             // a stale cache hit, update statistics or begin provider work.
             cache_checkpoint(cx)?;
-            let epoch = {
+            let contract = self.capture_raw_contract();
+            cache_checkpoint(cx)?;
+            let contract = contract?;
+            let (cached, epoch) = {
                 let mut cache = self.state_lock();
                 cache_checkpoint(cx)?;
-                if let Some(vec) = cache.get(text) {
-                    return Ok(vec);
-                }
-                Arc::clone(&cache.epoch)
+                cache.select_raw_contract(&contract);
+                (cache.lookup_raw(text), Arc::clone(&cache.raw_epoch))
             };
+            if let Some(vec) = cached {
+                self.admit_raw_outcome(cx, &contract, Ok(()))?;
+                {
+                    let mut cache = self.state_lock();
+                    cache_checkpoint(cx)?;
+                    if Arc::ptr_eq(&epoch, &cache.raw_epoch) {
+                        cache.record_raw_hit(text);
+                    }
+                }
+                cache_checkpoint(cx)?;
+                return Ok(vec);
+            }
             let outcome = self.inner.embed(cx, text).await;
-            cache_checkpoint(cx)?;
-            let vec = outcome?;
-            self.validate_vector(&vec)?;
+            let vec = self.admit_raw_outcome(cx, &contract, outcome)?;
+            self.validate_vector(&vec, contract.dimension)?;
             {
                 let mut cache = self.state_lock();
                 cache_checkpoint(cx)?;
-                if Arc::ptr_eq(&epoch, &cache.epoch) {
+                if Arc::ptr_eq(&epoch, &cache.raw_epoch) {
                     cache.insert(text.to_owned(), vec.clone());
                 }
             }
+            cache_checkpoint(cx)?;
             Ok(vec)
         })
     }
@@ -640,30 +770,31 @@ impl Embedder for CachedEmbedder {
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
             cache_checkpoint(cx)?;
-            // Pass 1 (single lock scope, released BEFORE the await so the batched
-            // inner call holds no lock): resolve cache hits and collect the *distinct*
-            // misses. A miss text repeated within the batch folds onto one inner
-            // embedding and counts as a hit — the in-batch dedup the old per-text loop
-            // got for free — so a batch of repeated queries embeds each text at most once.
+            let contract = self.capture_raw_contract();
+            cache_checkpoint(cx)?;
+            let contract = contract?;
+            // Resolve hits and distinct misses under one raw contract. No
+            // provider callback runs while the cache mutex is held.
             let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
             let mut miss_texts: Vec<&str> = Vec::new();
-            // Output slot -> index into `miss_texts` (None once the slot is resolved).
             let mut slot_miss: Vec<Option<usize>> = Vec::with_capacity(texts.len());
-            // Dedup map: distinct miss text -> its index in `miss_texts`.
             let mut miss_index: HashMap<&str, usize> = HashMap::new();
+            let mut duplicate_hits = 0_u64;
             let epoch = {
                 let mut cache = self.state_lock();
+                cache_checkpoint(cx)?;
+                cache.select_raw_contract(&contract);
                 for &text in texts {
                     cache_checkpoint(cx)?;
                     if let Some(&idx) = miss_index.get(text) {
-                        // Repeat of a text already queued this batch: fold onto the
-                        // same inner result, no second inner call, record a hit.
-                        cache.record_hit();
+                        // A duplicate miss folds onto the same inner result.
+                        // Count it only after the producer has been revalidated.
+                        duplicate_hits += 1;
                         out.push(None);
                         slot_miss.push(Some(idx));
                         continue;
                     }
-                    match cache.get(text) {
+                    match cache.lookup_raw(text) {
                         Some(vec) => {
                             out.push(Some(vec));
                             slot_miss.push(None);
@@ -677,37 +808,46 @@ impl Embedder for CachedEmbedder {
                         }
                     }
                 }
-                Arc::clone(&cache.epoch)
+                Arc::clone(&cache.raw_epoch)
             };
-            // ONE batched inner call for all distinct misses — vs the old per-text loop
-            // that called `inner.embed` N times, defeating a batching inner (e.g.
-            // fastembed embeds the whole batch in a single model invocation). N → 1.
-            if !miss_texts.is_empty() {
+            // Preserve one real batch call for distinct misses. The complete
+            // response and the producer are checked before any row is admitted.
+            // An all-hit batch also rechecks the producer before returning.
+            let embedded = if miss_texts.is_empty() {
+                self.admit_raw_outcome(cx, &contract, Ok(Vec::new()))?
+            } else {
                 cache_checkpoint(cx)?;
-                let all_slots_are_distinct_misses = miss_texts.len() == texts.len();
                 let outcome = self.inner.embed_batch(cx, &miss_texts).await;
+                let embedded = self.admit_raw_outcome(cx, &contract, outcome)?;
+                self.validate_batch(&embedded, miss_texts.len(), contract.dimension)?;
+                embedded
+            };
+            {
+                let mut cache = self.state_lock();
                 cache_checkpoint(cx)?;
-                let embedded = outcome?;
-                self.validate_batch(&embedded, miss_texts.len())?;
-                {
-                    let mut cache = self.state_lock();
-                    cache_checkpoint(cx)?;
-                    if Arc::ptr_eq(&epoch, &cache.epoch) {
-                        for (idx, vec) in embedded.iter().enumerate() {
-                            cache.insert(miss_texts[idx].to_owned(), vec.clone());
+                if Arc::ptr_eq(&epoch, &cache.raw_epoch) {
+                    for (&text, miss) in texts.iter().zip(&slot_miss) {
+                        if miss.is_none() {
+                            cache.record_raw_hit(text);
                         }
                     }
+                    cache.hits += duplicate_hits;
+                    for (text, values) in miss_texts.iter().zip(&embedded) {
+                        cache.insert((*text).to_owned(), values.clone());
+                    }
                 }
-                if all_slots_are_distinct_misses {
-                    return Ok(embedded);
-                }
-                Self::fill_batch_misses(&mut out, &slot_miss, embedded);
             }
             cache_checkpoint(cx)?;
-            Ok(out
+            if miss_texts.len() == texts.len() {
+                return Ok(embedded);
+            }
+            Self::fill_batch_misses(&mut out, &slot_miss, embedded);
+            let output = out
                 .into_iter()
                 .map(|v| v.expect("every slot filled"))
-                .collect())
+                .collect();
+            cache_checkpoint(cx)?;
+            Ok(output)
         })
     }
 
@@ -762,7 +902,7 @@ mod bound_batch_admission_tests;
 mod tests {
     use super::*;
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
-    use frankensearch_core::traits::l2_normalize;
+    use frankensearch_core::traits::{SyncEmbed, SyncEmbedderAdapter, l2_normalize};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Test double: counts how many times `embed()` is called.
@@ -1676,6 +1816,11 @@ mod tests {
         dimension: AtomicUsize,
         unavailable: AtomicBool,
         raw_calls: AtomicUsize,
+        raw_values: Mutex<Vec<f32>>,
+        raw_action: AtomicUsize,
+        raw_yield: AtomicBool,
+        missing_identity: AtomicBool,
+        renamed: AtomicBool,
         bound_calls: AtomicUsize,
         identity_calls: AtomicUsize,
         identity_hook: Mutex<Option<IdentityHook>>,
@@ -1712,6 +1857,11 @@ mod tests {
                 dimension: AtomicUsize::new(2),
                 unavailable: AtomicBool::new(false),
                 raw_calls: AtomicUsize::new(0),
+                raw_values: Mutex::new(vec![99.0, 0.0]),
+                raw_action: AtomicUsize::new(0),
+                raw_yield: AtomicBool::new(false),
+                missing_identity: AtomicBool::new(false),
+                renamed: AtomicBool::new(false),
                 bound_calls: AtomicUsize::new(0),
                 identity_calls: AtomicUsize::new(0),
                 identity_hook: Mutex::new(None),
@@ -1724,14 +1874,51 @@ mod tests {
         fn at_identity_read(&self, read: usize, action: impl FnOnce() + Send + 'static) {
             *self.identity_hook.lock().unwrap() = Some((read, Box::new(action)));
         }
+
+        async fn raw_response(&self, cx: &Cx, count: usize) -> SearchResult<Vec<Vec<f32>>> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            let values = self.raw_values.lock().unwrap().clone();
+            let action = self.raw_action.load(Ordering::Relaxed);
+            if self.raw_yield.load(Ordering::Relaxed) {
+                let mut yielded = false;
+                std::future::poll_fn(|task| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        task.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            if action >= 2 {
+                cx.set_cancel_requested(true);
+            }
+            if action % 2 == 1 {
+                return Err(SearchError::EmbeddingFailed {
+                    model: "raw-provider-test".to_owned(),
+                    source: "raw provider failed".into(),
+                });
+            }
+            Ok(vec![values; count])
+        }
     }
 
     impl Embedder for BoundCacheProvider {
-        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
-                self.raw_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(vec![99.0, 0.0])
+                let mut responses = self.raw_response(cx, 1).await?;
+                Ok(responses.pop().expect("one raw response"))
             })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            Box::pin(self.raw_response(cx, texts.len()))
         }
 
         fn embed_bound<'a>(
@@ -1797,6 +1984,13 @@ mod tests {
                     reason: "private-canary".to_owned(),
                 });
             }
+            if self.missing_identity.load(Ordering::Relaxed) {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedder.identity".to_owned(),
+                    value: String::new(),
+                    reason: "explicitly identity-less test provider".to_owned(),
+                });
+            }
             Ok(&self.identities[self.selected.load(Ordering::Relaxed)])
         }
 
@@ -1805,7 +1999,11 @@ mod tests {
         }
 
         fn id(&self) -> &'static str {
-            "bound-query-test"
+            if self.renamed.load(Ordering::Relaxed) {
+                "renamed-raw-provider"
+            } else {
+                "bound-query-test"
+            }
         }
 
         fn model_name(&self) -> &'static str {
@@ -1819,6 +2017,332 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::StaticEmbedder
         }
+    }
+
+    async fn raw_query(
+        cached: &CachedEmbedder,
+        cx: &Cx,
+        batch: bool,
+    ) -> SearchResult<Vec<Vec<f32>>> {
+        if batch {
+            cached.embed_batch(cx, &["query", "query"]).await
+        } else {
+            cached.embed(cx, "query").await.map(|values| vec![values])
+        }
+    }
+
+    #[test]
+    fn raw_contract_changes_invalidate_same_name_queries_and_preserve_bound_entries() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                for component in 0..6 {
+                    let mut provider = BoundCacheProvider::new();
+                    provider.identities[1] = provider.identities[0].clone();
+                    let changed = &mut provider.identities[1];
+                    match component {
+                        0 => changed.space.immutable_revision.push_str("-new"),
+                        1 => changed.space.artifacts[0].sha256 = "a".repeat(64),
+                        2 => changed.space.tokenizer_fingerprint = "b".repeat(64),
+                        3 => changed.input.canonicalization.push_str("-new"),
+                        4 => changed.producer.implementation_revision.push_str("-new"),
+                        _ => changed.storage.format.push_str("-new"),
+                    }
+                    changed.space.input_contract_fingerprint = changed.input.fingerprint();
+                    changed.producer.space_fingerprint = changed.space.fingerprint();
+                    changed.validate().unwrap();
+                    let inner = Arc::new(provider);
+                    let cached = CachedEmbedder::new(inner.clone(), 8);
+                    let bound = cached.embed_bound(&cx, "bound-resident").await.unwrap();
+                    let original = raw_query(&cached, &cx, batch).await.unwrap();
+                    assert_eq!(original, vec![vec![99.0, 0.0]; if batch { 2 } else { 1 }]);
+                    inner.selected.store(1, Ordering::Relaxed);
+                    *inner.raw_values.lock().unwrap() = vec![0.0, 1.0];
+                    let replacement = raw_query(&cached, &cx, batch).await.unwrap();
+                    assert_eq!(replacement, vec![vec![0.0, 1.0]; original.len()]);
+                    assert_eq!(raw_query(&cached, &cx, batch).await.unwrap(), replacement);
+                    assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 2);
+                    assert_eq!(cached.cache_stats().entries, 2);
+                    inner.selected.store(0, Ordering::Relaxed);
+                    assert_eq!(
+                        cached.embed_bound(&cx, "bound-resident").await.unwrap(),
+                        bound
+                    );
+                    assert_eq!(inner.bound_calls.load(Ordering::Relaxed), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn raw_warm_hits_refuse_invalid_metadata_without_counting_hits_or_dispatching() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                for invalid in 0..6 {
+                    let mut provider = BoundCacheProvider::new();
+                    provider.identities[1] = provider.identities[0].clone();
+                    match invalid {
+                        0 => provider.identities[1].space.dimension = 0,
+                        1 => {
+                            "fsvi-v2".clone_into(&mut provider.identities[1].storage.format);
+                            "little-endian"
+                                .clone_into(&mut provider.identities[1].storage.endianness);
+                        }
+                        2 => provider.identities[1].storage.quantization = QuantizationFormat::F16,
+                        3 => {
+                            "private-canary"
+                                .clone_into(&mut provider.identities[1].storage.endianness);
+                        }
+                        _ => {}
+                    }
+                    let inner = Arc::new(provider);
+                    let cached = CachedEmbedder::new(inner.clone(), 4);
+                    let original = raw_query(&cached, &cx, batch).await.unwrap();
+                    let before = cached.cache_stats();
+                    inner.selected.store(1, Ordering::Relaxed);
+                    if invalid == 4 {
+                        inner.dimension.store(3, Ordering::Relaxed);
+                    } else if invalid == 5 {
+                        inner.unavailable.store(true, Ordering::Relaxed);
+                    }
+                    let error = raw_query(&cached, &cx, batch).await.unwrap_err();
+                    assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                    assert!(!error.to_string().contains("private-canary"));
+                    assert_eq!(cached.cache_stats(), before);
+                    assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 1);
+                    inner.selected.store(0, Ordering::Relaxed);
+                    inner.dimension.store(2, Ordering::Relaxed);
+                    inner.unavailable.store(false, Ordering::Relaxed);
+                    assert_eq!(raw_query(&cached, &cx, batch).await.unwrap(), original);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn raw_inflight_drift_refuses_single_and_mixed_batches_without_partial_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                for action in [0, 1] {
+                    let inner = Arc::new(BoundCacheProvider::new());
+                    let cached = CachedEmbedder::new(inner.clone(), 4);
+                    cached.embed(&cx, "warm").await.unwrap();
+                    let before = cached.cache_stats();
+                    inner.raw_yield.store(true, Ordering::Relaxed);
+                    inner.raw_action.store(action, Ordering::Relaxed);
+                    let inputs = ["warm", "new", "new"];
+                    let mut flight = Box::pin(async {
+                        if batch {
+                            cached.embed_batch(&cx, &inputs).await
+                        } else {
+                            cached.embed(&cx, "new").await.map(|values| vec![values])
+                        }
+                    });
+                    {
+                        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                        assert!(std::future::Future::poll(flight.as_mut(), &mut task).is_pending());
+                    }
+                    inner.selected.store(1, Ordering::Relaxed);
+                    assert!(matches!(
+                        flight.await,
+                        Err(SearchError::UnverifiableRemoteSpace { .. })
+                    ));
+                    assert_eq!(cached.cache_stats().entries, before.entries);
+                    assert_eq!(cached.cache_stats().hits, before.hits);
+                    assert!(!cached.state_lock().entries.contains_key("new"));
+                    inner.raw_action.store(0, Ordering::Relaxed);
+                    *inner.raw_values.lock().unwrap() = vec![0.0, 1.0];
+                    assert_eq!(cached.embed(&cx, "new").await.unwrap(), vec![0.0, 1.0]);
+                    assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 3);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn raw_contract_epoch_fences_a_suspended_fill_after_identity_switches_back() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let inner = Arc::new(BoundCacheProvider::new());
+            inner.raw_yield.store(true, Ordering::Relaxed);
+            let cached = CachedEmbedder::new(inner.clone(), 1);
+            let mut flight = cached.embed(&cx, "old");
+            {
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(flight.as_mut(), &mut task).is_pending());
+            }
+            inner.raw_yield.store(false, Ordering::Relaxed);
+            inner.selected.store(1, Ordering::Relaxed);
+            *inner.raw_values.lock().unwrap() = vec![0.0, 1.0];
+            cached.embed(&cx, "replacement").await.unwrap();
+            inner.selected.store(0, Ordering::Relaxed);
+            *inner.raw_values.lock().unwrap() = vec![0.5, 0.5];
+            cached.embed(&cx, "newest").await.unwrap();
+            let before = cached.cache_stats();
+            assert_eq!(flight.await.unwrap(), vec![99.0, 0.0]);
+            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(cached.embed(&cx, "newest").await.unwrap(), vec![0.5, 0.5]);
+            assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 3);
+            assert_eq!(cached.embed(&cx, "old").await.unwrap(), vec![0.5, 0.5]);
+            assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 4);
+        });
+    }
+
+    #[test]
+    fn raw_metadata_callbacks_can_clear_without_deadlock_or_reset_stat_mutation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                for warm in [false, true] {
+                    let inner = Arc::new(BoundCacheProvider::new());
+                    let cached = Arc::new(CachedEmbedder::new(inner.clone(), 4));
+                    if warm {
+                        raw_query(&cached, &cx, batch).await.unwrap();
+                    }
+                    let cache = Arc::downgrade(&cached);
+                    inner.at_identity_read(
+                        inner.identity_calls.load(Ordering::Relaxed) + 2,
+                        move || cache.upgrade().unwrap().clear_cache(),
+                    );
+                    raw_query(&cached, &cx, batch).await.unwrap();
+                    assert_eq!(
+                        cached.cache_stats(),
+                        CacheStats {
+                            hits: 0,
+                            misses: 0,
+                            entries: 0,
+                            capacity: 4
+                        }
+                    );
+                    raw_query(&cached, &cx, batch).await.unwrap();
+                    assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 2);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn raw_metadata_cancellation_precedes_identity_drift_and_metadata_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                for boundary in [1, 2] {
+                    for unavailable in [false, true] {
+                        let inner = Arc::new(BoundCacheProvider::new());
+                        let cached = CachedEmbedder::new(inner.clone(), 4);
+                        raw_query(&cached, &cx, batch).await.unwrap();
+                        let before = cached.cache_stats();
+                        let producer = Arc::downgrade(&inner);
+                        let cancel_cx = cx.clone();
+                        inner.at_identity_read(
+                            inner.identity_calls.load(Ordering::Relaxed) + boundary,
+                            move || {
+                                let producer = producer.upgrade().unwrap();
+                                producer.selected.store(1, Ordering::Relaxed);
+                                producer.unavailable.store(unavailable, Ordering::Relaxed);
+                                cancel_cx.set_cancel_requested(true);
+                            },
+                        );
+                        assert!(matches!(
+                            raw_query(&cached, &cx, batch).await,
+                            Err(SearchError::Cancelled { .. })
+                        ));
+                        assert_eq!(cached.cache_stats(), before);
+                        assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 1);
+                        cx.set_cancel_requested(false);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_sync_adapter_preserves_raw_cache_and_refuses_bound_outputs() {
+        struct LegacySyncEmbedder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl SyncEmbed for LegacySyncEmbedder {
+            fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![1.0, 0.0])
+            }
+
+            fn dimension(&self) -> usize {
+                2
+            }
+
+            fn id(&self) -> &str {
+                "legacy-sync-control"
+            }
+
+            fn is_semantic(&self) -> bool {
+                false
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::HashEmbedder
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider = LegacySyncEmbedder {
+                    calls: Arc::clone(&calls),
+                };
+                let cached = CachedEmbedder::new(Arc::new(SyncEmbedderAdapter(provider)), 4);
+                let expected = vec![vec![1.0, 0.0]; if batch { 2 } else { 1 }];
+                assert_eq!(raw_query(&cached, &cx, batch).await.unwrap(), expected);
+                assert_eq!(raw_query(&cached, &cx, batch).await.unwrap(), expected);
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                let before = cached.cache_stats();
+                assert!(matches!(
+                    cached.embed_bound(&cx, "query").await,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
+                assert!(matches!(
+                    cached.embed_batch_bound(&cx, &["query", "query"]).await,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
+                assert_eq!(cached.cache_stats(), before);
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn identity_less_raw_controls_fence_name_and_dimension_without_becoming_bound() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let inner = Arc::new(BoundCacheProvider::new());
+            inner.missing_identity.store(true, Ordering::Relaxed);
+            let cached = CachedEmbedder::new(inner.clone(), 4);
+            assert_eq!(cached.embed(&cx, "query").await.unwrap(), vec![99.0, 0.0]);
+            assert_eq!(cached.embed(&cx, "query").await.unwrap(), vec![99.0, 0.0]);
+            assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 1);
+            inner.renamed.store(true, Ordering::Relaxed);
+            *inner.raw_values.lock().unwrap() = vec![0.0, 1.0];
+            assert_eq!(cached.embed(&cx, "query").await.unwrap(), vec![0.0, 1.0]);
+            inner.dimension.store(3, Ordering::Relaxed);
+            *inner.raw_values.lock().unwrap() = vec![0.0, 0.0, 1.0];
+            assert_eq!(
+                cached.embed_batch(&cx, &["query", "query"]).await.unwrap(),
+                vec![vec![0.0, 0.0, 1.0]; 2]
+            );
+            assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 3);
+            let before = cached.cache_stats();
+            inner.unavailable.store(true, Ordering::Relaxed);
+            for batch in [false, true] {
+                let error = raw_query(&cached, &cx, batch).await.unwrap_err();
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                assert!(!error.to_string().contains("private-canary"));
+            }
+            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 3);
+            inner.unavailable.store(false, Ordering::Relaxed);
+            assert!(matches!(
+                cached.embed_bound(&cx, "query").await,
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+            assert_eq!(cached.cache_stats(), before);
+            assert_eq!(inner.bound_calls.load(Ordering::Relaxed), 0);
+        });
     }
 
     #[test]
