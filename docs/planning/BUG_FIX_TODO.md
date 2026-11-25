@@ -1,5 +1,103 @@
 # Open bug repair TODO
 
+## November 25 idle compactor writer progress — active
+
+`bd-idle-compactor-writer-progress-u5mm1`, OrangeSparrow. Existing ready
+queue is empty; blocked publisher migration and peer-owned work remain intact.
+Actual qualified default ELF `7aaad237…` reproduced append exit 1 while the
+same idle compactor was alive; index creation and selected daemon stop exit 0.
+Artifacts: `/home/ubuntu/.fs-compactor-idle-nx56boh1/observation.json` and
+`/data/tmp/fs-compactor-idle-repro-20261125-v2.log`. Original installed
+quickstart directory was absent; the exact executable was recovered from the
+Cargo cache and retained separately, as recorded in
+`/data/tmp/fs-daemon-startup.sKDROXdS/default-elf-recovery-20261125.json`.
+
+- [x] Recheck source/ref/graph state and preserve the shared dirty checkout.
+- [x] Reproduce actual ordinary writer refusal with a live idle daemon.
+- [x] Record the complete original positive and adverse acceptance together
+  in one bug; claim it and reserve the precise source/test surface.
+- [x] Separate the lifetime compactor lease from the maintenance publication
+  lease using the existing native lock/fence implementation on every platform.
+- [x] Retry publication contention on the normal poll cadence; retain pending
+  work, recheck both tiers under exclusion, and capture the reset baseline
+  before unlock so a later acknowledged append is not consumed unmerged.
+- [x] Keep correct process ownership for stop and live-compactor uninstall
+  exclusion; retain sealed/fixed-authority admission on both lease kinds.
+- [x] Extend real process-owner controls for compactor versus writer-only
+  identity, second-compactor exclusion, and uninstall refusal.
+- [x] Add and execute a real Potion/MiniLM long-lived daemon regression:
+  repeated ordinary appends, both tiers compacted, all IDs/identities retained,
+  Refined search, deferred maintenance behind an independent publisher, and
+  selected stop while another writer holds publication exclusion.
+- [x] Execute the new regression against the retained old executable first;
+  retain its intended writer-progress failure.
+- [x] Complete focused compile/lint, ownership/admission tests and both old
+  seven-scenario startup and new writer-progress regressions.
+- [ ] Freeze clean source and complete all eighteen unchanged stock gate
+  labels. Preserve failures, original ignores, exact source/ELF/model identity
+  and native versus remote execution class; do not weaken acceptance.
+- [ ] Review the final production/test changes, run UBS and diff checks,
+  then perform fresh solo original acceptance against the frozen revision.
+- [ ] Publish only qualified source and this scoped Bead row; verify both
+  remote refs and preserve every unrelated published tracker row.
+- [ ] Close only with cited published evidence, export status, release the
+  exact owned leases, and report remaining release/migration limits.
+
+Initial focused controls: 25/0/0 native tests; preserved log
+`/data/tmp/fs-idle-compactor-focused-unit-v1.log`. Remote compiler check
+passed an initial snapshot; strict Clippy correctly refused a redundant
+`pub(crate)` constant in the private kernel module. Move that constant to
+the public admission module; no lint relaxation. The new real-model harness
+fails the old executable at the first ordinary append, as intended:
+`idle-writer-baseline-v1-result.json`, exit 101, log SHA256
+`15d2ce53e36dc8af7a04638e21a13d5231f6349a612cbb80855ad00d5d15b52e`.
+The first candidate command mistakenly copied the old cached ELF again;
+its retained SHA proves that mistake and it earns no candidate credit.
+The actual freshly built default ELF `01310494…` accepts all three CLI
+appends, merges both tiers and retries the observed contended publication.
+Its initial harness then correctly refuses the deliberately new vector-only
+ID because that ID has no source-window manifest membership. Correct this
+new test's contention stimulus to replay an existing row's actual vector and
+ID. It still requires observed deferral, pending WAL preservation, eventual
+both-tier merging, all acknowledged IDs, exact producer identities, Refined
+search and selected stop. No production manifest check or original criterion
+is changed. Preserve both failed candidate receipts; full qualification and
+fresh solo acceptance remain pending.
+
+UBS scans all four changed Rust files: 0 critical; existing/test-heavy
+warnings are triaged against the diff. New production findings are bounded
+array indices from the same two-element shape, two internal lock names
+supplied only by fixed constants, existing CLI output and tracing formatting.
+New test unwrap/assert/JSON findings are test assertions and retained-fixture
+I/O; none is silently suppressed. UBS does not replace compilation or tests.
+
+Corrected long-lived regression PASS in 14.69s:
+`idle-writer-candidate-v3-result.json`; normal default ELF SHA256
+`605fcb8768c61bb296f9dc077b0e30e6172926ba76f2c47b084d267429ba7ddc`,
+harness `445e00fd4b17f98bd1d35d7bab625de5df35868921c3e5b298eff793efcd9d77`,
+log `6ef6c0e912147bb3b7b9214a6c9d5398f6dea6bb2ce1eabbb086e34f8b652b0c`.
+All three actual CLI appends succeed with the same daemon PID. Independent
+publisher contention is observed, the original pending WALs remain, both
+merge after release, all acknowledged IDs/producers and Refined hits remain,
+and stop selects only the compactor while the writer remains fenced.
+All seven original startup scenarios also pass in 72.57s on the initial
+repaired executable: `idle-startup-regression-v1-result.json`. Remote strict
+all-target fsfs Clippy passes on hz4 after the visibility correction;
+`/data/tmp/fs-idle-compactor-rch-clippy-v2.log`. Final staged UBS v3 exits 0,
+four Rust files, 0 critical, 10,470 warnings and 2,900 info; broad unchanged
+source and test findings are not hidden. Full frozen-source stock qualification
+and fresh solo acceptance remain open below.
+
+Creation worksheet (requested granular TODO and scoped evidence): runtime
+does not branch on this block. Consumer: operator requesting completion of
+the idle-compactor repair. Gate: cannot claim that repair complete without
+the positive writer/compactor proof and unchanged stock gates. Observed
+defect: the live append refusal above. Retirement: after qualified publication
+and original acceptance, this becomes history. No integrity exception is
+claimed. Highest ready capability: this reproduced ordinary-write failure;
+an hour of implementation exceeds an hour of report work. Verdict:
+LEGITIMATE GATE, minimum updates in the existing TODO and Bead only.
+
 ## November 25 daemon repairs — qualified source published
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.

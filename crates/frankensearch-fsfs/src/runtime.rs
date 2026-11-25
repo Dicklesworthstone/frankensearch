@@ -9280,16 +9280,26 @@ impl FsfsRuntime {
         }
 
         // Never delete an index root out from under a live fsfs writer: the
-        // compaction daemon holds the publication lease for its whole
-        // lifetime, and indexers and complete-generation builds hold it while
-        // they write. The lease is a kernel lock, so a lock file left behind
+        // compaction daemon holds a distinct lifetime lease, and indexers and
+        // complete-generation builds hold the publication lease while they
+        // write. These are kernel locks, so a lock file left behind
         // by a crashed process does not block removal.
         let index_root_lease = if target.target == "index_dir"
             && target.kind == UninstallTargetKind::Directory
             && metadata.is_dir()
         {
+            let compactor_lease = match crate::lifecycle::CompactorLease::acquire(&normalized) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    "error".clone_into(&mut entry.status);
+                    entry.detail = Some(format!(
+                        "refusing to remove index_dir while its compactor lease is unavailable: {error}"
+                    ));
+                    return entry;
+                }
+            };
             match crate::lifecycle::PublicationLease::acquire(&normalized) {
-                Ok(lease) => Some(lease),
+                Ok(lease) => Some((compactor_lease, lease)),
                 Err(error) => {
                     "error".clone_into(&mut entry.status);
                     entry.detail = Some(format!(
@@ -19179,9 +19189,9 @@ impl FsfsRuntime {
                 path: vector_path.clone(),
             });
         }
-        // Held for the daemon's whole lifetime: its WAL-triggered compactions
-        // are mutually exclusive with every other mutating fsfs process.
-        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        // Keep one compactor per root without excluding writers while idle.
+        // Each maintenance turn separately takes the shared publication lease.
+        let compactor_lease = crate::lifecycle::CompactorLease::acquire(&index_root)?;
         // Published under the index root so `fsfs daemon --stop` can find this
         // process; released on every exit path (clean, idle, SIGTERM) by drop.
         let mut pid_file = crate::lifecycle::PidFile::new(index_root.join(FSFS_DAEMON_PID_FILE));
@@ -19244,6 +19254,7 @@ impl FsfsRuntime {
                 });
             }
 
+            compactor_lease.fence("daemon WAL observation")?;
             let observed_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
                 wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
             });
@@ -19253,73 +19264,97 @@ impl FsfsRuntime {
             });
             if pending.iter().any(|pending| *pending) {
                 last_activity = std::time::Instant::now();
-                // A fence failure means the long-held lease no longer proves
-                // exclusivity (lock file substituted); abort rather than
-                // compact alongside a possible second publisher.
-                publication_lease.fence("daemon vector compaction")?;
-                #[cfg(unix)]
-                if let Err(error) = self.quiesce_query_daemon("daemon vector compaction") {
-                    warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
-                }
-                publication_lease.fence("daemon vector repair preflight")?;
-                repair_vector_generations_if_corrupted(&index_root)?;
+                let publication_lease =
+                    match crate::lifecycle::PublicationLease::acquire(&index_root) {
+                        Ok(lease) => Some(lease),
+                        Err(SearchError::SubsystemError {
+                            subsystem: "publication-lease",
+                            source,
+                        }) if source.is::<crate::lifecycle::PublicationLeaseBusy>() => {
+                            debug!("daemon: deferring compaction while a publisher is active");
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if let Some(publication_lease) = publication_lease {
+                    // A writer may have appended to either tier since observation.
+                    // Recheck both under exclusion before selecting maintenance.
+                    let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] =
+                        std::array::from_fn(|position| {
+                            tiers[position].2.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                                > previous_wal_bytes[position]
+                                && tiers[position].1.exists()
+                        });
+                    publication_lease.fence("daemon vector compaction")?;
+                    #[cfg(unix)]
+                    if let Err(error) = self.quiesce_query_daemon("daemon vector compaction") {
+                        warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
+                    }
+                    publication_lease.fence("daemon vector repair preflight")?;
+                    repair_vector_generations_if_corrupted(&index_root)?;
 
-                // Validate both pending indexes and their WALs before rewriting
-                // either tier. A malformed quality WAL must not drain fast first.
-                // Writer opens may quarantine unusable WALs and continue, so
-                // first use strict readers to preserve malformed pending input.
-                for (position, (_, path, _)) in tiers.iter().enumerate() {
-                    if pending[position] {
-                        drop(VectorIndex::open_read_only(path)?);
+                    // Validate both pending indexes and their WALs before rewriting
+                    // either tier. A malformed quality WAL must not drain fast first.
+                    // Writer opens may quarantine unusable WALs and continue, so
+                    // first use strict readers to preserve malformed pending input.
+                    for (position, (_, path, _)) in tiers.iter().enumerate() {
+                        if pending[position] {
+                            drop(VectorIndex::open_read_only(path)?);
+                        }
                     }
-                }
-                let mut indexes = Vec::with_capacity(tiers.len());
-                for (position, (tier, path, _)) in tiers.iter().enumerate() {
-                    if pending[position] {
-                        indexes.push((*tier, Self::open_vector_index_for_mutation(path)?));
+                    let mut indexes = Vec::with_capacity(tiers.len());
+                    for (position, (tier, path, _)) in tiers.iter().enumerate() {
+                        if pending[position] {
+                            indexes.push((*tier, Self::open_vector_index_for_mutation(path)?));
+                        }
                     }
-                }
-                let mut rewritten = false;
-                let mut compaction_error = None;
-                for (tier, mut index) in indexes {
-                    publication_lease.fence("daemon tier compaction")?;
-                    match index.compact() {
-                        Ok(stats) => {
-                            rewritten |= stats.wal_records > 0;
-                            info!(
-                                tier,
-                                wal_merged = stats.wal_records,
-                                total_after = stats.total_records_after,
-                                elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
-                                "daemon: compaction completed"
-                            );
-                            if self.cli_input.format == OutputFormat::Table {
-                                println!(
-                                    "daemon: {tier}: compacted {} WAL entries -> {} total records ({:.1}ms)",
-                                    stats.wal_records, stats.total_records_after, stats.elapsed_ms
+                    let mut rewritten = false;
+                    let mut compaction_error = None;
+                    for (tier, mut index) in indexes {
+                        publication_lease.fence("daemon tier compaction")?;
+                        match index.compact() {
+                            Ok(stats) => {
+                                rewritten |= stats.wal_records > 0;
+                                info!(
+                                    tier,
+                                    wal_merged = stats.wal_records,
+                                    total_after = stats.total_records_after,
+                                    elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
+                                    "daemon: compaction completed"
                                 );
+                                if self.cli_input.format == OutputFormat::Table {
+                                    println!(
+                                        "daemon: {tier}: compacted {} WAL entries -> {} total records ({:.1}ms)",
+                                        stats.wal_records, stats.total_records_after, stats.elapsed_ms
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                compaction_error = Some(error);
+                                break;
                             }
                         }
-                        Err(error) => {
-                            compaction_error = Some(error);
-                            break;
-                        }
                     }
+                    // All writer handles are dropped before sidecar protection opens
+                    // shared readers. An I/O failure may also have rewritten bytes.
+                    if rewritten || compaction_error.is_some() {
+                        publication_lease.fence("daemon vector durability sidecars")?;
+                        protect_vector_generations(&index_root, "daemon compaction");
+                    }
+                    if let Some(error) = compaction_error {
+                        return Err(error);
+                    }
+                    // Capture the reset baseline before releasing exclusion. An
+                    // append after unlock must remain visible to the next poll.
+                    previous_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
+                        wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                    });
                 }
-                // All writer handles are dropped before sidecar protection opens
-                // shared readers. An I/O failure may also have rewritten bytes.
-                if rewritten || compaction_error.is_some() {
-                    publication_lease.fence("daemon vector durability sidecars")?;
-                    protect_vector_generations(&index_root, "daemon compaction");
-                }
-                if let Some(error) = compaction_error {
-                    return Err(error);
-                }
+            } else {
+                // Use only the observed snapshot: rereading without exclusion
+                // could consume an append that has not been compacted.
+                previous_wal_bytes = observed_wal_bytes;
             }
-            // A successful merge removes/resets the WAL; future growth is work.
-            previous_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
-                wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
-            });
 
             if let Some(limit) = idle_timeout {
                 let idle_for = last_activity.elapsed();
@@ -19503,12 +19538,12 @@ impl FsfsRuntime {
         }
         #[cfg(target_os = "linux")]
         {
-            let lock_path = pid_path.with_file_name(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME);
+            let lock_path = pid_path.with_file_name(crate::lifecycle::COMPACTOR_LOCK_FILE_NAME);
             if !crate::lifecycle::has_linux_publication_owner(&lock_path, contents.pid)? {
                 if !process.is_alive() {
                     return Ok(false);
                 }
-                return Err(pid_file_error("recorded PID does not hold this index's publication lock"));
+                return Err(pid_file_error("recorded PID does not hold this index's compactor lock"));
             }
         }
         let started = std::time::Instant::now();
@@ -65686,6 +65721,15 @@ mod tests {
             .expect("a refused uninstall must not disturb the live holder");
         drop(live_writer);
 
+        let compactor = crate::lifecycle::CompactorLease::acquire(&index_root)
+            .expect("live idle compactor");
+        let entry = FsfsRuntime::apply_uninstall_target(&target, false, false);
+        assert_eq!(entry.status, "error", "{entry:?}");
+        assert!(entry.detail.as_deref().is_some_and(|detail| detail.contains("compactor lease")));
+        assert!(index_root.join("vector/index.fsvi").is_file());
+        compactor.fence("post-refused-uninstall").expect("retained compactor");
+        drop(compactor);
+
         // A lock file and owner record left behind by a dead holder are not a
         // live lease: only the kernel lock is authority.
         fs::write(
@@ -69110,15 +69154,16 @@ mod tests {
     const STOP_TEST_INDEX_ROOT: &str = "FSFS_TEST_COMPACTOR_STOP_INDEX_ROOT";
 
     #[cfg(unix)]
-    fn start_stop_test_owner(index_root: &Path) -> std::process::Child {
+    fn start_stop_test_owner(index_root: &Path, writer_only: bool) -> std::process::Child {
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
                 "runtime::tests::daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon",
             ])
             .env(STOP_TEST_INDEX_ROOT, index_root)
+            .env("FSFS_TEST_STOP_WRITER_ONLY", if writer_only { "1" } else { "0" })
             .spawn()
-            .expect("spawn publication lease holder");
+            .expect("spawn compactor lease holder");
         let started = Instant::now();
         let ready_path = index_root.join("stop-test-ready");
         let ready = loop {
@@ -69137,7 +69182,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert!(ready, "owner did not acquire its publication lease");
+        assert!(ready, "owner did not acquire its compactor lease");
         child
     }
 
@@ -69146,7 +69191,13 @@ mod tests {
     fn daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon() {
         if let Some(root) = std::env::var_os(STOP_TEST_INDEX_ROOT) {
             let root = PathBuf::from(root);
-            let _lease = crate::lifecycle::PublicationLease::acquire(&root).expect("take lease");
+            if std::env::var("FSFS_TEST_STOP_WRITER_ONLY").as_deref() == Ok("1") {
+                let _lease = crate::lifecycle::PublicationLease::acquire(&root).expect("writer lease");
+                fs::write(root.join("stop-test-ready"), b"").expect("announce writer ownership");
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            let _lease = crate::lifecycle::CompactorLease::acquire(&root).expect("take lease");
             fs::write(root.join("stop-test-ready"), b"").expect("announce ownership");
             std::thread::sleep(Duration::from_secs(30));
             return;
@@ -69170,10 +69221,12 @@ mod tests {
             .expect("a stale pid file is cleared, not an error");
         assert!(!pid_path.exists(), "stale pid file must be removed");
 
-        // The live child holds the store lease until SIGTERM ends it.
+        // The live child holds the compactor lease until SIGTERM ends it.
         // Reap concurrently so this also exercises the signal-probe fallback
         // on Unix systems without Linux process descriptors.
-        let mut live = start_stop_test_owner(&index_root);
+        let mut live = start_stop_test_owner(&index_root, false);
+        let _writer = crate::lifecycle::PublicationLease::acquire(&index_root)
+            .expect("an independent writer may coexist with an idle compactor");
         write_pid_file(live.id());
         let wait_thread =
             std::thread::spawn(move || live.wait().expect("wait for the signalled child"));
@@ -69194,7 +69247,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
-        let mut child = start_stop_test_owner(temp.path());
+        let mut child = start_stop_test_owner(temp.path(), false);
         let mut contents = crate::lifecycle::PidFileContents::current("test");
         contents.pid = child.id();
         fs::write(&pid_path, serde_json::to_vec(&contents).unwrap()).unwrap();
@@ -69221,8 +69274,8 @@ mod tests {
         let requested = tempfile::tempdir().expect("requested index");
         let other = tempfile::tempdir().expect("other index");
         let _requested_lease =
-            crate::lifecycle::PublicationLease::acquire(requested.path()).expect("requested lease");
-        let mut child = start_stop_test_owner(other.path());
+            crate::lifecycle::CompactorLease::acquire(requested.path()).expect("requested lease");
+        let mut child = start_stop_test_owner(other.path(), false);
         let mut contents = crate::lifecycle::PidFileContents::current("test");
         contents.pid = child.id();
         let recorded = serde_json::to_vec(&contents).unwrap();
@@ -69240,7 +69293,7 @@ mod tests {
         child.wait().expect("reap other owner");
         assert!(still_running);
         assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
-            if field == "daemon.pid_file" && reason.contains("publication lock")));
+            if field == "daemon.pid_file" && reason.contains("compactor lock")));
         assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 
@@ -69267,6 +69320,32 @@ mod tests {
         child.wait().expect("reap owned child");
         assert!(still_running);
         assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, .. }) if field == "daemon.pid_file"));
+        assert_eq!(fs::read(pid_path).unwrap(), recorded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compactor_stop_refuses_a_writer_only_pid_in_the_same_index() {
+        let temp = tempfile::tempdir().expect("index");
+        let mut child = start_stop_test_owner(temp.path(), true);
+        let mut contents = crate::lifecycle::PidFileContents::current("test");
+        contents.pid = child.id();
+        let recorded = serde_json::to_vec(&contents).unwrap();
+        let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
+        fs::write(&pid_path, &recorded).unwrap();
+
+        let stopped = FsfsRuntime::stop_compaction_daemon(
+            &contents,
+            &pid_path,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        );
+        let still_running = child.try_wait().expect("poll writer").is_none();
+        let _ = child.kill();
+        child.wait().expect("reap writer");
+        assert!(still_running, "a writer must not be signalled as a compactor");
+        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
+            if field == "daemon.pid_file" && reason.contains("compactor lock")));
         assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 

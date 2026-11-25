@@ -2690,14 +2690,21 @@ impl PublicationLease {
     /// Returns `SearchError::SubsystemError` (subsystem `publication-lease`)
     /// carrying [`PublicationLeaseBusy`] when another process holds the lease,
     /// and `SearchError::Io` for filesystem failures.
-    #[cfg(unix)]
     pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        Self::acquire_named(index_root, PUBLICATION_LOCK_FILE_NAME)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn acquire_named(
+        index_root: &Path,
+        lock_name: &str,
+    ) -> frankensearch_core::SearchResult<Self> {
         use rustix::fs::{FlockOperation, OFlags, flock};
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         std::fs::create_dir_all(index_root)?;
-        let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
+        let lock_path = index_root.join(lock_name);
         let no_follow = i32::try_from(OFlags::NOFOLLOW.bits()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -2770,7 +2777,10 @@ impl PublicationLease {
     ///
     /// Returns the same typed busy refusal as Unix, or a filesystem error.
     #[cfg(windows)]
-    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+    pub(super) fn acquire_named(
+        index_root: &Path,
+        lock_name: &str,
+    ) -> frankensearch_core::SearchResult<Self> {
         use std::fs::TryLockError;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -2778,7 +2788,7 @@ impl PublicationLease {
         let root_identity = same_file::Handle::from_file(open_windows_publication_handle(
             index_root, true, false,
         )?)?;
-        let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
+        let lock_path = index_root.join(lock_name);
         let mut lock_file = open_windows_publication_handle(&lock_path, false, true)?;
         let lock_identity = same_file::Handle::from_file(lock_file.try_clone()?)?;
         match lock_file.try_lock() {
@@ -2829,7 +2839,10 @@ impl PublicationLease {
     ///
     /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
     #[cfg(not(any(unix, windows)))]
-    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+    pub(super) fn acquire_named(
+        index_root: &Path,
+        _lock_name: &str,
+    ) -> frankensearch_core::SearchResult<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(

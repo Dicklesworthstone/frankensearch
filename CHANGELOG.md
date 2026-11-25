@@ -12,6 +12,10 @@
 
 ### Fixed
 
+- The legacy WAL compactor now releases publication exclusion while idle,
+  allowing ordinary writers to append without stopping it. A distinct
+  lifetime lock retains single-compactor ownership and correct stop/uninstall
+  coordination; contended maintenance retries without losing pending work.
 - Complete-generation daemon I/O ticks now yield control before repeating an
   overdue turn, keeping pending request polling bounded and preserving prompt
   shutdown, disconnection and deadline checks after synchronous work.

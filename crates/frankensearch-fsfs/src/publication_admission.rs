@@ -61,6 +61,28 @@ impl PublicationLease {
     }
 }
 
+/// Lifetime exclusion for a legacy WAL compactor, separate from write admission.
+pub(crate) const COMPACTOR_LOCK_FILE_NAME: &str = "fsfs.compactor.lock";
+
+/// Keeps one legacy compactor alive without excluding ordinary index writers.
+/// Maintenance must separately acquire and fence a [`PublicationLease`].
+#[derive(Debug)]
+pub(crate) struct CompactorLease(PublicationLease);
+
+impl CompactorLease {
+    pub(crate) fn acquire(index_root: &Path) -> SearchResult<Self> {
+        let root = std::path::absolute(index_root)?;
+        reject_sealed_ancestry(&root)?;
+        let inner = kernel::PublicationLease::acquire_named(&root, COMPACTOR_LOCK_FILE_NAME)?;
+        reject_sealed_ancestry(&root)?;
+        Ok(Self(PublicationLease { inner, root }))
+    }
+
+    pub(crate) fn fence(&self, boundary: &'static str) -> SearchResult<()> {
+        self.0.fence(boundary)
+    }
+}
+
 /// Check the kernel's live exclusive flock for the selected lock inode.
 #[cfg(target_os = "linux")]
 pub(crate) fn has_linux_publication_owner(lock_path: &Path, pid: u32) -> std::io::Result<bool> {
@@ -174,6 +196,35 @@ pub(crate) fn reject_sealed_ancestry(root: &Path) -> SearchResult<()> {
 mod tests {
     use super::*;
     use crate::generation_store::COMPLETE_GENERATION_MANIFEST;
+
+    #[test]
+    fn compactor_exclusion_is_distinct_from_publication_and_preserves_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let compactor = CompactorLease::acquire(root.path()).expect("first compactor");
+        let writer = PublicationLease::acquire(root.path()).expect("concurrent writer");
+        assert!(CompactorLease::acquire(root.path()).is_err());
+        compactor.fence("idle compactor").unwrap();
+        writer.fence("ordinary writer").unwrap();
+        drop(writer);
+        drop(compactor);
+        CompactorLease::acquire(root.path()).expect("replacement after drop");
+
+        for marker in [
+            COMPLETE_GENERATION_MANIFEST,
+            GENERATION_ROOT_AUTHORITY_FILE_NAME,
+        ] {
+            let sealed = tempfile::tempdir().unwrap();
+            std::fs::write(sealed.path().join(marker), b"existing protocol").unwrap();
+            assert!(CompactorLease::acquire(sealed.path()).is_err());
+            assert!(CompactorLease::acquire(&sealed.path().join("missing/child")).is_err());
+            assert!(!sealed.path().join(COMPACTOR_LOCK_FILE_NAME).exists());
+            assert!(!sealed.path().join("missing").exists());
+            assert_eq!(
+                std::fs::read(sealed.path().join(marker)).unwrap(),
+                b"existing protocol"
+            );
+        }
+    }
 
     #[test]
     fn sealed_admission_does_not_create_or_modify_the_lock_file() {

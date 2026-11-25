@@ -8075,6 +8075,261 @@ meta:
         }
     }
 
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires pinned Potion and MiniLM caches; executes the production CLI"]
+    fn legacy_daemon_allows_writers_and_retries_contended_maintenance() {
+        use frankensearch_fsfs::lifecycle::PublicationLease;
+
+        log_binary_profile("legacy-daemon-writer-progress");
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified real producers");
+        let root = tempfile::tempdir().unwrap().keep();
+        eprintln!(
+            "[default-build-e2e] stage=legacy-writer-progress artifacts={}",
+            root.display()
+        );
+        let fsfs = IsolatedFsfs::new(&root, models);
+        let corpus = root.join("corpus");
+        let index = root.join("index");
+        fs::create_dir(&corpus).unwrap();
+        fs::write(
+            corpus.join("billing.md"),
+            "The veldquartz billing recovery guide.",
+        )
+        .unwrap();
+        let run = |label: &str, args: &[&str]| {
+            fsfs.run_with_env(
+                &root,
+                label,
+                args.iter().copied().chain([
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--offline",
+                    "--format",
+                    "json",
+                ]),
+                QUICKSTART_TIMEOUT,
+                &[
+                    ("FSFS_COMPLETE_GENERATIONS", "0"),
+                    ("FRANKENSEARCH_PRESSURE_PROFILE", "performance"),
+                    ("FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS", "5000"),
+                    ("FRANKENSEARCH_CHECK_UPDATES", "0"),
+                    ("FSFS_DISABLE_QUERY_CACHE", "1"),
+                ],
+            )
+        };
+        let indexed = run(
+            "index",
+            &["index", corpus.to_str().unwrap(), "--no-watch-mode"],
+        );
+        assert_eq!(
+            parse_success_envelope("legacy index", &indexed)["data"]["indexed_files"],
+            1
+        );
+        assert!(!index.join("FSFS-CURRENT").exists());
+        let paths = [
+            index.join("vector/index.fsvi"),
+            index.join("vector/quality.fsvi"),
+        ];
+        let producers = paths.each_ref().map(|path| {
+            let tier = VectorIndex::open_read_only(path).unwrap();
+            (
+                tier.embedder_id().to_owned(),
+                tier.embedder_revision().to_owned(),
+                tier.dimension(),
+                tier.quantization(),
+            )
+        });
+        let stdout = root.join("daemon.stdout.log");
+        let stderr = root.join("daemon.stderr.log");
+        let mut daemon = WatchChild(
+            fsfs.command(&root)
+                .args([
+                    "daemon",
+                    "--poll-ms",
+                    "25",
+                    "--idle-timeout-ms",
+                    "0",
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--offline",
+                ])
+                .env("FSFS_COMPLETE_GENERATIONS", "0")
+                .env("FRANKENSEARCH_PRESSURE_PROFILE", "performance")
+                .env("RUST_LOG", "frankensearch_fsfs=debug")
+                .stdout(File::create(&stdout).unwrap())
+                .stderr(File::create(&stderr).unwrap())
+                .spawn()
+                .expect("start actual legacy compactor"),
+        );
+        let pid_path = index.join("daemon.pid");
+        let started = Instant::now();
+        loop {
+            let pid = fs::read(&pid_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            if pid.as_ref().is_some_and(|pid| pid["pid"] == daemon.0.id()) {
+                break;
+            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "daemon did not publish its PID"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_pid = daemon.0.id();
+        let pid_bytes = fs::read(&pid_path).unwrap();
+        let wait_compacted = |daemon: &mut WatchChild, count: usize| {
+            let started = Instant::now();
+            loop {
+                let compacted = paths.iter().all(|path| {
+                    VectorIndex::open_read_only(path).is_ok_and(|tier| {
+                        tier.record_count() == count && tier.wal_record_count() == 0
+                    })
+                });
+                if compacted {
+                    break;
+                }
+                assert!(
+                    daemon.0.try_wait().unwrap().is_none(),
+                    "compactor exited: {}",
+                    fs::read_to_string(&stderr).unwrap()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "both tiers did not merge: {}",
+                    fs::read_to_string(&stderr).unwrap()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let take_writer = || {
+            let started = Instant::now();
+            loop {
+                match PublicationLease::acquire(&index) {
+                    Ok(lease) => break lease,
+                    Err(error) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(10),
+                            "writer could not acquire after compaction: {error}"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        };
+
+        // Every append uses the ordinary CLI and real producer stack while
+        // exactly the same long-lived compactor remains available.
+        let mut expected_ids = vec!["billing.md".to_owned()];
+        for batch in 1..=3 {
+            let id = format!("recovery-{batch}.md");
+            let append = root.join(format!("append-{batch}.jsonl"));
+            fs::write(&append, format!("{}\n", serde_json::json!({
+                "id": id, "text": format!("The veldquartz recovery guide for batch {batch} restores checkpoints.")
+            }))).unwrap();
+            let appended = run(
+                &format!("append-{batch}"),
+                &["append-batch", "--file", append.to_str().unwrap()],
+            );
+            assert_eq!(
+                parse_success_envelope("ordinary append while compactor is alive", &appended)["data"]
+                    ["appended"],
+                1
+            );
+            expected_ids.push(id);
+            wait_compacted(&mut daemon, expected_ids.len());
+            drop(take_writer()); // Sidecar protection must also release exclusion.
+            assert_eq!(daemon.0.id(), daemon_pid);
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            assert_eq!(fs::read(&pid_path).unwrap(), pid_bytes);
+        }
+        let duplicate = run("second-compactor", &["daemon", "--idle-timeout-ms", "100"]);
+        assert!(
+            !duplicate.timed_out && !duplicate.status.success(),
+            "{duplicate:?}"
+        );
+        assert_eq!(fs::read(&pid_path).unwrap(), pid_bytes);
+        assert!(daemon.0.try_wait().unwrap().is_none());
+
+        // An independent writer holds actual kernel publication authority.
+        // Replay an existing row's actual vector through the production index
+        // API, retaining its source-window membership. Then use the daemon's
+        // explicit deferral as the contention witness.
+        let writer = take_writer();
+        for path in &paths {
+            writer.fence("contention-test vector append").unwrap();
+            let mut tier = VectorIndex::open(path).unwrap();
+            let id = tier.doc_id_at(0).unwrap().to_owned();
+            let vector = tier.vector_at_f32(0).unwrap();
+            tier.append(&id, &vector).unwrap();
+        }
+        wait_for_watch_output(
+            &mut daemon,
+            &stderr,
+            "deferring compaction while a publisher is active",
+            1,
+            Duration::from_secs(10),
+        );
+        for path in &paths {
+            let tier = VectorIndex::open_read_only(path).unwrap();
+            assert_eq!(tier.record_count(), expected_ids.len());
+            assert_eq!(tier.wal_record_count(), 1);
+        }
+        writer.fence("after observed deferral").unwrap();
+        drop(writer);
+        wait_compacted(&mut daemon, expected_ids.len());
+        for (position, path) in paths.iter().enumerate() {
+            let tier = VectorIndex::open_read_only(path).unwrap();
+            let ids = tier.live_doc_ids().unwrap();
+            for id in &expected_ids {
+                assert!(ids.contains(id), "missing acknowledged {id}");
+            }
+            assert_eq!(
+                (
+                    tier.embedder_id().to_owned(),
+                    tier.embedder_revision().to_owned(),
+                    tier.dimension(),
+                    tier.quantization()
+                ),
+                producers[position]
+            );
+        }
+        let search = run(
+            "refined-after-appends",
+            &["search", "veldquartz", "--no-daemon", "--limit", "20"],
+        );
+        let result = parse_success_envelope("Refined result after live compaction", &search);
+        assert_eq!(result["data"]["phase"], "refined", "{result}");
+        let hits = result["data"]["hits"].as_array().unwrap();
+        for id in &expected_ids {
+            assert!(
+                hits.iter().any(|hit| hit["path"] == *id),
+                "missing acknowledged {id}: {result}"
+            );
+        }
+        // Stop must identify the compactor even while another PID holds the
+        // publication lease, and must leave that writer's authority intact.
+        let writer = take_writer();
+        let stopped = run("stop-selected-compactor", &["daemon", "--stop"]);
+        assert_finished_successfully("stop selected compactor while writer is active", &stopped);
+        let receipt: Value = serde_json::from_str(&stopped.stdout).unwrap();
+        assert_eq!(receipt["stopped"], true, "{receipt}");
+        assert_eq!(receipt["pid"], daemon_pid, "{receipt}");
+        assert!(daemon.0.wait().unwrap().success());
+        writer.fence("after stopping only the compactor").unwrap();
+        assert!(!pid_path.exists());
+        eprintln!(
+            "[default-build-e2e] stage=legacy-writer-progress appends=3 tiers=2 deferred=merged refined=preserved duplicate=refused stop=selected"
+        );
+    }
+
     #[cfg(feature = "semantic-loaders")]
     #[test]
     #[ignore = "mock-free model-backed quickstart; provision the pinned cache, then run with --ignored --nocapture"]
