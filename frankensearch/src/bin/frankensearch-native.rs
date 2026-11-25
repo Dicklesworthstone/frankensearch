@@ -532,14 +532,14 @@ struct Models {
     quality: Option<Arc<dyn Embedder>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotReceipt {
     byte_len: u64,
     sha256: [u8; 32],
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
     schema: String,

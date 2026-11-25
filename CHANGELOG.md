@@ -17,6 +17,10 @@
   pending WALs before merging either tier, repairs recoverable vector damage,
   and reports failed maintenance instead of silently reaching an idle exit.
   Starting it again with no queued work leaves the index and sidecars intact.
+- Native authority quality backfill and partial-coverage updates can validate
+  an unpublished candidate's authenticated retrieval policies and bounded
+  stored source through the public preview API. This connects the hybrid CLI's
+  existing publication checks without bypassing them.
 - Incremental vector appends now validate the existing WAL header and roll
   back failed writes or durability barriers before releasing the writer lock.
   A failed rollback blocks further mutations on that handle until reopening

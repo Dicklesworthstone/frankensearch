@@ -212,7 +212,7 @@ fn prepare_completion(
         .unwrap_or(NativeBuildPrecision::F32);
     let quality_retrieval = spec
         .retrieval
-        .or(snapshot.quality_retrieval_configuration())
+        .or_else(|| snapshot.quality_retrieval_configuration())
         .unwrap_or_default();
     checkpoint(cx)?;
     Ok(PreparedCompletion {
@@ -1500,7 +1500,9 @@ mod tests {
                         let cached_quality =
                             session.query_models().models().unwrap().quality.clone();
                         fixture.fast.fault.store(0, Ordering::SeqCst);
-                        cached_fast.embed(&cx, "cached retry").await.unwrap();
+                        // Production query caching binds the producer identity;
+                        // raw embed intentionally bypasses the serving cache.
+                        cached_fast.embed_bound(&cx, "cached retry").await.unwrap();
                         fixture.fast.fault.store(1, Ordering::SeqCst);
                         let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
                         let quality_calls = quality.calls.load(Ordering::SeqCst);
@@ -1562,7 +1564,7 @@ mod tests {
                                     .unwrap(),
                             ));
                         }
-                        cached_fast.embed(&cx, "cached retry").await.unwrap();
+                        cached_fast.embed_bound(&cx, "cached retry").await.unwrap();
                         assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
                         assert_eq!(
                             session.snapshot.retrieval_configuration(),
@@ -1597,7 +1599,7 @@ mod tests {
                                 .unwrap(),
                         );
                         cached_quality
-                            .embed(&cx, "cached quality retry")
+                            .embed_bound(&cx, "cached quality retry")
                             .await
                             .unwrap();
                         let quality_calls = quality.calls.load(Ordering::SeqCst);
@@ -1640,7 +1642,7 @@ mod tests {
                         ));
                         quality.fault.store(1, Ordering::SeqCst);
                         cached_quality
-                            .embed(&cx, "cached quality retry")
+                            .embed_bound(&cx, "cached quality retry")
                             .await
                             .unwrap();
                         assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls + 1);
@@ -1739,7 +1741,7 @@ mod tests {
                             "updates" => session.update_limits = None,
                             "model-grant" => session.allow_model_activation = false,
                             "source-budget" => {
-                                session.update_limits.as_mut().unwrap().max_source_bytes = 1
+                                session.update_limits.as_mut().unwrap().max_source_bytes = 1;
                             }
                             "model-options" if starts_partial => {
                                 value["model_dir"] =

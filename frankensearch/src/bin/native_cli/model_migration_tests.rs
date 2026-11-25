@@ -42,7 +42,7 @@ impl Provider {
 
 impl Embedder for Provider {
     fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-        Box::pin(async { panic!("CLI model migration must never use raw inference") })
+        Box::pin(async { panic!("CLI model migration must never use raw inference") }) // ubs:ignore -- test sentinel rejects raw inference; only embed_bound is permitted.
     }
 
     fn embed_bound<'a>(
@@ -160,7 +160,7 @@ fn completion_request(receipt: &Path, quality_exact: bool) -> serde_json::Value 
 
 fn quality_authority(quality: Arc<Provider>, loads: Arc<AtomicUsize>) -> Authority {
     Authority {
-        load: Box::new(|_, _, _, _| panic!("completion must never load the fast model")),
+        load: Box::new(|_, _, _, _| panic!("completion must never load the fast model")), // ubs:ignore -- test sentinel verifies completion retains the incumbent fast model.
         load_quality: Box::new(move |_, path, options| {
             assert_eq!(path, Path::new("/explicit/quality/models"));
             assert!(options.backend.is_none());
@@ -200,7 +200,7 @@ fn permitted(models: Models, loads: Arc<AtomicUsize>) -> SessionControls {
         controls: Controls::default(),
         migration: Some(Authority {
             load_quality: Box::new(|_, _, _| {
-                panic!("migration must use its complete model loader")
+                panic!("migration must use its complete model loader") // ubs:ignore -- test sentinel rejects partial model loading during complete migration.
             }),
             load: Box::new(move |_cx, path, required, options| {
                 assert_eq!(path, Path::new("/explicit/replacement/models"));
@@ -524,7 +524,7 @@ fn quality_completion_preflight_refuses_without_loading_or_replacing_fast() {
                 "relative" => value["model_dir"] = serde_json::json!("relative"),
                 "backend" => value["quality_backend"] = serde_json::json!("automatic"),
                 "wrong-fast" => {
-                    selected.fast_producer = Provider::new("foreign", 2).identity.fingerprint()
+                    selected.fast_producer = Provider::new("foreign", 2).identity.fingerprint();
                 }
                 "no-quality" => selected.quality_producer = None,
                 "wrong-layout" => selected.schema = sharded::SELECTION_SCHEMA.to_owned(),

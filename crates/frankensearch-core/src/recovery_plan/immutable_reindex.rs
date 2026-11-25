@@ -613,7 +613,7 @@ mod tests {
                         .partial_quality
                         .as_mut()
                         .unwrap()
-                        .document_set_sha256 = [11; 32]
+                        .document_set_sha256 = [11; 32];
                 }
                 _ => changed.partial_quality = None,
             }
@@ -666,7 +666,7 @@ mod tests {
                         .partial_quality
                         .as_mut()
                         .unwrap()
-                        .document_set_sha256 = [0; 32]
+                        .document_set_sha256 = [0; 32];
                 }
                 3 => changed.source_kind = ImmutableReindexSource::Prepared,
                 4 => changed.fast = None,

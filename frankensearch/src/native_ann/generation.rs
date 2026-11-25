@@ -187,6 +187,18 @@ impl NativeGenerationPreview {
         &self.readers.metadata
     }
 
+    /// Authenticated primary-tier construction/search policy of this candidate.
+    #[must_use]
+    pub const fn retrieval_configuration(&self) -> NativeBuildRetrieval {
+        self.readers.retrieval
+    }
+
+    /// Independent quality-tier policy; absent for a single-tier candidate.
+    #[must_use]
+    pub const fn quality_retrieval_configuration(&self) -> Option<NativeBuildRetrieval> {
+        self.readers.quality_retrieval
+    }
+
     /// Return the actual covered IDs of an admitted partial candidate.
     ///
     /// Membership comes from the candidate's retained quality vector owner in
@@ -452,7 +464,18 @@ impl NativeGenerationPreview {
         Ok(())
     }
 
-    pub(in crate::native_ann) fn source_documents(
+    /// Export this candidate's complete live stored source cohort.
+    ///
+    /// Uses the retained admitted images without reopening source paths or
+    /// invoking models. Ordering, preserved fields and the UTF-8 payload budget
+    /// match [`NativeGenerationSnapshot::source_documents`]. This does not
+    /// establish that the candidate is published or selected.
+    ///
+    /// # Errors
+    /// Refuses cancellation, budget exhaustion, unsupported schemas, invalid
+    /// stored fields and disagreement with the admitted live cohort. Failure
+    /// returns no partial collection.
+    pub fn source_documents(
         &self,
         cx: &Cx,
         max_source_bytes: usize,

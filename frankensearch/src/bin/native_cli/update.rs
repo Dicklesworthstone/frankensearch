@@ -569,7 +569,7 @@ where
 }
 
 /// Authenticate the complete receipt-selected original fields without opening derived indexes.
-pub(super) fn selected_source(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
+pub fn selected_source(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
     let mut limits = NativeHybridReopenLimits::default();
     limits.vectors.max_source_bytes = MAX_INPUT_BYTES as u64;
     limits.vectors.max_document_bytes = MAX_RECORD_BYTES as u64;

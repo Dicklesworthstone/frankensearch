@@ -28,6 +28,55 @@ unmet criteria; preserve its history. Beads remains the task authority.
 - [ ] Freeze a clean source checkpoint and finish all eighteen unchanged stock
   labels with real models and the genuine prior executable. Keep execution
   classes, all failed attempts and source/lock/ELF/model identities explicit.
+  - [x] Preserve the first clean `b692f5d4` run: fmt/check/clippy-proxy pass;
+    strict workspace and hybrid Clippy fail on upstream code. Retire the owned
+    process group before editing; terminal -15, no full-gate credit.
+  - [x] Repair the upstream integration blockers without changing assertions,
+    lints or gates: two unit-valued mutation statements need semicolons; an HNSW
+    test needs its explicit default type; receipt values need Clone; native CLI
+    preview checks need the authenticated policies and bounded source export.
+  - [ ] Re-execute the existing populated partial-quality migration, completion,
+    source-recovery and transition cases; freeze and rerun all eighteen labels.
+  - [x] Preserve and correct the warm-completion test's wrong API invocation:
+    raw `ServingEmbedder::embed` deliberately bypasses caching, while production
+    queries use `embed_bound`. The isolated old test fails with the injected
+    inference prohibition. Exercise the bound path without changing faults,
+    call-count/cache identity/scope/membership assertions or production caching.
+  - [x] Preserve the second isolated failure: the forged receipt fixture writes
+    its input to the output path it later asserts absent. Separate the input
+    path, require the exact document-count refusal, and verify a matched valid
+    receipt reaches the injected loader stop without staging work or output.
+
+Additional scanner triage: the nine integration-repair files initially return
+UBS exit 1, with three critical `panic!` findings in the existing
+`model_migration_tests.rs` fixture. All three are unchanged intentional failure
+sentinels under `model_migration.rs`'s test-only module: raw inference, loading
+fast during completion, or partial loading during whole-model migration must
+fail. Three local explanatory UBS annotations now classify these exact test
+sentinels; their panic bodies and the strict guards remain intact. The full
+unfiltered prior result is retained. The annotated full-file scan exits 0 with
+0 critical, 1,361 warnings and 405 informational findings. No production path,
+scanner rule, stock label or test assertion is suppressed. This admits exactly
+three intentional test sentinels for scanner triage, with no performance claim.
+The separate unannotated production-panic control still returns exit 1 with
+one critical finding; annotations do not disable that rule or alter panic
+behavior. After both test-driver corrections the final integration scan covers
+ten files: exit 0, 0 critical, 1,867 warnings, 455 informational findings. All
+45 findings near changed lines were reviewed: deliberate test failures and
+fixed fixture values, path-string false positives, bounded retained `Arc`
+clones, existing constant-size casts, and the unchanged inherited retrieval
+default. No whole-project scanner clearance is claimed.
+
+The native CLI's first actual suite run is retained: 400 pass, two fail, zero
+ignored, 360.35 seconds. The two failures reproduce separately in fresh private
+tmpfs namespaces. Corrected warm cache retention passes in 92.42 seconds across
+all four original topology/retrieval combinations; corrected source-completion
+preflight passes in 32.58 seconds, including the exact refusal and matched
+valid-input control. Both affected core migration tests pass. Workspace strict
+Clippy and final hybrid strict Clippy pass; the new complete stock run remains
+pending. Neither correction changes production caching, default tests,
+model mocks, pass thresholds, or time budgets. The quality script, lockfile and
+startup production/test implementation are byte-identical to `b692f5d4`.
 - [ ] Reverify original acceptance in a fresh solo pass, write the bounded
   work/honesty review, close only the owned bug on evidence, export only owned
   tracker changes, publish and verify both refs, then release reservations.

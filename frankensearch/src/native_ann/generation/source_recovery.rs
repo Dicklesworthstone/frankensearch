@@ -1129,9 +1129,11 @@ mod tests {
 
     #[test]
     fn partial_completion_source_survives_derived_image_damage_without_query_admission() {
+        use frankensearch_index::native_hnsw::HnswParams;
+
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let policy = NativeBuildRetrieval::Hnsw {
-                params: Default::default(),
+                params: HnswParams::default(),
                 seed: 17,
             };
             let fixture = fixture_with_coverage(

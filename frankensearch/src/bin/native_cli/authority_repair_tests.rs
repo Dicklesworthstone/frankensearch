@@ -1484,7 +1484,7 @@ mod lifecycle {
                         selected.documents = 3;
                         selected.quality_documents = Some(2);
                         selected.validate().unwrap();
-                        let path = fixture.parent.join("forged-coverage.json");
+                        let path = fixture.parent.join("forged-input-coverage.json");
                         save_receipt(&selected, &path).unwrap();
                         options.from_receipt = Some(path);
                     }
@@ -1506,6 +1506,33 @@ mod lifecycle {
                         error.downcast_ref::<SearchError>(),
                         Some(SearchError::Cancelled { .. })
                     ));
+                }
+                if case == "forged-coverage" {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("the repair source differs from the selected document count"),
+                        "{error}"
+                    );
+                    // Clearing only the forged receipt must pass source
+                    // preflight. Stop at the loader before creating any work.
+                    let mut control = fixture.options("valid-coverage-control");
+                    control.complete_quality = true;
+                    let mut control_loads = 0;
+                    let refused = with_loader(&cx, &control, &mut Vec::new(), |_| {
+                        control_loads += 1;
+                        Err(bad("valid-coverage-control-loader-stop"))
+                    })
+                    .await
+                    .unwrap_err();
+                    assert_eq!(control_loads, 1);
+                    assert!(
+                        refused
+                            .to_string()
+                            .contains("valid-coverage-control-loader-stop")
+                    );
+                    assert!(!control.work.as_ref().unwrap().exists());
+                    assert!(!control.receipt.exists());
                 }
                 cx.set_cancel_requested(false);
                 assert_eq!(loads, 0, "case {case}");
