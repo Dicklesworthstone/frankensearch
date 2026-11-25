@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 active direct-reader compactor progress — in progress
+## November 25 active direct-reader compactor progress — qualified source
 
 `bd-compactor-direct-reader-progress-pup0v`, OrangeSparrow. Actual installed
 default `12762434…` exits 2 when a real direct progressive search retains
@@ -25,15 +25,15 @@ the Bead before implementation. Shared dirty checkout and peer tasks stay intact
   Refined, automatic both-tier merge with every acknowledged ID/producer.
 - [x] Exercise quality-only contention after a successful fast writer open;
   prove the earlier writer and publication lease are released between polls.
-- [ ] Check absent/corrupt artifacts and non-contention lock errors stay hard
+- [x] Check absent/corrupt artifacts and non-contention lock errors stay hard
   failures; retain the original seven startup and idle-writer controls.
-- [ ] Execute the named regression baseline-red/candidate-green, focused
+- [x] Execute the named regression baseline-red/candidate-green, focused
   compiler/lint/unit checks, review/UBS and diff checks with retained receipts.
-- [ ] Freeze clean source and pass all eighteen unchanged stock gate labels;
+- [x] Freeze clean source and pass all eighteen unchanged stock gate labels;
   record exact source/lock/toolchain/model/installed ELF and execution class.
-- [ ] Perform fresh solo original acceptance on the stock installed ELF,
-  publish scoped qualified source/status, verify both refs, then close only
-  this Bead on cited evidence and export closed status. Release owned leases.
+- [x] Perform fresh solo original acceptance on the stock installed ELF.
+- [ ] Verify published qualified source on both refs, close only this Bead
+  on cited evidence, export the closed status, and release owned leases.
 
 The live candidate probe keeps both main/WAL/FEC sets byte-identical while
 the actual direct reader holds both kernel locks beyond the old budget.
@@ -56,7 +56,34 @@ denominator. The correction borrows the error and leaves the OS classification
 and reported error unchanged. Strict native workspace Clippy with all targets
 passes on the corrected source in 87 s (`fs-active-reader-native-clippy-v2.log`).
 UBS exits 0 with zero critical findings on all changed Rust files, including
-the corrected index file. Run the full gate again with the same stages.
+the corrected index file.
+
+All eighteen unchanged stock stages passed on clean
+`b32b9ae8c10d5a309c74ece4a7b830a587c501fd` in 3,977.01 s. The native
+thinkstation1 run used UID 1000, a private 4 GiB tmpfs, and the pinned
+nightly. See `stock-gate-active-reader-v2-result.json` and
+`reader-stock-source-toolchain-b32b9ae8.txt` in the evidence directory above.
+The fsfs stage includes 3,368 library tests and 120 schema tests passed.
+The end-to-end stage explicitly ran the real-model reader, writer, and seven
+startup scenarios. The Quill result covers the bounded stock witness.
+
+The installed default build has SHA256
+`3d9adea85b5b9d1ac169c29179087c47837f02c2762b975d528d9aabf3e32efe`.
+`reader-quickstart-b32b9ae8-receipt.json` records 12 commands, 22 controls
+and zero remaining owned processes. Fresh solo original acceptance on that
+binary passed in 21.60 s, including actual suspended direct-reader and
+quality-only contention. `reader-installed-acceptance-v2-result.json`
+binds the clean source, installed executable, harness, and log. Selected
+stop preserved both live query locks and pending bytes, then the resumed
+query returned Refined. A write-permission refusal preserved pending bytes
+and restoring permissions allowed both tiers to compact. These controls
+are in `/data/tmp/fs-active-reader-installed-stop.log` and
+`/data/tmp/fs-active-reader-installed-denied-write.log`.
+
+Release qualification remains on `bd-dsbym`. At 14:51 UTC DSR found `mmini`
+reachable with 21.74 GiB against its 40 GiB floor, `wlap` unreachable, and
+`trj` healthy. `/data/tmp/fs-reader-release-hosts-20261125.json` preserves
+the admission results. The maintained tap at `61378995` has no fsfs formula.
 
 ## November 25 idle compactor writer progress — qualified source published
 
