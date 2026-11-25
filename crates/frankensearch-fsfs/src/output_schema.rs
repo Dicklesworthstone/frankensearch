@@ -1627,7 +1627,40 @@ mod tests {
         let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.returned_hits, 2);
-        assert_eq!(decoded.degradation_advice.len(), 9);
+        let original_advice_count = decoded
+            .degradation_advice
+            .keys()
+            .filter(|reason| {
+                !matches!(
+                    reason.as_str(),
+                    "degrade.advice.model_unavailable"
+                        | "degrade.advice.artifact_integrity_failure"
+                )
+            })
+            .count();
+        assert_eq!(original_advice_count, 9);
+        assert_eq!(decoded.degradation_advice.len(), 11);
+        for (reason, failure) in [
+            (
+                "degrade.advice.model_unavailable",
+                crate::degradation_advisor::DegradationFailureKind::ModelUnavailable,
+            ),
+            (
+                "degrade.advice.artifact_integrity_failure",
+                crate::degradation_advisor::DegradationFailureKind::ArtifactIntegrityFailure,
+            ),
+        ] {
+            let advice = decoded
+                .degradation_advice
+                .get(reason)
+                .expect("both diagnostic advice kinds survive the wire round trip");
+            assert_eq!(advice.failure, failure);
+            assert_eq!(advice.next_actions.len(), 1);
+            assert_eq!(
+                advice.next_actions[0].reason_code,
+                "degrade.action.inspect_readiness"
+            );
+        }
         assert_eq!(
             decoded
                 .degradation_advice

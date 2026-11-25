@@ -1891,7 +1891,17 @@ mod public_advice_tests {
     fn every_generated_action_quotes_its_index_and_query_placeholder() {
         let path = "owner's index/$(printf INJECTED >&2); *";
         let mut checked = 0;
+        let mut diagnostic_checked = [0; 2];
         for fixture in synthetic_degradation_advice_fixture() {
+            let diagnostic = match fixture.failure {
+                DegradationFailureKind::ModelUnavailable => {
+                    Some(("degrade.advice.model_unavailable", 0))
+                }
+                DegradationFailureKind::ArtifactIntegrityFailure => {
+                    Some(("degrade.advice.artifact_integrity_failure", 1))
+                }
+                _ => None,
+            };
             let advice = DegradationAdvice::from_input(DegradationAdviceInput {
                 failure: fixture.failure,
                 query: "public query",
@@ -1907,14 +1917,25 @@ mod public_advice_tests {
                 let observed = argv(&shell(command, None));
                 if let Some(index) = observed.iter().position(|word| word == "--index-dir") {
                     assert_eq!(observed[index + 1], path);
-                    checked += 1;
+                    if let Some((reason, diagnostic_index)) = diagnostic {
+                        assert_eq!(advice.reason_code, reason);
+                        assert_eq!(
+                            observed,
+                            ["doctor", "--index-dir", path, "--format", "json"]
+                        );
+                        diagnostic_checked[diagnostic_index] += 1;
+                    } else {
+                        checked += 1;
+                    }
                 }
                 if observed[0] == "search" {
                     assert_eq!(observed.last().unwrap(), "<query>");
                 }
             }
         }
+        // Preserve the original nine-kind census, then require both additions.
         assert_eq!(checked, 11);
+        assert_eq!(diagnostic_checked, [1, 1]);
     }
 
     #[cfg(unix)]

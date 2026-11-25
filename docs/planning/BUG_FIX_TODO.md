@@ -136,6 +136,44 @@ startup production/test implementation are byte-identical to `b692f5d4`.
   byte-identical prefix proof and zero critical in changed spans. Preserve the
   failed scan; add no suppression. Correct the first triage receipt's mistaken
   canonical HEAD in a separate retained v2 receipt bound to `fcc2b15b`.
+- [x] Preserve v8's two fixture-consumer failures: 3,364 pass/two fail/sixteen
+  ignored in the default fsfs unit binary. Both incoming recovery kinds pass
+  their behavioral tests, and all three strengthened daemon probes pass in
+  the complete suite. Old consumers still expect nine advice kinds and eleven
+  quoted commands, while the expanded fixture has eleven kinds/thirteen
+  commands. Retire only the verified owned group; no full-gate credit.
+- [x] Correct these two consumers while preserving the original nine-kind and
+  eleven-command censuses. Require both new kinds, their exact wire types and
+  diagnostic action, and exact quoted doctor argv separately. Preserve all
+  existing round-trip, hit, freshness, omission and quoting assertions.
+- [x] Execute the corrected consumers and existing model/topology refusal
+  controls; preserve the failed baseline ELF/logs and report the admitted
+  scope. This admits exactly two additional diagnostic kinds, no performance
+  WIN/LOSE rows, relaxed thresholds, goldens or production changes.
+
+V8 at clean `6e458457` retains twelve PASS labels and FAIL fsfs, then verified
+owned-group retirement (terminal -15, 2,999.34 seconds). The fsfs binary reports
+3,364 passed/two failed/sixteen ignored in 60.48 seconds; build time is 35m39s.
+`stock-gate-v8-result.json` and log SHA256
+`6086036bf4d5756445b2e9a4397daea33a9eaf3c45a73d144d95abe5da9ed8d5`
+are retained. The two consumers still census the old shared fixture. The
+correction preserves nine original advice kinds and eleven quoted commands,
+then separately requires each new diagnostic kind, its exact wire type and
+readiness action, and exact quoted doctor argv. Every old hit, payload equality,
+freshness, omission and shell-quoting assertion remains. Production prefixes
+are byte-identical; no golden, gate driver, policy or tolerance changes.
+`advice-census-pair-result.json` binds two fresh old-ELF failures (13 versus 11
+commands, 11 versus 9 kinds) and the corrected advice group (24/0/0) plus payload
+round trip (1/0/0), including existing model/topology refusal controls. Retained
+old ELF SHA256: `d4bd87a1263df1c3411ca875657d5c06fcefd567f28cc68326705b8e37b50376`.
+Strict fsfs all-target Clippy and formatting pass. Two-file UBS exits 0:
+0 critical, 437 warnings, 88 informational; all nineteen touched findings are
+test assertions/unwraps, fixed 0/1 diagnostic indices or checks after length
+validation. No annotation is added. This admits exactly two diagnostic kinds;
+no performance rows or WIN/LOSE decisions are admitted. Full clean-source
+qualification remains pending. The refreshed Mac admission at 08:30 UTC is
+still refused: 20.26 GiB available against the unchanged 40 GiB requirement;
+`macos-admission-refresh-v2-command.json` records actual exit 1.
 - [ ] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
 - [ ] Repeat the twelve actual-model native preview command outcomes and add
