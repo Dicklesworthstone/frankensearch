@@ -1,13 +1,16 @@
 # Open bug repair TODO
 
-## November 25 daemon repairs — qualified, publication pending
+## November 25 daemon repairs — qualified source published
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
-The separate overdue-turn repair is `bd-daemon-overdue-tick-cooperation-z3qax`;
-its code and native regression coverage stay together and block final startup
-repair qualification. Close the two bugs only on their own original criteria.
-Retire this active block at qualified publication or handoff with explicit
-unmet criteria; preserve its history. Beads remains the task authority.
+The overdue-turn repair is `bd-daemon-overdue-tick-cooperation-z3qax`; its code
+and native regression coverage remain in the same Bead. Qualified source was
+published and verified on both remote refs at `cc00e0d1`. Only then were the
+fairness and startup bugs closed, in that order, on their original criteria.
+This dated block is retired from active product work; preserve its history.
+Beads remains the task authority. Use
+`/data/tmp/fs-daemon-startup.sKDROXdS/final-qualified-publication-result.json`
+for post-commit status publication, ref checks and exact reservation releases.
 
 Final qualified code: `e8043378ad24db7d892e32f87c8bb2182e86e860`.
 All eighteen unchanged stock labels PASS, terminal 0, no label skips,
@@ -47,8 +50,11 @@ same-stream and fresh-process queries use the committed default and IDs.
 Artifact roots: `/home/ubuntu/.native-preview-s4kkncyo` and
 `/home/ubuntu/.native-warm-coverage-rfdjyzl6`. These are solo functional checks,
 not independent certification, performance wins, full Quill campaigns or
-binary/crate release qualification. Both bugs remain in progress until code
-publication and original-criteria closure; broader Beads remain unchanged.
+binary/crate release qualification. Source publication is verified in
+`initial-qualified-publication-result.json`: both refs at
+`cc00e0d1297673963613a3d5546eb958ed0817dd`, product code byte-identical to the
+qualified revision. Fairness closed at 10:08:35 UTC, startup at 10:08:36 UTC;
+their original descriptions remain unchanged. Broader Beads remain open.
 
 - [x] Refresh current source and governing instructions; preserve the dirty
   shared checkout and fast-forward the clean isolated checkout to `b27feb94`.
@@ -226,10 +232,11 @@ still refused: 20.26 GiB available against the unchanged 40 GiB requirement;
   graph: nine files, 0 critical/4,222 warnings/757 informational, 69 nearby
   findings. Test fixture assertions, bounded indices, retained handles and
   comment text explain these reports; no new scanner exclusions.
-- [ ] Export only the two owned tracker records, publish qualified code and evidence,
+- [x] Export only the two owned tracker records, publish qualified code and evidence,
   and verify both remote refs without disturbing the peer's unpublished row.
-- [ ] Close the fairness bug, then the startup bug on their original acceptance;
-  publish final status, verify both refs again and release owned reservations.
+- [x] Close the fairness bug, then the startup bug on their original acceptance;
+  export only their final statuses. The final publication receipt records the
+  post-commit push, ref verification and release of the 23 exact owned leases.
 
 Earlier qualification: clean `b286a61d737ebbba0aff63dc73a67fec558d5686`, all
 eighteen quality labels PASS, no label skips, terminal 0, 04:22:51–05:20:34 UTC,
@@ -321,8 +328,9 @@ The existing helper supplies a real scheduler yield and cancellation checks;
 no sleep is added to production and no deadline or assertion is weakened.
 Three-file UBS exits 0: 0 critical, 855 warnings, 168 informational findings;
 the three touched-line findings are deliberate native test setup unwraps.
-Strict fsfs all-target Clippy passes. Both bug closures still require the full
-combined stock run, fresh solo original-criteria re-execution and publication.
+Strict fsfs all-target Clippy passes. Both closures were withheld until the full
+combined stock run, fresh solo original-criteria checks and publication recorded
+at the top of this block.
 
 Real-work worksheet (these repairs and their integrated validation): the
 README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:
@@ -367,7 +375,8 @@ Honesty inventory (bounded to these changes and retained attempts):
    failed native tests, all retired gates, the missed work-path collision,
    overdue-turn failures and both fixture-consumer failures remain visible.
 10. No (checked: command redirections): stdout/stderr evidence is retained.
-11. No (checked: Beads): both owned bugs remain in progress until publication;
+11. No (checked: Beads): both bugs closed only after qualified code was verified
+    on both remote refs; their original acceptance descriptions are unchanged;
     broader migration, performance and release acceptance remains open.
 12. No (checked: original Bead description): acceptance/specification unchanged.
 13–17. Not applicable: truly solo; the prior prototype is credited and rechecked,
@@ -386,8 +395,9 @@ Six bounded CASS searches plus archived hit context checked older work and this
 named probe; this is a sample, not an exhaustive history audit. Disposition:
 the observed defects and annotation exceptions are corrected, disclosed and
 guarded by retained negative controls. Patterns guarded against are false/zero
-green, gate self-weakening, proof-class inflation and false closure. Publication
-and the final status update remain the only pending actions in this block.
+green, gate self-weakening, proof-class inflation and false closure. Qualified
+code is published and the two bugs are closed. Consult the final publication
+receipt for the post-commit status push, ref verification and lease releases.
 
 Current evidence: `/data/tmp/fs-daemon-startup.sKDROXdS`. The clean-overlay
 `b27feb94` build with explicit `fast_cmaes` revision completed on hz4 and its
