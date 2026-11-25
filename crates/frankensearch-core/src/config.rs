@@ -84,7 +84,8 @@ pub struct TwoTierConfig {
     /// Default: false.
     pub fast_only: bool,
 
-    /// Enable optional graph-ranking contribution in Phase 1 fusion.
+    /// Enable a graph signal generated in Phase 1 and retained through quality
+    /// refinement.
     /// Default: false.
     pub graph_ranking_enabled: bool,
 

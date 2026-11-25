@@ -22,7 +22,7 @@
     },
     "scoreComponentSource": {
       "type": "string",
-      "enum": ["lexical_bm25", "semantic_fast", "semantic_quality", "rerank"]
+      "enum": ["lexical_bm25", "semantic_fast", "semantic_quality", "semantic_blend", "graph", "rerank", "hash_control"]
     },
     "policyDomain": {
       "type": "string",

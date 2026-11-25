@@ -640,17 +640,20 @@ impl FusionArmExplanation {
 
 /// Retain the scoring settings and pool bounds used by lexical-semantic fusion.
 #[derive(Clone, Copy)]
-pub(crate) struct FusionExplanation {
+pub(crate) struct FusionExplanation<'a> {
     lexical: FusionArmExplanation,
     vector: FusionArmExplanation,
+    graph: &'a [ScoredResult],
+    graph_weight: f64,
 }
 
-impl FusionExplanation {
+impl<'a> FusionExplanation<'a> {
     pub(crate) fn new(
         strategy: FusionStrategy,
         lexical: &[ScoredResult],
         vector: &[VectorHit],
-        graph: &[ScoredResult],
+        graph: &'a [ScoredResult],
+        graph_weight: f64,
         config: &RrfConfig,
     ) -> Self {
         let strategy = effective_fusion_strategy(strategy, graph);
@@ -667,6 +670,8 @@ impl FusionExplanation {
                 config.semantic_weight,
                 vector.iter().map(|hit| hit.score),
             ),
+            graph,
+            graph_weight: sanitize_graph_weight(graph_weight),
         }
     }
 
@@ -700,6 +705,7 @@ impl FusionExplanation {
             };
             components.push(self.vector.component(source, rank, raw_score));
         }
+        components.extend(self.graph_component(hit));
         HitExplanation {
             final_score: f64::from(score),
             components,
@@ -719,6 +725,27 @@ impl FusionExplanation {
                         .component(ExplainedSource::SemanticBlend, rank, score)
                 }),
         ]
+    }
+
+    /// The public fused row omits graph internals. Resolve its graph evidence
+    /// from the exact retained ranking used by fusion, only when explanations
+    /// were requested. Graph contribution is always rank-based RRF.
+    pub(crate) fn graph_component(&self, hit: &FusedHit) -> Option<ScoreComponent> {
+        if self.graph_weight <= 0.0 {
+            return None;
+        }
+        let (rank, result) = self
+            .graph
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.doc_id == hit.doc_id)?;
+        Some(ScoreComponent {
+            source: ExplainedSource::Graph,
+            raw_score: f64::from(result.score),
+            normalized_score: f64::from(result.score),
+            rrf_contribution: self.graph_weight * rank_contribution(self.vector.k, rank),
+            weight: self.graph_weight,
+        })
     }
 }
 
@@ -1646,12 +1673,21 @@ mod tests {
             &lexical,
             &semantic,
             &graph,
+            0.5,
             &cfg,
         );
         let hybrid = via.iter().find(|hit| hit.doc_id == "a").unwrap();
         let explanation = evidence.for_hit(hybrid, 2.0 / 61.0, "fixture", false);
         assert_eq!(explanation.components.len(), 2);
         assert!((explanation.total_rrf_contribution() - 2.0 / 61.0).abs() < 1e-12);
+        let graph_only = via.iter().find(|hit| hit.doc_id == "z").unwrap();
+        let explanation = evidence.for_hit(graph_only, 0.5 / 61.0, "fixture", false);
+        assert_eq!(explanation.components.len(), 1);
+        assert!(matches!(
+            explanation.components[0].source,
+            ExplainedSource::Graph
+        ));
+        assert!((explanation.total_rrf_contribution() - 0.5 / 61.0).abs() < 1e-12);
     }
 
     /// QUALITY GATE. The claimed nDCG advantage is not just a rank permutation — measure it.

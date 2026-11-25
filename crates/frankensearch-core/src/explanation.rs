@@ -100,6 +100,9 @@ pub enum ExplainedSource {
     /// blend and should not be added again to the final fusion score.
     SemanticBlend,
 
+    /// Query-biased graph rank retained through progressive refinement.
+    Graph,
+
     /// Cross-encoder reranker score.
     Rerank {
         /// Reranker model identifier.
@@ -210,6 +213,7 @@ impl std::fmt::Display for ExplainedSource {
                 write!(f, "QualitySemantic({embedder}, cos={cosine_sim:.4})")
             }
             Self::SemanticBlend => f.write_str("BlendedSemantic"),
+            Self::Graph => f.write_str("GraphRank"),
             Self::Rerank {
                 model,
                 logit,
@@ -666,6 +670,7 @@ mod tests {
                 embedder: "minilm".into(),
                 cosine_sim: 0.85,
             },
+            ExplainedSource::Graph,
             ExplainedSource::Rerank {
                 model: "flashrank".into(),
                 logit: 1.2,

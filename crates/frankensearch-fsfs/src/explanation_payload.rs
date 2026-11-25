@@ -365,6 +365,7 @@ pub enum ScoreComponentSource {
     SemanticFast,
     SemanticQuality,
     SemanticBlend,
+    Graph,
     Rerank,
     HashControl,
 }
@@ -376,6 +377,7 @@ impl std::fmt::Display for ScoreComponentSource {
             Self::SemanticFast => "semantic_fast",
             Self::SemanticQuality => "semantic_quality",
             Self::SemanticBlend => "semantic_blend",
+            Self::Graph => "graph",
             Self::Rerank => "rerank",
             Self::HashControl => "hash_control",
         };
@@ -693,6 +695,7 @@ fn source_from_explained(source: &ExplainedSource) -> ScoreComponentSource {
         ExplainedSource::SemanticFast { .. } => ScoreComponentSource::SemanticFast,
         ExplainedSource::SemanticQuality { .. } => ScoreComponentSource::SemanticQuality,
         ExplainedSource::SemanticBlend => ScoreComponentSource::SemanticBlend,
+        ExplainedSource::Graph => ScoreComponentSource::Graph,
         ExplainedSource::Rerank { .. } => ScoreComponentSource::Rerank,
     }
 }
@@ -1396,6 +1399,10 @@ mod tests {
                 cosine_sim: 0.0,
             }),
             ScoreComponentSource::SemanticQuality
+        );
+        assert_eq!(
+            source_from_explained(&ExplainedSource::Graph),
+            ScoreComponentSource::Graph
         );
         assert_eq!(
             source_from_explained(&ExplainedSource::Rerank {
