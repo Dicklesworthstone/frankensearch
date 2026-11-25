@@ -850,9 +850,9 @@ impl From<SearchError> for FsviOpenError {
 }
 
 impl FsviOpenError {
-    fn map_lock(path: &Path, access: &str, error: std::fs::TryLockError) -> Self {
+    fn map_lock(path: &Path, access: &str, error: &std::fs::TryLockError) -> Self {
         Self {
-            error: map_lock_error(path, access, &error),
+            error: map_lock_error(path, access, error),
             lock_contended: matches!(error, std::fs::TryLockError::WouldBlock),
         }
     }
@@ -2130,7 +2130,7 @@ impl VectorIndex {
                     thread = ?std::thread::current().id(),
                     "fsvi map lock refused: {error}"
                 );
-                FsviOpenError::map_lock(path, "exclusive writer", error)
+                FsviOpenError::map_lock(path, "exclusive writer", &error)
             })?;
             FsviMapLock::Exclusive {
                 file,
@@ -2147,7 +2147,7 @@ impl VectorIndex {
                     thread = ?std::thread::current().id(),
                     "fsvi map lock refused: {error}"
                 );
-                FsviOpenError::map_lock(path, "shared reader", error)
+                FsviOpenError::map_lock(path, "shared reader", &error)
             })?;
             FsviMapLock::Shared {
                 file,
@@ -12666,7 +12666,7 @@ mod tests {
         let denied = FsviOpenError::map_lock(
             &path,
             "exclusive writer",
-            std::fs::TryLockError::Error(std::io::Error::from(
+            &std::fs::TryLockError::Error(std::io::Error::from(
                 std::io::ErrorKind::PermissionDenied,
             )),
         );

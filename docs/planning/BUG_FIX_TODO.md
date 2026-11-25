@@ -49,6 +49,14 @@ The initial harness failed earlier because the expected stored MiniLM ID
 used the model directory's casing. Preserve `reader-baseline-v1-result.json`
 as a fixture failure outside the baseline regression evidence. Initial
 compiler refusals and error diagnostics remain in the focused build logs.
+Strict remote Clippy found a needless move of the OS lock error. The stock
+run on `ae93dcb0` stopped at the formatting stage before the correction.
+`stock-gate-active-reader-v1-result.json` records exit -15 and the partial
+denominator. The correction borrows the error and leaves the OS classification
+and reported error unchanged. Strict native workspace Clippy with all targets
+passes on the corrected source in 87 s (`fs-active-reader-native-clippy-v2.log`).
+UBS exits 0 with zero critical findings on all changed Rust files, including
+the corrected index file. Run the full gate again with the same stages.
 
 ## November 25 idle compactor writer progress — qualified source published
 
