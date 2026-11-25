@@ -1067,6 +1067,7 @@ impl SyncTwoTierSearcher {
                             lexical,
                             &fast_hits,
                             &[],
+                            0.0,
                             &rrf_config,
                         )
                     }),
@@ -1319,6 +1320,7 @@ impl SyncTwoTierSearcher {
                             lexical,
                             hits,
                             &[],
+                            0.0,
                             &rrf_config,
                         )
                     }),
@@ -1654,6 +1656,7 @@ impl SyncTwoTierSearcher {
                     lexical,
                     &blended,
                     &[],
+                    0.0,
                     &rrf_config,
                 );
                 fusion_components.extend(fused.iter().map(|hit| evidence.refined_components(hit)));
@@ -2556,7 +2559,7 @@ fn fused_hits_to_scored_results(
     hits: Vec<FusedHit>,
     lexical: &[ScoredResult],
     k: usize,
-    explanation: Option<FusionExplanation>,
+    explanation: Option<FusionExplanation<'_>>,
     fast_embedder_id: &str,
     hash_control: bool,
 ) -> Vec<ScoredResult> {

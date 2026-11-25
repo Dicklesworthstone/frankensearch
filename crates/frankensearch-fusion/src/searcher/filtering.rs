@@ -528,6 +528,28 @@ impl<'a> RequestFilter<'a> {
         cx: &Cx,
         results: &mut Vec<ScoredResult>,
     ) -> SearchResult<bool> {
+        self.retain_scored_inner(cx, results, None)
+    }
+
+    /// Bound graph/semantic reconciliation even for a predicate whose answer
+    /// changes after a previously rejected graph document is refilled.
+    #[cfg(feature = "graph")]
+    pub(super) fn retain_scored_with_history(
+        &self,
+        cx: &Cx,
+        results: &mut Vec<ScoredResult>,
+        revoked: &mut AHashSet<DocId>,
+    ) -> SearchResult<bool> {
+        self.retain_scored_inner(cx, results, Some(revoked))
+    }
+
+    #[cfg(feature = "graph")]
+    fn retain_scored_inner(
+        &self,
+        cx: &Cx,
+        results: &mut Vec<ScoredResult>,
+        mut revoked: Option<&mut AHashSet<DocId>>,
+    ) -> SearchResult<bool> {
         if !self.is_active() {
             return Ok(false);
         }
@@ -537,6 +559,15 @@ impl<'a> RequestFilter<'a> {
             if self.includes(cx, &results[rank].doc_id)? {
                 results.swap(retained, rank);
                 retained += 1;
+            } else if let Some(revoked) = revoked.as_deref_mut()
+                && !revoked.insert(results[rank].doc_id.clone())
+            {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.filter".to_owned(),
+                    value: "unstable_predicate".to_owned(),
+                    reason: "filter eligibility changed repeatedly during candidate refill"
+                        .to_owned(),
+                });
             }
         }
         results.truncate(retained);

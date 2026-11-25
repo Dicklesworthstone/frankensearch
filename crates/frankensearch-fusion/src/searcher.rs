@@ -25,8 +25,6 @@ use asupersync::time::timeout;
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
 
-#[cfg(feature = "graph")]
-use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
@@ -49,6 +47,8 @@ use frankensearch_core::types::{
     BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
     SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
+#[cfg(feature = "graph")]
+use frankensearch_core::{DocId, DocumentGraph};
 use frankensearch_core::{
     EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
     LifecycleState, LiveSearchFrame, LiveSearchStreamEmitter, ResourceCollectorSample,
@@ -578,6 +578,10 @@ struct RefinementPools {
     /// Own the scoring snapshot until refinement finishes, including metadata
     /// hydration for candidates promoted from outside the Initial fused pool.
     lexical_context: Option<LexicalHydrationContext>,
+    /// Graph signal generated from the admitted Phase-1 semantic seeds. Keep
+    /// its candidate identities and ranks through quality re-fusion instead of
+    /// silently dropping a configured retrieval arm after Initial.
+    graph: Option<Vec<ScoredResult>>,
 }
 
 struct FastRefinementEvidence {
@@ -1044,7 +1048,9 @@ impl TwoTierSearcher {
         crate::federated::FederatedSearcher::new().add_index(name, self, weight)
     }
 
-    /// Attach an optional document graph used for phase-1 graph ranking.
+    /// Attach an optional document graph ranked from Phase-1 semantic seeds.
+    /// Its signal is retained through quality refinement and revalidated when
+    /// request metadata changes candidate eligibility.
     #[cfg(feature = "graph")]
     #[must_use]
     pub fn with_document_graph(mut self, graph: Arc<DocumentGraph>) -> Self {
@@ -2964,6 +2970,7 @@ impl TwoTierSearcher {
                             lexical,
                             &hits,
                             &[],
+                            0.0,
                             &rrf_config,
                         )
                     }),
@@ -3579,6 +3586,7 @@ impl TwoTierSearcher {
                                             &[],
                                             &fast_hits,
                                             graph,
+                                            self.config.graph_ranking_weight,
                                             &rrf_config,
                                         )
                                     }),
@@ -3616,6 +3624,7 @@ impl TwoTierSearcher {
                                     lexical,
                                     &fast_hits,
                                     graph,
+                                    self.config.graph_ranking_weight,
                                     &rrf_config,
                                 )
                             }),
@@ -3649,6 +3658,7 @@ impl TwoTierSearcher {
                         fast_evidence,
                         lexical: lexical_results,
                         lexical_context,
+                        graph: graph_candidates,
                     }),
                 })
             }
@@ -3743,6 +3753,7 @@ impl TwoTierSearcher {
         pools: Option<&RefinementPools>,
         fast_hits: &mut Vec<VectorHit>,
         quality_hits: &mut Vec<VectorHit>,
+        graph_candidates: &mut Option<Vec<ScoredResult>>,
         quality_budget: usize,
         quality_limit: &mut usize,
         exclusions: Option<&NormalizedExclusions>,
@@ -3756,6 +3767,8 @@ impl TwoTierSearcher {
         let mut fast_limit = pools.map_or(0, |pools| pools.fast_retrieval_limit);
         let mut fast_revoked = AHashSet::new();
         let mut quality_revoked = AHashSet::new();
+        #[cfg(feature = "graph")]
+        let mut graph_revoked = AHashSet::new();
         let mut replacement_evidence = None;
         loop {
             let quality_replaced = request_filter
@@ -3836,10 +3849,74 @@ impl TwoTierSearcher {
                 self.apply_score_calibration_to_hits(fast_hits);
                 *fast_hits = self.correct_phase1_pool(std::mem::take(fast_hits));
             }
-            if !quality_replaced && !fast_replaced {
+            #[cfg(feature = "graph")]
+            let graph_replaced = self
+                .reconcile_refinement_graph(
+                    cx,
+                    lexical_source,
+                    lexical_pool.query,
+                    fast_hits,
+                    graph_candidates,
+                    pools.map_or(quality_budget, |pools| pools.semantic_budget),
+                    fast_replaced,
+                    exclusions,
+                    text_fn,
+                    request_filter,
+                    &mut graph_revoked,
+                )
+                .await?;
+            #[cfg(not(feature = "graph"))]
+            let _ = graph_candidates;
+            #[cfg(not(feature = "graph"))]
+            let graph_replaced = false;
+            if !quality_replaced && !fast_replaced && !graph_replaced {
                 return Ok(replacement_evidence);
             }
         }
+    }
+
+    /// A retained graph signal stays unchanged unless its seeds or eligibility
+    /// change. Refilling can discover metadata for other arms, so callers must
+    /// reconcile those arms again before publishing the final ranking.
+    #[cfg(feature = "graph")]
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_refinement_graph(
+        &self,
+        cx: &Cx,
+        lexical: Option<&dyn LexicalRead>,
+        query: &str,
+        fast_hits: &[VectorHit],
+        candidates: &mut Option<Vec<ScoredResult>>,
+        target: usize,
+        seeds_changed: bool,
+        exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        request_filter: &mut RequestFilter<'_>,
+        revoked: &mut AHashSet<DocId>,
+    ) -> SearchResult<bool> {
+        if !request_filter.is_active()
+            || !self.config.graph_ranking_enabled
+            || self.config.graph_ranking_weight <= 0.0
+        {
+            return Ok(false);
+        }
+        let Some(graph) = self.document_graph.as_deref() else {
+            return Ok(false);
+        };
+        let membership_changed = candidates
+            .as_mut()
+            .map(|candidates| request_filter.retain_scored_with_history(cx, candidates, revoked))
+            .transpose()?
+            .unwrap_or(false);
+        if !seeds_changed && !membership_changed {
+            return Ok(false);
+        }
+        *candidates = request_filter
+            .graph_candidates(
+                cx, lexical, graph, query, fast_hits, target, exclusions, text_fn,
+            )
+            .await?;
+        Ok(true)
     }
 
     /// Run Phase 2: quality embedding and blend, retaining the final ranking pool.
@@ -4049,6 +4126,7 @@ impl TwoTierSearcher {
             std::borrow::Cow::Borrowed(query)
         };
         let lexical_budget = pools.map_or(0, |pools| pools.lexical_budget);
+        let mut graph_candidates = pools.and_then(|pools| pools.graph.clone());
         let mut quality_coverage = None;
         let mut replacement_fast_evidence = None;
         let mut quality_pool = match admission {
@@ -4099,6 +4177,7 @@ impl TwoTierSearcher {
                         pools,
                         &mut fast_hits,
                         &mut hits,
+                        &mut graph_candidates,
                         quality_budget,
                         &mut retrieval_limit,
                         exclusions,
@@ -4173,6 +4252,7 @@ impl TwoTierSearcher {
                         pools,
                         &mut fast_hits,
                         &mut hits,
+                        &mut graph_candidates,
                         quality_budget,
                         &mut retrieval_limit,
                         exclusions,
@@ -4186,20 +4266,47 @@ impl TwoTierSearcher {
             }
             SemanticAdmission::OwnerBacked { quality: false }
             | SemanticAdmission::LegacyUnidentified => {
-                request_filter
-                    .revalidate_lexical(
-                        cx,
-                        lexical_source,
-                        &lexical_query,
-                        lexical_budget,
-                        &mut filtered_lexical,
-                        &mut refreshed_lexical_context,
-                        exclusions,
-                        text_fn,
-                    )
-                    .await?;
-                // Membership must settle before producing positional scores.
-                request_filter.retain_vectors(cx, &mut fast_hits)?;
+                #[cfg(feature = "graph")]
+                let mut graph_revoked = AHashSet::new();
+                loop {
+                    request_filter
+                        .revalidate_lexical(
+                            cx,
+                            lexical_source,
+                            &lexical_query,
+                            lexical_budget,
+                            &mut filtered_lexical,
+                            &mut refreshed_lexical_context,
+                            exclusions,
+                            text_fn,
+                        )
+                        .await?;
+                    #[cfg(feature = "graph")]
+                    let previous_fast_count = fast_hits.len();
+                    // Membership must settle before producing positional scores.
+                    request_filter.retain_vectors(cx, &mut fast_hits)?;
+                    #[cfg(feature = "graph")]
+                    let graph_replaced = self
+                        .reconcile_refinement_graph(
+                            cx,
+                            lexical_source,
+                            query,
+                            &fast_hits,
+                            &mut graph_candidates,
+                            quality_budget,
+                            fast_hits.len() != previous_fast_count,
+                            exclusions,
+                            text_fn,
+                            request_filter,
+                            &mut graph_revoked,
+                        )
+                        .await?;
+                    #[cfg(not(feature = "graph"))]
+                    let graph_replaced = false;
+                    if !graph_replaced {
+                        break;
+                    }
+                }
                 QualityPool::RescoredFastPool(self.index.quality_scores_for_hits_cancellable(
                     cx,
                     &quality_vec,
@@ -4481,29 +4588,33 @@ impl TwoTierSearcher {
             }))
         };
 
-        // Lexical re-fusion (bd-tm83): when Phase 1 retained a lexical pool,
-        // rerun the configured fusion strategy against the blended semantic
-        // pool so the refined ordering reflects both sources — the same
-        // shape as the sync searcher — without a second lexical query.
+        // Re-fuse the retained lexical and graph arms against the blended
+        // semantic pool. Quality changes the semantic evidence; it must not
+        // silently remove graph-only discoveries or the configured graph
+        // weight from the final ranking.
         let lexical_pool = if request_filter.is_active() {
             filtered_lexical.as_ref()
         } else {
             pools.and_then(|pools| pools.lexical.as_ref())
         };
-        if let Some(lexical_pool) = lexical_pool {
+        let graph_pool = graph_candidates.as_deref().unwrap_or_default();
+        if lexical_pool.is_some() || !graph_pool.is_empty() {
             let rrf_config = RrfConfig {
                 k: self.effective_rrf_k(query_class),
                 lexical_weight: self.rrf_lexical_weight,
-                semantic_weight: self.effective_semantic_weight(lexical_pool),
+                semantic_weight: lexical_pool.map_or(self.rrf_semantic_weight, |lexical| {
+                    self.effective_semantic_weight(lexical)
+                }),
                 tiebreak: self.rrf_tiebreak,
             };
+            let lexical_pool = lexical_pool.map_or(&[][..], Vec::as_slice);
             cancellation_checkpoint(cx, "quality_rank_to_refusion")?;
             let fused = fuse_by_strategy(
                 self.config.fusion_strategy,
                 lexical_pool,
                 &blended,
-                &[],
-                0.0,
+                graph_pool,
+                self.config.graph_ranking_weight,
                 k,
                 0,
                 &rrf_config,
@@ -4516,7 +4627,8 @@ impl TwoTierSearcher {
                     self.config.fusion_strategy,
                     lexical_pool,
                     &blended,
-                    &[],
+                    graph_pool,
+                    self.config.graph_ranking_weight,
                     &rrf_config,
                 )
             });
@@ -4551,6 +4663,12 @@ impl TwoTierSearcher {
                         evidence.refined_components(fused_hit)
                     }),
                 );
+                if let Some(explanation) = result.explanation.as_mut()
+                    && let Some(component) =
+                        fusion_explanation.and_then(|evidence| evidence.graph_component(fused_hit))
+                {
+                    explanation.components.push(component);
+                }
             }
             if !request_filter.is_active()
                 && let (Some(lexical), Some(context)) = (
@@ -5606,7 +5724,7 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
 fn fused_hits_to_scored_results(
     fused: &[frankensearch_core::types::FusedHit],
     lexical_results: &[ScoredResult],
-    explanation: Option<FusionExplanation>,
+    explanation: Option<FusionExplanation<'_>>,
     fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
     // Borrow each candidate's metadata `&Value` into the map instead of cloning
@@ -14988,6 +15106,353 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
+    fn graph_progressive_retains_candidates_weights_and_explanations() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_dir, index) = query_admission_index_with_rows(
+                    layout,
+                    &[("seed", &[1.0, 0.0, 0.0, 0.0])],
+                    &[("seed", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0])],
+                );
+                let mut graph = DocumentGraph::new();
+                graph.add_edge(
+                    "seed",
+                    "graph-discovery",
+                    frankensearch_core::EdgeType::Reference,
+                    1.0,
+                );
+                graph.add_edge(
+                    "graph-discovery",
+                    "graph-discovery",
+                    frankensearch_core::EdgeType::Reference,
+                    1.0,
+                );
+                let graph = Arc::new(graph);
+                for lexical in [false, true] {
+                    for fusion_strategy in [
+                        frankensearch_core::FusionStrategy::Rrf,
+                        frankensearch_core::FusionStrategy::PoolMinMax,
+                    ] {
+                        for weight in [0.0, 0.25, 1.0] {
+                            let mut searcher = TwoTierSearcher::new(
+                                Arc::clone(&index),
+                                Arc::new(query_admission_embedder("fast")),
+                                TwoTierConfig {
+                                    candidate_multiplier: 1,
+                                    graph_ranking_enabled: true,
+                                    graph_ranking_weight: weight,
+                                    fusion_strategy,
+                                    explain: true,
+                                    ..TwoTierConfig::default()
+                                },
+                            )
+                            .with_quality_embedder(Arc::new(query_admission_embedder("quality")))
+                            .with_document_graph(Arc::clone(&graph));
+                            if lexical {
+                                searcher = searcher.with_lexical(Arc::new(StubLexical));
+                            }
+                            let mut phases = Vec::new();
+                            searcher
+                                .search(
+                                    &cx,
+                                    "find related material",
+                                    10,
+                                    |_| None,
+                                    |phase| phases.push(phase),
+                                )
+                                .await
+                                .unwrap();
+                            let [
+                                SearchPhase::Initial {
+                                    results: initial, ..
+                                },
+                                SearchPhase::Refined {
+                                    results: refined, ..
+                                },
+                            ] = phases.as_slice()
+                            else {
+                                panic!(
+                                    "{layout}/{lexical}/{fusion_strategy:?}/{weight}: {phases:?}"
+                                );
+                            };
+                            for results in [initial, refined] {
+                                let discovery = results
+                                    .iter()
+                                    .find(|result| result.doc_id == "graph-discovery");
+                                if weight == 0.0 {
+                                    assert!(discovery.is_none());
+                                    continue;
+                                }
+                                let discovery = discovery.expect(
+                                    "successful quality refinement must retain the graph-only discovery",
+                                );
+                                assert!(discovery.index.is_none());
+                                assert!(discovery.fast_score.is_none());
+                                assert!(discovery.quality_score.is_none());
+                                assert!(discovery.lexical_score.is_none());
+                                assert_eq!(discovery.source, ScoreSource::Hybrid);
+                                let explanation = discovery.explanation.as_ref().unwrap();
+                                let [component] = explanation.components.as_slice() else {
+                                    panic!(
+                                        "graph-only evidence must not invent a semantic component"
+                                    );
+                                };
+                                assert!(matches!(component.source, ExplainedSource::Graph));
+                                assert_eq!(component.weight, weight);
+                                // The absorbing discovery is graph rank zero;
+                                // neither semantic tier contains a row for it.
+                                let expected = weight / 61.0;
+                                assert!((component.rrf_contribution - expected).abs() < 1e-12);
+                                assert!((f64::from(discovery.score) - expected).abs() < 1e-8);
+                            }
+                            if weight > 0.0 {
+                                assert_eq!(
+                                    refined
+                                        .iter()
+                                        .find(|result| result.doc_id == "graph-discovery")
+                                        .unwrap()
+                                        .explanation
+                                        .as_ref()
+                                        .unwrap()
+                                        .phase,
+                                    ExplanationPhase::Refined,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn async_filter_graph_refinement_refills_revoked_candidates_and_preserves_pin() {
+        struct LateGraphMetadata {
+            pinned: bool,
+            cancel_tail: bool,
+            pins: Arc<AtomicU64>,
+            blocked_lookups: Arc<AtomicU64>,
+        }
+
+        impl LexicalRead for LateGraphMetadata {
+            fn pin_search<'a>(
+                &'a self,
+                _cx: &'a Cx,
+            ) -> SearchFuture<'a, Option<Arc<dyn LexicalRead>>> {
+                Box::pin(async move {
+                    assert!(!self.pinned, "a request pins its lexical publication once");
+                    self.pins.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(Arc::new(Self {
+                        pinned: true,
+                        cancel_tail: self.cancel_tail,
+                        pins: Arc::clone(&self.pins),
+                        blocked_lookups: Arc::clone(&self.blocked_lookups),
+                    }) as Arc<dyn LexicalRead>))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _query: &'a str,
+                _limit: usize,
+            ) -> SearchFuture<'a, Vec<ScoredResult>> {
+                Box::pin(async move {
+                    assert!(self.pinned);
+                    Ok(Vec::new())
+                })
+            }
+
+            fn metadata_for_documents<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                ids: &'a [&str],
+            ) -> SearchFuture<'a, Vec<Option<Arc<serde_json::Value>>>> {
+                Box::pin(async move {
+                    assert!(
+                        self.pinned,
+                        "graph and quality must use the retained reader"
+                    );
+                    if self.cancel_tail && ids.contains(&"graph-tail") {
+                        return Err(SearchError::Cancelled {
+                            phase: "fixture.graph_refill".to_owned(),
+                            reason: "cancel before admitting the replacement graph row".to_owned(),
+                        });
+                    }
+                    Ok(ids
+                        .iter()
+                        .map(|id| {
+                            if *id == "graph-blocked"
+                                && self.blocked_lookups.fetch_add(1, Ordering::Relaxed) == 0
+                            {
+                                None
+                            } else {
+                                Some(Arc::new(serde_json::json!({
+                                    "allowed": *id != "graph-blocked"
+                                })))
+                            }
+                        })
+                        .collect())
+                })
+            }
+
+            fn doc_count(&self) -> SearchResult<usize> {
+                Ok(0)
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                for cancel_tail in [false, true] {
+                    let (_dir, index) = query_admission_index_with_rows(
+                        layout,
+                        &[("seed", &[1.0, 0.0, 0.0, 0.0])],
+                        &[
+                            ("graph-blocked", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                            ("seed", &[0.0, 0.6, 0.8, 0.0, 0.0, 0.0]),
+                        ],
+                    );
+                    let mut graph = DocumentGraph::new();
+                    for (id, weight) in [("graph-blocked", 10.0), ("graph-tail", 1.0)] {
+                        graph.add_edge("seed", id, frankensearch_core::EdgeType::Reference, weight);
+                        graph.add_edge(id, id, frankensearch_core::EdgeType::Reference, 1.0);
+                    }
+                    let lexical = Arc::new(LateGraphMetadata {
+                        pinned: false,
+                        cancel_tail,
+                        pins: Arc::new(AtomicU64::new(0)),
+                        blocked_lookups: Arc::new(AtomicU64::new(0)),
+                    });
+                    let fast = Arc::new(query_admission_embedder("fast"));
+                    let quality = Arc::new(query_admission_embedder("quality"));
+                    let searcher = TwoTierSearcher::new(
+                        index,
+                        fast.clone(),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            graph_ranking_enabled: true,
+                            graph_ranking_weight: 1.0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(quality.clone())
+                    .with_document_graph(Arc::new(graph))
+                    .with_lexical(lexical.clone());
+                    let filter =
+                        AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+                            metadata.is_none_or(|value| value["allowed"] == true)
+                        });
+                    let mut phases = Vec::new();
+                    let outcome = searcher
+                        .search_with_filter(
+                            &cx,
+                            "find related material",
+                            2,
+                            Some(&filter),
+                            |_| None,
+                            |phase| phases.push(phase),
+                        )
+                        .await;
+                    let Some(SearchPhase::Initial { results, .. }) = phases.first() else {
+                        panic!("missing Initial: {phases:?}");
+                    };
+                    assert!(results.iter().any(|hit| hit.doc_id == "graph-blocked"));
+                    assert!(results.iter().all(|hit| hit.doc_id != "graph-tail"));
+                    assert_eq!(lexical.pins.load(Ordering::Relaxed), 1);
+                    assert_eq!(fast.embed_count(), 1);
+                    assert_eq!(quality.embed_count(), 1);
+                    if cancel_tail {
+                        assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                        assert_eq!(
+                            phases.len(),
+                            1,
+                            "cancellation must not publish a replacement"
+                        );
+                    } else {
+                        outcome.unwrap();
+                        let [_, SearchPhase::Refined { results, .. }] = phases.as_slice() else {
+                            panic!("missing Refined: {phases:?}");
+                        };
+                        assert_eq!(results.len(), 2);
+                        assert!(results.iter().any(|hit| hit.doc_id == "seed"));
+                        assert!(results.iter().any(|hit| hit.doc_id == "graph-tail"));
+                        assert!(results.iter().all(|hit| hit.doc_id != "graph-blocked"));
+                        for result in results {
+                            assert_eq!(result.metadata.as_ref().unwrap()["allowed"], true);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn async_filter_graph_refinement_rechecks_legacy_rescoring() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = build_test_index_with_quality(4);
+            let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut graph = DocumentGraph::new();
+            for (id, weight) in [("graph-blocked", 10.0), ("graph-tail", 1.0)] {
+                graph.add_edge("doc-0", id, frankensearch_core::EdgeType::Reference, weight);
+                graph.add_edge(id, id, frankensearch_core::EdgeType::Reference, 1.0);
+            }
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    graph_ranking_enabled: true,
+                    graph_ranking_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(Arc::new(CountingEmbedder::new(
+                "quality",
+                4,
+                Arc::clone(&quality_calls),
+            )))
+            .with_document_graph(Arc::new(graph));
+            let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                matches!(id, "doc-0" | "graph-tail")
+                    || (id == "graph-blocked" && quality_calls.load(Ordering::Relaxed) == 0)
+            });
+            let mut phases = Vec::new();
+            searcher
+                .search_with_filter(
+                    &cx,
+                    "find related material",
+                    2,
+                    Some(&filter),
+                    |_| None,
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            let [
+                SearchPhase::Initial {
+                    results: initial, ..
+                },
+                SearchPhase::Refined {
+                    results: refined, ..
+                },
+            ] = phases.as_slice()
+            else {
+                panic!("legacy rescoring must preserve the progressive contract: {phases:?}");
+            };
+            assert!(initial.iter().any(|hit| hit.doc_id == "graph-blocked"));
+            assert!(initial.iter().all(|hit| hit.doc_id != "graph-tail"));
+            assert_eq!(refined.len(), 2);
+            assert!(refined.iter().any(|hit| hit.doc_id == "doc-0"));
+            assert!(refined.iter().any(|hit| hit.doc_id == "graph-tail"));
+            assert!(refined.iter().all(|hit| hit.doc_id != "graph-blocked"));
+            assert_eq!(quality_calls.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
     fn async_filter_graph_tail_refills_before_fusion() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index(4);
@@ -19453,12 +19918,13 @@ mod tests {
         assert!(explanation.components[1].rrf_contribution > 0.0);
     }
 
-    fn default_rrf_explanation() -> FusionExplanation {
+    fn default_rrf_explanation() -> FusionExplanation<'static> {
         FusionExplanation::new(
             frankensearch_core::FusionStrategy::Rrf,
             &[],
             &[],
             &[],
+            0.0,
             &RrfConfig::default(),
         )
     }

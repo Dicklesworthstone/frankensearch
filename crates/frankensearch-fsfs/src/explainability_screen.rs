@@ -579,6 +579,7 @@ fn source_label(source: ScoreComponentSource) -> String {
         ScoreComponentSource::SemanticFast => "FastSemantic".to_string(),
         ScoreComponentSource::SemanticQuality => "QualitySemantic".to_string(),
         ScoreComponentSource::SemanticBlend => "BlendedSemantic".to_string(),
+        ScoreComponentSource::Graph => "GraphRank".to_string(),
         ScoreComponentSource::Rerank => "Rerank".to_string(),
         ScoreComponentSource::HashControl => "HashControl".to_string(),
     }
@@ -1103,6 +1104,7 @@ mod tests {
     #[test]
     fn source_labels_are_concise() {
         assert_eq!(source_label(ScoreComponentSource::LexicalBm25), "BM25");
+        assert_eq!(source_label(ScoreComponentSource::Graph), "GraphRank");
         assert_eq!(
             source_label(ScoreComponentSource::SemanticFast),
             "FastSemantic"
