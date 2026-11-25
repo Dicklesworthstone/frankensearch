@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 manual legacy compaction admission — source qualified
+## November 25 manual legacy compaction admission — closed
 
 `bd-explicit-compact-admission-kv0lf`, OrangeSparrow. The published installed
 default `b1bfe7b8…` drains fast and removes its FEC before returning a quality
@@ -25,8 +25,8 @@ complete manual compaction, followed by real Refined results.
 - [x] Run both named tests and all three direct CLI controls on the fresh
   stock install. Verify the busy and malformed refusals, successful retries,
   the retained search hit, both protection sidecars, and fast-only JSON.
-- [ ] Publish scoped source and evidence, verify both remote refs, close on
-  cited criteria, export closure, and release leases.
+- [x] Publish scoped source and evidence, verify both remote refs before
+  closing on the original criteria, and export the closure.
 
 Baseline and candidate receipts `manual-{busy,malformed}-{red,green}-v1-result.json`
 retain the same harness `0c819b33…` and exact tested binary identities.
@@ -69,6 +69,12 @@ receipt `manual-compact-quickstart-ab2c175e-receipt.json`, and two
 The DSR refresh at 18:50 UTC measured 20.18 GiB free on `mmini` against a
 40 GiB floor, with Windows `wlap` unreachable. Release bead `bd-dsbym`
 remains in progress.
+
+Both origin refs were verified at `58120988becee62b12fe0e78cefea915681b3a72`
+before `bd-explicit-compact-admission-kv0lf` closed at 20:13:04 UTC. The
+scoped closure export preserved the original acceptance text and all evidence.
+`manual-compact-final-publication-result.json` records the final ref checks
+and lease release after this closure is published.
 
 ## November 25 fresh review of legacy compactor repair — qualified source published
 
