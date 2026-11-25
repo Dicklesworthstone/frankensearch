@@ -6268,7 +6268,9 @@ meta:
     #[cfg(all(unix, feature = "semantic-loaders"))]
     impl Drop for WatchChild {
         fn drop(&mut self) {
-            if self.0.try_wait().ok().flatten().is_none() {
+            // A waitpid observer can already have reaped an exited child.
+            // Signal only a child that this handle still reports as alive.
+            if matches!(self.0.try_wait(), Ok(None)) {
                 let _ = self.0.kill();
             }
             let _ = self.0.wait();
@@ -8258,32 +8260,73 @@ meta:
         assert_eq!(fs::read(&pid_path).unwrap(), pid_bytes);
         assert!(daemon.0.try_wait().unwrap().is_none());
 
-        // An independent writer holds actual kernel publication authority.
-        // Replay an existing row's actual vector through the production index
-        // API, retaining its source-window membership. Then use the daemon's
-        // explicit deferral as the contention witness.
-        let writer = take_writer();
-        for path in &paths {
-            writer.fence("contention-test vector append").unwrap();
-            let mut tier = VectorIndex::open(path).unwrap();
-            let id = tier.doc_id_at(0).unwrap().to_owned();
-            let vector = tier.vector_at_f32(0).unwrap();
-            tier.append(&id, &vector).unwrap();
+        // Pause only this owned child and observe its stopped state. A real
+        // CLI append can then finish before the independent publisher takes
+        // exclusion and resumes the daemon with newly acknowledged work.
+        // WatchChild kills/reaps even a stopped child on every panic path.
+        let daemon_process =
+            rustix::process::Pid::from_raw(i32::try_from(daemon_pid).unwrap()).unwrap();
+        rustix::process::kill_process(daemon_process, rustix::process::Signal::STOP).unwrap();
+        let started = Instant::now();
+        loop {
+            if let Some((pid, status)) = rustix::process::waitpid(
+                Some(daemon_process),
+                rustix::process::WaitOptions::UNTRACED | rustix::process::WaitOptions::NOHANG,
+            )
+            .unwrap()
+            {
+                assert_eq!(pid, daemon_process);
+                assert!(
+                    status.stopped(),
+                    "owned daemon exited instead of stopping: {status:?}"
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "daemon did not stop"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
+        let contended_id = "contended-recovery.md";
+        let append = root.join("append-contended.jsonl");
+        fs::write(&append, format!("{}\n", serde_json::json!({
+            "id": contended_id, "text": "The veldquartz recovery guide explains restoring the contended checkpoint."
+        }))).unwrap();
+        let appended = run(
+            "append-contended",
+            &["append-batch", "--file", append.to_str().unwrap()],
+        );
+        assert_eq!(
+            parse_success_envelope("acknowledge new document before contention", &appended)["data"]
+                ["appended"],
+            1
+        );
+        let writer = take_writer();
+        let expected_count = expected_ids.len();
+        let deferral = "deferring compaction while a publisher is active";
+        let expected_deferrals = fs::read_to_string(&stderr)
+            .unwrap()
+            .matches(deferral)
+            .count()
+            + 1;
+        rustix::process::kill_process(daemon_process, rustix::process::Signal::CONT).unwrap();
         wait_for_watch_output(
             &mut daemon,
             &stderr,
-            "deferring compaction while a publisher is active",
-            1,
+            deferral,
+            expected_deferrals,
             Duration::from_secs(10),
         );
         for path in &paths {
             let tier = VectorIndex::open_read_only(path).unwrap();
-            assert_eq!(tier.record_count(), expected_ids.len());
+            assert_eq!(tier.record_count(), expected_count);
             assert_eq!(tier.wal_record_count(), 1);
+            assert!(tier.wal_records().any(|(id, _)| id == contended_id));
         }
         writer.fence("after observed deferral").unwrap();
         drop(writer);
+        expected_ids.push(contended_id.to_owned());
         wait_compacted(&mut daemon, expected_ids.len());
         for (position, path) in paths.iter().enumerate() {
             let tier = VectorIndex::open_read_only(path).unwrap();
@@ -8326,7 +8369,7 @@ meta:
         writer.fence("after stopping only the compactor").unwrap();
         assert!(!pid_path.exists());
         eprintln!(
-            "[default-build-e2e] stage=legacy-writer-progress appends=3 tiers=2 deferred=merged refined=preserved duplicate=refused stop=selected"
+            "[default-build-e2e] stage=legacy-writer-progress appends=4 tiers=2 deferred=merged refined=preserved duplicate=refused stop=selected"
         );
     }
 

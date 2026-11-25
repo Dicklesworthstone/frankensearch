@@ -88,6 +88,39 @@ four Rust files, 0 critical, 10,470 warnings and 2,900 info; broad unchanged
 source and test findings are not hidden. Full frozen-source stock qualification
 and fresh solo acceptance remain open below.
 
+Fresh review found the first contention fixture insufficient: replaying the
+same ID/vector has no observable payload effect, and accepting any earlier
+deferral log could mistake a prior append's contention for the named case.
+The 14.69s pass therefore does not qualify contention acceptance. Retire the
+first stock run before source edits: verified own process group 3860986 was
+terminated with SIGTERM and had no remaining processes. Preserve
+`stock-gate-idle-compactor-v1-result.json`; terminal -15, only the six compiler
+labels completed, no full-gate credit. Strengthen the existing test instead:
+stop only its owned daemon, observe the actual stopped-child event, append a
+new document through the real CLI, hold an independent publication lease,
+resume the daemon and require one NEW deferral after the prior log count.
+Both pending WALs must still contain that newly acknowledged ID under
+contention; after release it must appear in both compacted mains and Refined
+results. Four CLI appends are now the predeclared denominator. No new process
+hooks, fake vectors, production changes or relaxed assertions/deadlines.
+
+The stronger named test passes in 16.75s (four actual CLI appends):
+`idle-writer-candidate-v4-result.json`; matching baseline with the same new
+harness fails at the first ordinary append, `idle-writer-baseline-v2-result.json`.
+The existing fixture child guard now signals only when `Child::try_wait`
+reports `Ok(None)`: a stop observer may already have reaped a terminated
+child, so an error must not become permission to signal its old PID. The
+new stopped-state observation remains safe Rust using the existing rustix
+dependency; no new runtime hook, dependency or unsafe site.
+An additional actual baseline same-input control confirms append exit 1 with
+the live old daemon, then exit 0 after selected stop:
+`/home/ubuntu/.fs-compactor-idle-c73r0qw8/post-stop-control.json`, transcript
+`/data/tmp/fs-compactor-idle-repro-20261125-v3.log`. Staged UBS v5 exits 0
+(one changed test file, 0 critical, 2,125 warning, 327 info), triaged as test
+assertions/fixture I/O and unchanged code. Production source remains exactly
+the implementation in `216575fc`; freeze the stronger fixture and rerun the
+entire unchanged stock gate before original acceptance and publication.
+
 Creation worksheet (requested granular TODO and scoped evidence): runtime
 does not branch on this block. Consumer: operator requesting completion of
 the idle-compactor repair. Gate: cannot claim that repair complete without
