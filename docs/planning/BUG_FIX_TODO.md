@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 idle compactor writer progress — active
+## November 25 idle compactor writer progress — qualified, publication pending
 
 `bd-idle-compactor-writer-progress-u5mm1`, OrangeSparrow. Existing ready
 queue is empty; blocked publisher migration and peer-owned work remain intact.
@@ -33,10 +33,10 @@ Cargo cache and retained separately, as recorded in
   retain its intended writer-progress failure.
 - [x] Complete focused compile/lint, ownership/admission tests and both old
   seven-scenario startup and new writer-progress regressions.
-- [ ] Freeze clean source and complete all eighteen unchanged stock gate
+- [x] Freeze clean source and complete all eighteen unchanged stock gate
   labels. Preserve failures, original ignores, exact source/ELF/model identity
   and native versus remote execution class; do not weaken acceptance.
-- [ ] Review the final production/test changes, run UBS and diff checks,
+- [x] Review the final production/test changes, run UBS and diff checks,
   then perform fresh solo original acceptance against the frozen revision.
 - [ ] Publish only qualified source and this scoped Bead row; verify both
   remote refs and preserve every unrelated published tracker row.
@@ -53,7 +53,7 @@ fails the old executable at the first ordinary append, as intended:
 `15d2ce53e36dc8af7a04638e21a13d5231f6349a612cbb80855ad00d5d15b52e`.
 The first candidate command mistakenly copied the old cached ELF again;
 its retained SHA proves that mistake and it earns no candidate credit.
-The actual freshly built default ELF `01310494…` accepts all three CLI
+The actual freshly built Cargo-test CLI ELF `01310494…` accepts all three CLI
 appends, merges both tiers and retries the observed contended publication.
 Its initial harness then correctly refuses the deliberately new vector-only
 ID because that ID has no source-window manifest membership. Correct this
@@ -72,7 +72,7 @@ New test unwrap/assert/JSON findings are test assertions and retained-fixture
 I/O; none is silently suppressed. UBS does not replace compilation or tests.
 
 Corrected long-lived regression PASS in 14.69s:
-`idle-writer-candidate-v3-result.json`; normal default ELF SHA256
+`idle-writer-candidate-v3-result.json`; Cargo-test CLI ELF SHA256
 `605fcb8768c61bb296f9dc077b0e30e6172926ba76f2c47b084d267429ba7ddc`,
 harness `445e00fd4b17f98bd1d35d7bab625de5df35868921c3e5b298eff793efcd9d77`,
 log `6ef6c0e912147bb3b7b9214a6c9d5398f6dea6bb2ce1eabbb086e34f8b652b0c`.
@@ -104,7 +104,7 @@ contention; after release it must appear in both compacted mains and Refined
 results. Four CLI appends are now the predeclared denominator. No new process
 hooks, fake vectors, production changes or relaxed assertions/deadlines.
 
-The stronger named test passes in 16.75s (four actual CLI appends):
+The stronger named test passes in 16.76s (four actual CLI appends):
 `idle-writer-candidate-v4-result.json`; matching baseline with the same new
 harness fails at the first ordinary append, `idle-writer-baseline-v2-result.json`.
 The existing fixture child guard now signals only when `Child::try_wait`
@@ -120,6 +120,122 @@ the live old daemon, then exit 0 after selected stop:
 assertions/fixture I/O and unchanged code. Production source remains exactly
 the implementation in `216575fc`; freeze the stronger fixture and rerun the
 entire unchanged stock gate before original acceptance and publication.
+
+Final functional and stock acceptance is complete on clean unchanged
+`b39f432dd5982a98467294793af359b1d542dda8`. Every one of the exact eighteen
+stock labels passes, terminal 0, 11:10:51–12:11:53 UTC, 3,662.16s;
+`stock-gate-idle-compactor-v2-result.json` binds log SHA256
+`89392bd000db7490ebbd60a52de3093f5a74cc9d2f77e7ecf54bcc7dc28c3792`.
+Execution is native thinkstation1, UID1000, original groups, private 4 GiB
+tmpfs; remote compiler success is recorded separately. No label skips, skip
+allowances, gate edits, lint relaxations, golden regeneration or widened
+deadlines. The library fsfs lane passes 3,368/0/16 (original unit ignores
+unchanged), schema 120/0/0; the newly declared real-model test executes
+explicitly in the unchanged stock e2e lane. Cargo.lock remains `ad2c99a0…`,
+the stock script `db7fae7f…`, nightly `1.100.0 (908501772)`, and the clean
+unpublished tool dependency fast_cmaes stays at `18b39102`.
+
+Final fresh acceptance uses the exact installed STOCK DEFAULT executable,
+not merely the earlier Cargo-test feature closure. Quickstart receipt
+`fsfs-quickstart.X5N42TUb/receipt.json` binds checker/source `b39f432d`,
+default profile, invocation-build origin, 12 commands, 22 controls and no
+remaining owned processes. Retained `idle-installed-b39f432d` has SHA256
+`127624341d1396d0e16bbc1b5b7bef17d8ec111c22d12b0db3a3a00362d5659b`.
+`idle-installed-writer-result.json` passes all four real CLI appends,
+same-daemon continuity, a fresh contention event, the new acknowledged ID in
+both pending WALs and then both mains and Refined results, exact producer
+identity, duplicate exclusion and selected stop, 17.83s; log SHA256
+`184cc873988c36dce51a77db4f6c7dd206d07c55e9697fec21960aab982fffeb`.
+`idle-installed-startup-result.json` passes all seven original cases in
+76.91s; log SHA256
+`f421d10d1cb06894ab3e480e6bfb79ce6e378e1760195008b818e46991ced8e0`.
+Both use final harness SHA256
+`a3fb245bcf7c0453b71a8b64a43430739ff896f6ba8091a6712b753ded4fc176`.
+The same harness's intended baseline failure is in
+`idle-final-writer-baseline-result.json`, log `2e1af6db…`. All eight installed
+fixtures' actual index-command JSON records Potion 256 and MiniLM 384 with
+`is_hash_control: false`; both identities survive compaction. The original
+Bead description remains byte-identical. Joined evidence is
+`idle-original-acceptance-result.json`; source publication remains required
+before closure. Earlier 605fcb87 CLI checks are separate subjects, not the
+installed-default proof. All referenced run receipts live under
+`/data/tmp/fs-daemon-startup.sKDROXdS` unless otherwise stated.
+
+Release remains open. Fresh unchanged DSR Mac admission at 12:10:37 UTC
+refuses 22.20 GiB free against the configured two-slot 40 GiB floor:
+`/data/tmp/fs-idle-compactor-macos-admission-v2.json`, SHA256
+`a491cf90b108cd33ecd6651f23d0a86fdc4a0d3454dd8b34db8347b105d9f0ad`.
+No capacity setting, version or tag changed. Six binary variants, forward
+crate/consumer qualification, full Quill campaigns and the separately held
+publisher/watch migration are not qualified by this source repair.
+
+End-of-block real-work audit (10:16 UTC through qualified publication):
+purpose from README: reusable two-tier hybrid search and its fsfs product.
+Actual commits inspected: `216575fc` USER (writers work with an idle daemon),
+`b39f432d` ENABLER (non-tautological contention proof); evidence/status edits
+are PROCESS and earn zero capability credit; UNKNOWN 0. The two-minute demo
+is the same-input old-daemon refusal/stopped success, then four appends with
+the repaired daemon alive and all IDs in Refined results. Removing the
+process notes would not change runtime behavior; they serve the requested
+TODO and honest closure. The enabler is exercised by the actual installed
+CLI, not speculative infrastructure. Oldest user-facing open work includes
+February's native ONNX replacement; it is peer-owned, while release is
+externally refused and the fixed publisher explicitly held. No ready work
+was displaced, no subagents were spawned, and no original criterion was
+split into a follow-up or edited to manufacture completion. Verdict HEALTHY;
+correction: retain the stronger new-ID control and keep broader work open.
+
+Honesty inventory, this same bounded block (numbers follow the invoked
+skill's worksheet):
+1. No (checked both commit test diffs): no existing test removed or newly
+   ignored; the new pinned-model case is explicitly executed, including the
+   stock e2e lane. Original fsfs library's sixteen ignores remain unchanged.
+2. Yes: initial identical-vector replay was inadequate positive proof.
+   Removed in `b39f432d`; real CLI new-ID append replaces it. Earlier pass
+   withdrawn in Bead comment 5456 and the operator update.
+3. No (checked changed paths/diffs): no golden or snapshot regenerated.
+4. Yes: production and regression tests change together; existing stop
+   controls follow the actual new compactor role, retain their state/signal
+   assertions and add independent writer exclusion. No gate, CI, validator,
+   suppression, bypass flag or tolerance changed; failed controls retained.
+5. No (checked production diff): no fixture ID, benchmark path or test-only
+   success branch. Publication contention remains real kernel exclusion.
+6. No (checked receipts): each named model run executes one test, the stock
+   lane executes the new case, and exactly eighteen distinct labels pass.
+7. No (checked terminal outcomes and source/ELF receipts): no unrun command
+   is reported as executed, and incomplete gate v1 earns no full-gate credit.
+8. Yes: the early replay/stale-log witness could overstate contention proof.
+   Replaced by a newly acknowledged real ID and a new log event after the
+   observed stopped child resumes; final installed readback proves its effect.
+9. Yes: first candidate copied the baseline cache by mistake; later weak
+   contention success was premature. Both were disclosed and corrected;
+   old failed/withdrawn receipts are preserved, not silently replaced.
+10. No (checked runner redirections): all cited stderr is retained in combined
+    or separate logs; no evidence command silences it.
+11. No (checked statuses): this bug stays in progress until qualified source
+    is published; no release or peer task is closed from these checks.
+12. No (checked creation description and unrelated rows): original acceptance
+    is byte-identical; no requirement or plan was rewritten as implementation.
+13–17. N/A, genuinely solo: no agent/pane delegation, peer certification or
+    agreement used as evidence. Remote compiler jobs are not reviewers.
+18. Expanded the fixture from three CLI appends plus synthetic replay to four
+    real appends before running the stronger version; the old result is
+    withdrawn, not silently assigned the new denominator. Countermetrics are
+    acknowledged IDs, both tiers, producer identity and unchanged adverse
+    cases. No performance win is claimed.
+Older-session check: six bounded cass queries, including this test's name;
+followed each first hit by exact archive ordinal. Tool titles and earlier
+partial work are not treated as historical certification.
+19. Explain the mistaken ELF and weak fixture before review: done in operator
+    updates, this history and Bead comments 5456/5459. No false-close remains.
+20. Strongest evidence: intended original-stock failure, same-input stopped
+    control, exact installed-stock four-append/new-ID readback and all seven
+    original cases, joined to all eighteen labels on clean unchanged b39f432d.
+Disposition: corrected in place, disclosed, and encoded as RH-2 (bind actual
+ELF/origin/proof class) and RH-5 (observable new payload and fresh contention
+witness). RH-1 control: exact stock script/labels, old assertions and all
+original acceptance are retained. This is solo verification, not independent
+certification. No unresolved test/gate relaxation is hidden.
 
 Creation worksheet (requested granular TODO and scoped evidence): runtime
 does not branch on this block. Consumer: operator requesting completion of
