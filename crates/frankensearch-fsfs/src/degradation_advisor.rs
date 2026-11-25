@@ -107,6 +107,11 @@ impl SearchRecoveryContext {
 pub enum DegradationFailureKind {
     RefinementFailed,
     LexicalFallback,
+    /// A model operation failed without independently identifying its tier.
+    ModelUnavailable,
+    /// An artifact failed verification without identifying its role or tier.
+    ArtifactIntegrityFailure,
+    /// The quality lane independently observed an absent quality producer.
     MissingQualityModel,
     UnverifiableEmbeddingSpace,
     Timeout,
@@ -122,6 +127,8 @@ impl DegradationFailureKind {
         match self {
             Self::RefinementFailed => "degrade.advice.refinement_failed",
             Self::LexicalFallback => "degrade.advice.lexical_fallback",
+            Self::ModelUnavailable => "degrade.advice.model_unavailable",
+            Self::ArtifactIntegrityFailure => "degrade.advice.artifact_integrity_failure",
             Self::MissingQualityModel => "degrade.advice.quality_model_missing",
             Self::UnverifiableEmbeddingSpace => "degrade.advice.embedding_space_unverifiable",
             Self::Timeout => "degrade.advice.timeout",
@@ -137,6 +144,10 @@ impl DegradationFailureKind {
         match self {
             Self::RefinementFailed => "quality refinement failed; initial results remain usable",
             Self::LexicalFallback => "semantic retrieval fell back to lexical search",
+            Self::ModelUnavailable => "semantic model unavailable; inspect producer readiness",
+            Self::ArtifactIntegrityFailure => {
+                "artifact verification failed; inspect model and index readiness"
+            }
             Self::MissingQualityModel => "quality model unavailable; refinement skipped",
             Self::UnverifiableEmbeddingSpace => {
                 "semantic index and query embedding identities cannot be proven compatible"
@@ -158,13 +169,14 @@ impl DegradationFailureKind {
         match self {
             Self::RefinementFailed
             | Self::LexicalFallback
+            | Self::ModelUnavailable
             | Self::MissingQualityModel
             | Self::UnverifiableEmbeddingSpace
             | Self::Timeout
             | Self::CacheMiss
             | Self::SemanticZeroSignal
             | Self::HashControlGeneration => true,
-            Self::CorruptIndex => false,
+            Self::CorruptIndex | Self::ArtifactIntegrityFailure => false,
         }
     }
 }
@@ -348,7 +360,8 @@ pub fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
         | SearchError::DimensionMismatch { .. } => DegradationFailureKind::CorruptIndex,
         SearchError::EmbedderUnavailable { .. }
         | SearchError::ModelNotFound { .. }
-        | SearchError::ModelLoadFailed { .. } => DegradationFailureKind::MissingQualityModel,
+        | SearchError::ModelLoadFailed { .. } => DegradationFailureKind::ModelUnavailable,
+        SearchError::HashMismatch { .. } => DegradationFailureKind::ArtifactIntegrityFailure,
         SearchError::UnverifiableRemoteSpace { .. } => {
             DegradationFailureKind::UnverifiableEmbeddingSpace
         }
@@ -369,36 +382,38 @@ pub fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
         | SearchError::FederatedInsufficientResponses { .. }
         | SearchError::QueueFull { .. }
         | SearchError::DurabilityDisabled
-        | SearchError::HashMismatch { .. }
         | SearchError::QueryParseError { .. } => DegradationFailureKind::RefinementFailed,
     }
 }
 
 /// Map a [`DegradationFailureKind`] to the canonical [`SemanticReadiness`]
 /// state under the caller's requested mode and retrieval topology.
+///
+/// Generic model and artifact failures do not identify a stored producer.
+/// Independently observed quality absence keeps its exact tier; the planner
+/// rejects requests whose topology cannot include that tier.
 #[must_use]
 pub const fn semantic_readiness_for_failure(
     failure: DegradationFailureKind,
     mode: RequestMode,
-    requested_topology: RetrievalTopology,
+    _requested_topology: RetrievalTopology,
 ) -> SemanticReadiness {
     if matches!(mode, RequestMode::HashControl) {
         return SemanticReadiness::HashControl;
     }
-    let tier = if matches!(requested_topology, RetrievalTopology::FastOnly) {
-        ModelTier::Fast
-    } else {
-        ModelTier::Quality
-    };
     match failure {
-        DegradationFailureKind::MissingQualityModel => SemanticReadiness::ModelMissing { tier },
+        DegradationFailureKind::MissingQualityModel => SemanticReadiness::ModelMissing {
+            tier: ModelTier::Quality,
+        },
         // A failed query is not an index census or producer attestation. In
         // particular, timing out does not prove that half of the quality tier
         // exists, and a cache miss does not prove that an index is absent.
         DegradationFailureKind::RefinementFailed
         | DegradationFailureKind::Timeout
         | DegradationFailureKind::LexicalFallback
-        | DegradationFailureKind::CacheMiss => SemanticReadiness::ReadinessUnproven,
+        | DegradationFailureKind::CacheMiss
+        | DegradationFailureKind::ModelUnavailable
+        | DegradationFailureKind::ArtifactIntegrityFailure => SemanticReadiness::ReadinessUnproven,
         DegradationFailureKind::UnverifiableEmbeddingSpace => SemanticReadiness::RemoteUnverified,
         DegradationFailureKind::CorruptIndex => SemanticReadiness::ManifestUnsafe,
         DegradationFailureKind::SemanticZeroSignal => {
@@ -410,6 +425,12 @@ pub const fn semantic_readiness_for_failure(
 
 /// Map a [`SearchError`] to its canonical [`SemanticReadiness`] state without
 /// formatting or inspecting opaque provider error bodies.
+///
+/// Generic model errors identify neither a tier nor a proven acquisition need.
+/// A requested topology is policy, not evidence of the failed producer: even a
+/// single-tier request can admit a retained bundle containing both tiers.
+/// Use [`recovery_plan_for_readiness`] with independently observed typed model
+/// readiness when choosing a tier-specific recovery action.
 #[must_use]
 pub fn semantic_readiness_for_search_error(
     error: &SearchError,
@@ -419,18 +440,11 @@ pub fn semantic_readiness_for_search_error(
     if matches!(mode, RequestMode::HashControl) {
         return SemanticReadiness::HashControl;
     }
-    let tier = if matches!(requested_topology, RetrievalTopology::FastOnly) {
-        ModelTier::Fast
-    } else {
-        ModelTier::Quality
-    };
     match error {
-        SearchError::ModelNotFound { .. } | SearchError::EmbedderUnavailable { .. } => {
-            SemanticReadiness::ModelMissing { tier }
-        }
-        SearchError::ModelLoadFailed { .. } | SearchError::HashMismatch { .. } => {
-            SemanticReadiness::ModelUnloadable { tier }
-        }
+        SearchError::ModelNotFound { .. }
+        | SearchError::EmbedderUnavailable { .. }
+        | SearchError::ModelLoadFailed { .. }
+        | SearchError::HashMismatch { .. } => SemanticReadiness::ReadinessUnproven,
         SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
             SemanticReadiness::IndexAbsent
         }
@@ -526,6 +540,8 @@ pub fn synthetic_degradation_advice_fixture() -> Vec<DegradationAdvice> {
     [
         DegradationFailureKind::RefinementFailed,
         DegradationFailureKind::LexicalFallback,
+        DegradationFailureKind::ModelUnavailable,
+        DegradationFailureKind::ArtifactIntegrityFailure,
         DegradationFailureKind::MissingQualityModel,
         DegradationFailureKind::UnverifiableEmbeddingSpace,
         DegradationFailureKind::Timeout,
@@ -551,6 +567,7 @@ pub fn synthetic_degradation_advice_fixture() -> Vec<DegradationAdvice> {
 const fn severity_for(failure: DegradationFailureKind) -> DegradationAdviceSeverity {
     match failure {
         DegradationFailureKind::RefinementFailed
+        | DegradationFailureKind::ModelUnavailable
         | DegradationFailureKind::MissingQualityModel
         | DegradationFailureKind::UnverifiableEmbeddingSpace
         | DegradationFailureKind::Timeout
@@ -558,7 +575,9 @@ const fn severity_for(failure: DegradationFailureKind) -> DegradationAdviceSever
         | DegradationFailureKind::SemanticZeroSignal
         | DegradationFailureKind::HashControlGeneration => DegradationAdviceSeverity::Warn,
         DegradationFailureKind::LexicalFallback => DegradationAdviceSeverity::Info,
-        DegradationFailureKind::CorruptIndex => DegradationAdviceSeverity::Error,
+        DegradationFailureKind::CorruptIndex | DegradationFailureKind::ArtifactIntegrityFailure => {
+            DegradationAdviceSeverity::Error
+        }
     }
 }
 
@@ -601,6 +620,13 @@ fn next_actions_for(
                 with_index("fsfs index . --full", ""),
             ),
         ],
+        DegradationFailureKind::ModelUnavailable
+        | DegradationFailureKind::ArtifactIntegrityFailure => vec![action(
+            1,
+            "degrade.action.inspect_readiness",
+            "Inspect model and index readiness before choosing recovery; this failure does not identify a tier or establish a need to download or rebuild.",
+            with_index("fsfs doctor", " --format json"),
+        )],
         DegradationFailureKind::MissingQualityModel => vec![
             action(
                 1,
@@ -864,6 +890,213 @@ mod tests {
     }
 
     #[test]
+    fn model_failures_do_not_select_acquisition_from_request_topology_or_display_name() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticReadiness,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Allowed,
+            acquisition_authorization: None,
+        };
+        for display_name in ["potion-128M", "all-MiniLM-L6-v2"] {
+            let errors = [
+                SearchError::ModelNotFound {
+                    name: display_name.to_owned(),
+                },
+                SearchError::EmbedderUnavailable {
+                    model: display_name.to_owned(),
+                    reason: "the selected loader is not compiled into this binary".to_owned(),
+                },
+                SearchError::ModelLoadFailed {
+                    path: PathBuf::from(display_name).join("weights.bin"),
+                    source: Box::new(std::io::Error::other("producer initialization failed")),
+                },
+                SearchError::HashMismatch {
+                    path: PathBuf::from(display_name).join("weights.bin"),
+                    expected: "expected-digest".to_owned(),
+                    actual: "actual-digest".to_owned(),
+                },
+            ];
+            for requested_topology in [
+                RetrievalTopology::FastOnly,
+                RetrievalTopology::QualityOnly,
+                RetrievalTopology::FullProgressive,
+            ] {
+                let request = RecoveryRequest {
+                    mode: RequestMode::ExplicitSemantic,
+                    requested_topology,
+                };
+                for error in &errors {
+                    let plan =
+                        super::recovery_plan_for_search_error(error, request, &policy, None, 0)
+                            .expect("an unlocated producer failure has a diagnostic plan");
+                    let advice = advice_for_search_error(
+                        "query",
+                        Some(Path::new("/tmp/fsfs-index")),
+                        error,
+                    );
+                    let (failure, reason, summary, wire_failure) =
+                        if matches!(error, SearchError::HashMismatch { .. }) {
+                            (
+                                DegradationFailureKind::ArtifactIntegrityFailure,
+                                "degrade.advice.artifact_integrity_failure",
+                                "artifact verification failed; inspect model and index readiness",
+                                "artifact_integrity_failure",
+                            )
+                        } else {
+                            (
+                                DegradationFailureKind::ModelUnavailable,
+                                "degrade.advice.model_unavailable",
+                                "semantic model unavailable; inspect producer readiness",
+                                "model_unavailable",
+                            )
+                        };
+                    assert_eq!(advice.failure, failure);
+                    assert_eq!(advice.reason_code, reason);
+                    assert_eq!(advice.operator_summary, summary);
+                    assert_eq!(serde_json::to_value(&advice).unwrap()["failure"], wire_failure);
+                    assert_eq!(advice.next_actions.len(), 1);
+                    assert_eq!(
+                        advice.next_actions[0].reason_code,
+                        "degrade.action.inspect_readiness"
+                    );
+                    assert_eq!(
+                        advice.next_actions[0].command.as_deref(),
+                        Some("fsfs doctor --index-dir '/tmp/fsfs-index' --format json")
+                    );
+                    assert!(!advice.next_actions[0].action.contains("quality"));
+                    let advice_plan = advice
+                        .recovery_plan(request, &policy, None, 0)
+                        .expect("classified advice must not invent the failing tier either");
+                    assert_eq!(plan, advice_plan);
+                    assert_eq!(plan.state(), &SemanticReadiness::ReadinessUnproven);
+                    assert!(!plan.semantic_available());
+                    assert!(plan.response_contract().is_none());
+                    let action = plan.action().expect("readiness inspection");
+                    assert_eq!(action.code(), "recovery.action.inspect_readiness");
+                    assert!(!action.network_required());
+                    assert!(!action.potentially_destructive());
+                    assert!(action.required_authorization().is_none());
+                    let parsed = crate::parse_cli_args(action.argv().iter().skip(1).cloned())
+                        .expect("diagnosis is executable through the actual CLI");
+                    assert_eq!(parsed.command, crate::CliCommand::Doctor);
+                    assert_eq!(parsed.format, crate::OutputFormat::Json);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_model_readiness_retains_its_tier_in_progressive_recovery() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryContractError, RecoveryPolicy,
+            RecoveryRequest, RequestMode, SemanticReadiness,
+        };
+        use frankensearch_core::traits::ModelTier;
+        use frankensearch_core::types::RetrievalTopology;
+
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let request = RecoveryRequest {
+            mode: RequestMode::ExplicitSemantic,
+            requested_topology: RetrievalTopology::FullProgressive,
+        };
+        for tier in [ModelTier::Fast, ModelTier::Quality] {
+            for (readiness, action_code) in [
+                (
+                    SemanticReadiness::ModelMissing { tier },
+                    "recovery.action.acquire_model",
+                ),
+                (
+                    SemanticReadiness::ModelUnloadable { tier },
+                    "recovery.action.reacquire_model",
+                ),
+            ] {
+                let plan =
+                    super::recovery_plan_for_readiness(&readiness, request, &policy, None, 0)
+                        .expect("independently observed producer readiness stays actionable");
+                assert_eq!(plan.state(), &readiness);
+                assert_eq!(plan.action().unwrap().code(), action_code);
+                let other_topology = match tier {
+                    ModelTier::Fast => RetrievalTopology::QualityOnly,
+                    ModelTier::Quality => RetrievalTopology::FastOnly,
+                };
+                let other_request = RecoveryRequest {
+                    requested_topology: other_topology,
+                    ..request
+                };
+                assert!(matches!(
+                    super::recovery_plan_for_readiness(
+                        &readiness,
+                        other_request,
+                        &policy,
+                        None,
+                        0,
+                    ),
+                    Err(RecoveryContractError::UnavailableTierTopologyMismatch { .. })
+                ));
+            }
+        }
+
+        let advice = super::DegradationAdvice::from_input(super::DegradationAdviceInput {
+            failure: DegradationFailureKind::MissingQualityModel,
+            query: "query",
+            index_dir: None,
+            original_error: None,
+            replay_command: None,
+        });
+        assert_eq!(advice.reason_code, "degrade.advice.quality_model_missing");
+        assert_eq!(
+            advice.operator_summary,
+            "quality model unavailable; refinement skipped"
+        );
+        for topology in [
+            RetrievalTopology::QualityOnly,
+            RetrievalTopology::FullProgressive,
+        ] {
+            let plan = advice
+                .recovery_plan(
+                    RecoveryRequest {
+                        requested_topology: topology,
+                        ..request
+                    },
+                    &policy,
+                    None,
+                    0,
+                )
+                .expect("observed quality absence applies to quality-bearing requests");
+            assert_eq!(
+                plan.state(),
+                &SemanticReadiness::ModelMissing {
+                    tier: ModelTier::Quality,
+                }
+            );
+        }
+        assert!(matches!(
+            advice.recovery_plan(
+                RecoveryRequest {
+                    requested_topology: RetrievalTopology::FastOnly,
+                    ..request
+                },
+                &policy,
+                None,
+                0,
+            ),
+            Err(RecoveryContractError::UnavailableTierTopologyMismatch {
+                tier: ModelTier::Quality,
+                requested_topology: RetrievalTopology::FastOnly,
+            })
+        ));
+    }
+
+    #[test]
     fn terminal_recovery_does_not_reinterpret_cancelled_invalid_or_reported_errors() {
         use frankensearch_core::recovery_plan::{
             InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
@@ -919,6 +1152,8 @@ mod tests {
             vec![
                 "degrade.advice.refinement_failed",
                 "degrade.advice.lexical_fallback",
+                "degrade.advice.model_unavailable",
+                "degrade.advice.artifact_integrity_failure",
                 "degrade.advice.quality_model_missing",
                 "degrade.advice.embedding_space_unverifiable",
                 "degrade.advice.timeout",
@@ -1169,6 +1404,32 @@ mod tests {
                     let readiness =
                         super::semantic_readiness_for_failure(fixture.failure, mode, topology);
                     assert_eq!(fixture.semantic_readiness(mode, topology), readiness);
+                    if fixture.failure == DegradationFailureKind::MissingQualityModel
+                        && topology == RetrievalTopology::FastOnly
+                    {
+                        use frankensearch_core::recovery_plan::RecoveryContractError;
+                        use frankensearch_core::traits::ModelTier;
+
+                        for result in [
+                            super::recovery_plan_for_readiness(
+                                &readiness,
+                                request,
+                                &policy,
+                                None,
+                                1_750_000_000,
+                            ),
+                            fixture.recovery_plan(request, &policy, None, 1_750_000_000),
+                        ] {
+                            assert!(matches!(
+                                result,
+                                Err(RecoveryContractError::UnavailableTierTopologyMismatch {
+                                    tier: ModelTier::Quality,
+                                    requested_topology: RetrievalTopology::FastOnly,
+                                })
+                            ));
+                        }
+                        continue;
+                    }
                     let plan = super::recovery_plan_for_readiness(
                         &readiness,
                         request,
@@ -1176,7 +1437,7 @@ mod tests {
                         None,
                         1_750_000_000,
                     )
-                    .expect("every DegradationFailureKind must produce a valid RecoveryPlan");
+                    .expect("every applicable DegradationFailureKind must produce a valid plan");
                     let advice_plan = fixture
                         .recovery_plan(request, &policy, None, 1_750_000_000)
                         .expect("DegradationAdvice::recovery_plan must match canonical plan");
@@ -1425,7 +1686,7 @@ mod public_advice_tests {
                 let advice =
                     advice_for_search_error("public query", Some(Path::new("/index")), &error);
                 let expected_kind = if matches!(&error, SearchError::ModelLoadFailed { .. }) {
-                    DegradationFailureKind::MissingQualityModel
+                    DegradationFailureKind::ModelUnavailable
                 } else {
                     DegradationFailureKind::RefinementFailed
                 };

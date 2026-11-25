@@ -121,8 +121,11 @@ startup production/test implementation are byte-identical to `b692f5d4`.
 - [x] Execute all three repaired probes green and all 152 daemon-focused tests
   green, zero ignored; formatting, strict all-target fsfs Clippy and three-file
   scanner triage pass. No runtime, dependency, unsafe site or suppression added.
-- [ ] Preserve the additional upstream cache/recovery work at `de47fbda` before
-  freezing the next combined source. Requalify graph dependencies if changed.
+- [x] Preserve the additional upstream cache/recovery work at `de47fbda` before
+  freezing the next combined source. Review producer-contract invalidation,
+  cancellation/epoch fencing, legacy raw adapters and neutral recovery advice.
+- [ ] Requalify the optional graph feature on this combined source: its cache
+  dependency changed, so the earlier graph result cannot qualify this tree.
 - [ ] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
 - [ ] Repeat the twelve actual-model native preview command outcomes and add

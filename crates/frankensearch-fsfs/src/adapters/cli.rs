@@ -3362,6 +3362,8 @@ mod tests {
         let failures = [
             DegradationFailureKind::RefinementFailed,
             DegradationFailureKind::LexicalFallback,
+            DegradationFailureKind::ModelUnavailable,
+            DegradationFailureKind::ArtifactIntegrityFailure,
             DegradationFailureKind::MissingQualityModel,
             DegradationFailureKind::UnverifiableEmbeddingSpace,
             DegradationFailureKind::Timeout,
