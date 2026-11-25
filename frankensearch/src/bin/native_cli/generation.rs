@@ -365,8 +365,13 @@ source_low, source_high, and exactly one of changes (upsert/delete objects) or\n
 documents (the complete replacement inventory). Destinations must be new\n\
 absolute paths. At most 1000 mutations or documents fit within the 1 MiB request\n\
 budget. Empty changes advance the checkpoint; empty documents clear a complete\n\
-cohort. --batch-size requires this flag.\n\
-Updates retain producer, tier, precision and retrieval policy. They save a recovery\n\
+cohort. --batch-size requires this flag. Partial updates retain their covered IDs\n\
+and require a nonempty proper quality subset by default. On a partial selection,\n\
+allow_coverage_transition=true explicitly permits full, fast-only, or empty\n\
+successors derived from surviving coverage. It never embeds newly covered IDs.\n\
+The session retains its fast model/cache and drops the quality model/cache only\n\
+when no covered IDs survive. Replies advertise the successor's query modes.\n\
+Updates retain producer, precision and retrieval policy. They save a recovery\n\
 receipt before publication, compare the original authority pair, and install the\n\
 exact admitted successor. They report publication separately from reader activation.\n\
 Queries retain the old selection after refusal or unresolved publication; further\n\
@@ -3924,6 +3929,13 @@ impl AuthorityModels {
         }
     }
 
+    fn primary_only(&self) -> Result<Self> {
+        Ok(Self::Semantic(Models {
+            fast: Arc::clone(&self.models()?.fast),
+            quality: None,
+        }))
+    }
+
     fn admit(&self, receipt: &Receipt) -> Result<()> {
         match self {
             Self::Semantic(models) => admit_serving_models(receipt, models),
@@ -4029,6 +4041,8 @@ struct AuthorityUpdateRequest {
     new_receipt: PathBuf,
     source_low: u64,
     source_high: u64,
+    #[serde(default)]
+    allow_coverage_transition: bool,
     #[serde(default, deserialize_with = "super::serve::supplied_array")]
     changes: Option<Vec<mutations::Mutation>>,
     #[serde(default, deserialize_with = "super::serve::supplied_array")]
@@ -4367,6 +4381,11 @@ impl AuthoritySession {
         response["quality_completion_activation_enabled"] = serde_json::json!(completion);
         response["quality_completion_enabled"] =
             serde_json::json!(completion && self.update_limits.is_some());
+        response["coverage_transition_enabled"] = serde_json::json!(
+            semantic
+                && self.update_limits.is_some()
+                && matches!(topology, NativeGenerationTopology::PartialQuality { .. })
+        );
         response["full_mode_reranker"] = serde_json::json!(
             self.query_policy
                 .rerank
@@ -4709,10 +4728,30 @@ impl AuthoritySession {
                 limits,
                 max_image_bytes: self.max_image_bytes,
                 replace_source,
-                allow_coverage_transition: false,
+                allow_coverage_transition: request.allow_coverage_transition,
             },
             || Ok(edits),
         )?;
+        // Prepare the entire serving provider selection before any publication.
+        // A partial-to-fast transition retires both quality handles while
+        // preserving the exact warm fast cache. Other transitions keep both
+        // independently admitted providers and their existing query caches.
+        let successor_models = if prepared.spec.allow_coverage_transition
+            && prepared
+                .quality_document_ids
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        {
+            Some((
+                self.models.primary_only()?,
+                self.cached_query_models
+                    .as_ref()
+                    .map(AuthorityModels::primary_only)
+                    .transpose()?,
+            ))
+        } else {
+            None
+        };
         let document_count = prepared.document_count;
         let edit_count = prepared.edits.len();
         let receipt_path = prepared.spec.receipt.clone();
@@ -4730,10 +4769,15 @@ impl AuthoritySession {
         .await?;
         // This is the exact admitted result returned by publication. Do not
         // reopen the head, revalidate mutable paths, or checkpoint after commit.
-        // The request loop owns all three fields until terminal acknowledgement.
+        // The request loop owns the reader, scope and providers until terminal
+        // acknowledgement; no query can observe a mixed selection.
         self.receipt = published.receipt;
         self.snapshot = published.snapshot;
         self.scope = published.scope;
+        if let Some((models, cached_query_models)) = successor_models {
+            self.models = models;
+            self.cached_query_models = cached_query_models;
+        }
         let mut response = self.response("updated", true, None, request.id.as_deref());
         response["publication"] = serde_json::json!("committed");
         response["serving"] = serde_json::json!("activated");
@@ -4742,6 +4786,7 @@ impl AuthoritySession {
         response["selection"] = serde_json::json!(self.receipt);
         response["documents"] = serde_json::json!(document_count);
         response["edited_ids"] = serde_json::json!(edit_count);
+        self.annotate_query_capabilities(&mut response);
         Ok(response)
     }
 

@@ -9126,6 +9126,250 @@ mod progressive_authority {
     }
 
     #[test]
+    fn partial_warm_coverage_transitions_install_coherent_cached_successors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ann in [false, true] {
+                for replace_source in [false, true] {
+                    for (label, keep, topology) in [
+                        (
+                            "full",
+                            vec!["quality"],
+                            NativeGenerationTopology::FullProgressive,
+                        ),
+                        (
+                            "fast",
+                            vec!["fast-only", "garden"],
+                            NativeGenerationTopology::FastOnly,
+                        ),
+                        ("empty", vec![], NativeGenerationTopology::FastOnly),
+                        (
+                            "partial",
+                            vec!["fast-only", "quality"],
+                            NativeGenerationTopology::PartialQuality {
+                                quality_documents: 1,
+                                total_documents: 2,
+                                coverage_ppm: 500_000,
+                            },
+                        ),
+                    ] {
+                        let parent = private_parent();
+                        let fast = provider(false);
+                        let quality = provider(true);
+                        let (initial, selected) =
+                            publish_partial_cli(&cx, &parent, &fast, &quality, ann).await;
+                        let root = admit_root(&selected.root).unwrap();
+                        let retained = Arc::new(
+                            selected
+                                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                                .unwrap(),
+                        );
+                        let original_source =
+                            retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+                        let original_receipt = fs::read(&initial.receipt).unwrap();
+                        let mut session = AuthoritySession::new(
+                            &cx,
+                            root,
+                            selected.clone(),
+                            Arc::clone(&retained),
+                            models(&fast, &quality),
+                            (4, DEFAULT_IMAGE_BYTES),
+                            false,
+                        )
+                        .unwrap()
+                        .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+                        .unwrap()
+                        .with_filter(
+                            &cx,
+                            Some(
+                                Filter::parse(r#"{"ids":["quality","fast-only","new"]}"#).unwrap(),
+                            ),
+                            MAX_INPUT_BYTES,
+                        )
+                        .unwrap()
+                        .with_updates(2, MAX_INPUT_BYTES)
+                        .unwrap();
+                        let raw = session.models.models().unwrap().clone();
+                        let cached = session.query_models().models().unwrap().clone();
+                        let primed = exchange(
+                            &cx,
+                            &mut session,
+                            &[serde_json::json!({"query":"retry", "mode":"partial", "stream":true})],
+                        )
+                        .await;
+                        assert_eq!(primed[0]["coverage_transition_enabled"], true);
+                        assert_eq!(primed[2]["phase"], "refined");
+                        let before = calls(&fast, &quality);
+                        let next_path = parent.join(format!("{label}.json"));
+                        let mut request = serde_json::json!({
+                            "op":"update", "id":label, "expected_authority":selected.authority,
+                            "work_dir":parent.join(format!("{label}-work")), "new_receipt":next_path,
+                            "source_low":2, "source_high":8, "allow_coverage_transition":true,
+                        });
+                        let records: Vec<_> = original_source
+                            .iter()
+                            .filter_map(|document| {
+                                if replace_source {
+                                    keep.contains(&document.id.as_str()).then(|| {
+                                        serde_json::json!({"id":document.id, "content":document.content})
+                                    })
+                                } else {
+                                    (!keep.contains(&document.id.as_str()))
+                                        .then(|| serde_json::json!({"op":"delete", "id":document.id}))
+                                }
+                            })
+                            .collect();
+                        request[if replace_source {
+                            "documents"
+                        } else {
+                            "changes"
+                        }] = serde_json::json!(records);
+                        let mut query =
+                            serde_json::json!({"id":"after", "query":"retry", "stream":true});
+                        if label == "partial" {
+                            query["mode"] = serde_json::json!("partial");
+                        }
+                        // Continue querying within the same request stream: no
+                        // second ready frame may conceal an incomplete handoff.
+                        let response = exchange(&cx, &mut session, &[request, query]).await;
+                        assert_eq!(response[1]["event"], "updated");
+                        assert_eq!(response[1]["publication"], "committed");
+                        assert_eq!(response[1]["serving"], "activated");
+                        assert_eq!(session.snapshot.topology(), topology);
+                        assert_eq!(session.receipt.topology(), topology);
+                        assert_eq!(
+                            response[1]["query_modes"],
+                            if label == "full" {
+                                serde_json::json!(["fast", "quality", "full", "lexical"])
+                            } else if label == "partial" {
+                                serde_json::json!(["fast", "partial", "lexical"])
+                            } else {
+                                serde_json::json!(["fast", "lexical"])
+                            }
+                        );
+                        assert_eq!(
+                            response[1]["coverage_transition_enabled"],
+                            label == "partial"
+                        );
+                        assert_eq!(
+                            response[1]["default_mode"],
+                            if label == "full" { "full" } else { "fast" }
+                        );
+                        let scoped_ids: BTreeSet<_> = keep
+                            .iter()
+                            .filter(|id| **id != "garden")
+                            .map(|id| (*id).to_owned())
+                            .collect();
+                        assert_eq!(session.scope.as_ref().unwrap().len(), scoped_ids.len());
+                        assert_eq!(response[1]["scope"]["eligible_documents"], scoped_ids.len());
+                        let final_query = response.last().unwrap();
+                        assert_eq!(final_query["event"], "results");
+                        assert_eq!(final_query["id"], "after");
+                        assert_eq!(final_query["authority"], response[1]["authority"]);
+                        assert_eq!(
+                            final_query["results"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|hit| hit["doc_id"].as_str().unwrap().to_owned())
+                                .collect::<BTreeSet<_>>(),
+                            scoped_ids,
+                        );
+                        assert_eq!(
+                            calls(&fast, &quality),
+                            before,
+                            "delete-only builds reuse vectors and the continuing query reuses both warm caches",
+                        );
+                        assert!(Arc::ptr_eq(
+                            &raw.fast,
+                            &session.models.models().unwrap().fast
+                        ));
+                        assert!(Arc::ptr_eq(
+                            &cached.fast,
+                            &session.query_models().models().unwrap().fast
+                        ));
+                        let retains_quality = keep.contains(&"quality");
+                        for (old, next) in [
+                            (&raw, session.models.models().unwrap()),
+                            (&cached, session.query_models().models().unwrap()),
+                        ] {
+                            assert_eq!(next.quality.is_some(), retains_quality);
+                            if retains_quality {
+                                assert!(Arc::ptr_eq(
+                                    old.quality.as_ref().unwrap(),
+                                    next.quality.as_ref().unwrap()
+                                ));
+                            }
+                        }
+                        let next = Receipt::read(&next_path).unwrap();
+                        let reopened = next.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        assert_eq!(reopened.authority(), session.snapshot.authority());
+                        assert_eq!(reopened.topology(), topology);
+                        assert_eq!(
+                            reopened.retrieval_configuration(),
+                            retained.retrieval_configuration()
+                        );
+                        assert_eq!(
+                            reopened.quality_retrieval_configuration(),
+                            if retains_quality {
+                                retained.quality_retrieval_configuration()
+                            } else {
+                                None
+                            },
+                        );
+                        assert_eq!(
+                            reopened
+                                .source_documents(&cx, MAX_INPUT_BYTES)
+                                .unwrap()
+                                .iter()
+                                .map(|document| document.id.as_str())
+                                .collect::<BTreeSet<_>>(),
+                            keep.iter().copied().collect::<BTreeSet<_>>(),
+                        );
+                        assert_eq!(fs::read(&initial.receipt).unwrap(), original_receipt);
+                        assert_eq!(
+                            serde_json::to_value(
+                                retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
+                            )
+                            .unwrap(),
+                            serde_json::to_value(&original_source).unwrap(),
+                        );
+                        assert_eq!(
+                            retained.partial_quality_document_ids(&cx).unwrap(),
+                            ["quality"]
+                        );
+
+                        if !retains_quality {
+                            // Fast and empty successors stay writable without a
+                            // stale quality handle or another transition grant.
+                            let followup = exchange(
+                                &cx,
+                                &mut session,
+                                &[
+                                    serde_json::json!({
+                                        "op":"update", "expected_authority":next.authority,
+                                        "work_dir":parent.join("followup-work"), "new_receipt":parent.join("followup.json"),
+                                        "source_low":2, "source_high":9,
+                                        "changes":[{"op":"upsert", "id":"new", "content":"retry newly indexed document"}],
+                                    }),
+                                    serde_json::json!({"query":"retry", "filter":{"ids":["new"]}}),
+                                ],
+                            )
+                            .await;
+                            assert_eq!(followup[1]["event"], "updated");
+                            assert_eq!(followup[2]["results"][0]["doc_id"], "new");
+                            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1));
+                            assert!(Arc::ptr_eq(
+                                &cached.fast,
+                                &session.query_models().models().unwrap().fast
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn partial_warm_updates_keep_scopes_query_caches_and_old_readers() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let parent = private_parent();
@@ -9280,6 +9524,412 @@ mod progressive_authority {
                     authority
                 );
             }
+        });
+    }
+
+    #[test]
+    fn partial_warm_coverage_transition_request_requires_an_explicit_boolean() {
+        let request = serde_json::json!({
+            "op":"update", "expected_authority":[],
+            "work_dir":"/work", "new_receipt":"/receipt.json",
+            "source_low":2, "source_high":8, "changes":[]
+        });
+        assert!(
+            !serde_json::from_value::<AuthorityUpdateRequest>(request.clone())
+                .unwrap()
+                .allow_coverage_transition
+        );
+        for allowed in [false, true] {
+            let mut supplied = request.clone();
+            supplied["allow_coverage_transition"] = serde_json::json!(allowed);
+            assert_eq!(
+                serde_json::from_value::<AuthorityUpdateRequest>(supplied)
+                    .unwrap()
+                    .allow_coverage_transition,
+                allowed
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut supplied = request.clone();
+            supplied["allow_coverage_transition"] = invalid;
+            assert!(serde_json::from_value::<AuthorityUpdateRequest>(supplied.clone()).is_err());
+            assert!(serde_json::from_value::<AuthorityRequest>(supplied).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_warm_coverage_transition_guards_refuse_before_inference_or_work_files() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (partial, allowed, code) in [
+                (
+                    true,
+                    None,
+                    "partial_quality_update_requires_partial_coverage",
+                ),
+                (
+                    true,
+                    Some(false),
+                    "partial_quality_update_requires_partial_coverage",
+                ),
+                (
+                    false,
+                    Some(true),
+                    "coverage_transition_requires_partial_quality",
+                ),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let selected = if partial {
+                    publish_partial_cli(&cx, &parent, &fast, &quality, false)
+                        .await
+                        .1
+                } else {
+                    publish_full(
+                        &cx,
+                        &parent,
+                        &fast,
+                        &quality,
+                        vec![
+                            IndexableDocument::new("quality", "retry network requests"),
+                            IndexableDocument::new("fast-only", "retry fallback"),
+                        ],
+                        [NativeBuildRetrieval::Exact; 2],
+                    )
+                    .await
+                };
+                let root = admit_root(&selected.root).unwrap();
+                let snapshot = Arc::new(
+                    selected
+                        .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                        .unwrap(),
+                );
+                let mut session = AuthoritySession::new(
+                    &cx,
+                    root,
+                    selected.clone(),
+                    Arc::clone(&snapshot),
+                    models(&fast, &quality),
+                    (4, DEFAULT_IMAGE_BYTES),
+                    false,
+                )
+                .unwrap()
+                .with_updates(2, MAX_INPUT_BYTES)
+                .unwrap();
+                let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+                let before = calls(&fast, &quality);
+                let work = parent.join("refused-work");
+                let receipt = parent.join("refused.json");
+                let mut request = serde_json::json!({
+                    "op":"update", "expected_authority":selected.authority,
+                    "work_dir":work, "new_receipt":receipt,
+                    "source_low":2, "source_high":8,
+                    "changes":[{"op":"delete", "id":"quality"}]
+                });
+                if let Some(allowed) = allowed {
+                    request["allow_coverage_transition"] = serde_json::json!(allowed);
+                }
+                let error = session
+                    .update(&cx, serde_json::from_value(request).unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<AuthorityServeRefusal>().unwrap().0,
+                    code
+                );
+                assert_eq!(calls(&fast, &quality), before);
+                assert!(!work.exists());
+                assert!(!receipt.exists());
+                assert_eq!(session.receipt.authority, selected.authority);
+                assert!(Arc::ptr_eq(&session.snapshot, &snapshot));
+                assert_eq!(
+                    fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                    authority
+                );
+                session.models.admit(&session.receipt).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn partial_warm_coverage_transition_scope_failure_keeps_both_provider_caches() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (_, selected) = publish_partial_cli(&cx, &parent, &fast, &quality, false).await;
+            let root = admit_root(&selected.root).unwrap();
+            let snapshot = Arc::new(
+                selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap(),
+            );
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                Arc::clone(&snapshot),
+                models(&fast, &quality),
+                (4, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"ids":["quality","fast-only"]}"#).unwrap()),
+                512,
+            )
+            .unwrap()
+            .with_updates(2, MAX_INPUT_BYTES)
+            .unwrap();
+            let query = serde_json::json!({"query":"retry", "mode":"partial", "stream":true});
+            let initial = exchange(&cx, &mut session, std::slice::from_ref(&query)).await;
+            assert_eq!(initial[2]["results"].as_array().unwrap().len(), 2);
+            let raw_fast = Arc::clone(&session.models.models().unwrap().fast);
+            let raw_quality =
+                Arc::clone(session.models.models().unwrap().quality.as_ref().unwrap());
+            let cached_fast = Arc::clone(&session.query_models().models().unwrap().fast);
+            let cached_quality = Arc::clone(
+                session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap(),
+            );
+            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let before = calls(&fast, &quality);
+            // The edits realize fast-only coverage, preparing quality retirement,
+            // but the candidate's source exceeds the fixed scope's export budget.
+            // Its unchanged content still reuses the original document vector.
+            let request = serde_json::json!({
+                "op":"update", "expected_authority":selected.authority,
+                "work_dir":parent.join("scope-refusal-work"),
+                "new_receipt":parent.join("scope-refusal.json"),
+                "source_low":2, "source_high":8, "allow_coverage_transition":true,
+                "changes":[
+                    {"op":"delete", "id":"quality"},
+                    {"op":"upsert", "id":"fast-only", "content":"retry fallback remains searchable",
+                     "metadata":{"note":"x".repeat(1_024)}}
+                ]
+            });
+            let output = exchange(&cx, &mut session, &[request, query]).await;
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["publication"], "not_committed");
+            assert_eq!(output[1]["serving"], "not_activated");
+            assert_eq!(
+                output[1]["authority"],
+                serde_json::json!(selected.authority)
+            );
+            assert_eq!(output[1]["scope"]["eligible_documents"], 2);
+            assert_eq!(output[2]["phase"], "initial");
+            assert_eq!(output[3]["phase"], "refined");
+            assert_eq!(output[3]["results"], initial[2]["results"]);
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "both query caches remain warm"
+            );
+            assert_eq!(session.receipt.authority, selected.authority);
+            assert!(Arc::ptr_eq(&session.snapshot, &snapshot));
+            assert!(Arc::ptr_eq(
+                &raw_fast,
+                &session.models.models().unwrap().fast
+            ));
+            assert!(Arc::ptr_eq(
+                &raw_quality,
+                session.models.models().unwrap().quality.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &cached_fast,
+                &session.query_models().models().unwrap().fast
+            ));
+            assert!(Arc::ptr_eq(
+                &cached_quality,
+                session
+                    .query_models()
+                    .models()
+                    .unwrap()
+                    .quality
+                    .as_ref()
+                    .unwrap()
+            ));
+            assert_eq!(session.scope.as_ref().unwrap().len(), 2);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority
+            );
+            assert!(!parent.join("scope-refusal.json").exists());
+            assert!(
+                session
+                    .snapshot
+                    .source_documents(&cx, MAX_INPUT_BYTES)
+                    .unwrap()
+                    .iter()
+                    .all(|document| !document.metadata.contains_key("note"))
+            );
+        });
+    }
+
+    #[test]
+    fn partial_warm_coverage_transition_delivery_failure_keeps_installed_fast_selection() {
+        struct FailAtUpdate<'a> {
+            cx: &'a Cx,
+            bytes: Vec<u8>,
+            attempted_update: Option<serde_json::Value>,
+        }
+
+        impl Write for FailAtUpdate<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let frame: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                if frame["event"] == "updated" {
+                    self.attempted_update = Some(frame);
+                    self.cx.set_cancel_requested(true);
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (_, selected) = publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
+            let root = admit_root(&selected.root).unwrap();
+            let retained = Arc::new(
+                selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap(),
+            );
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                Arc::clone(&retained),
+                models(&fast, &quality),
+                (4, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_query_cache(&cx, query_cache::Config::parse("4").unwrap())
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"ids":["quality","fast-only"]}"#).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap()
+            .with_updates(2, MAX_INPUT_BYTES)
+            .unwrap();
+            exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({"query":"retry", "mode":"partial", "stream":true})],
+            )
+            .await;
+            let raw_fast = Arc::clone(&session.models.models().unwrap().fast);
+            let cached_fast = Arc::clone(&session.query_models().models().unwrap().fast);
+            let before = calls(&fast, &quality);
+            let receipt_path = parent.join("committed-fast.json");
+            let request = serde_json::json!({
+                "op":"update", "expected_authority":selected.authority,
+                "work_dir":parent.join("committed-fast-work"), "new_receipt":receipt_path,
+                "source_low":2, "source_high":8, "allow_coverage_transition":true,
+                "changes":[{"op":"delete", "id":"quality"}]
+            });
+            let mut input = serde_json::to_vec(&request).unwrap();
+            input.extend_from_slice(b"\n{\"query\":\"must not execute\"}\n");
+            let mut output = FailAtUpdate {
+                cx: &cx,
+                bytes: Vec::new(),
+                attempted_update: None,
+            };
+            let error = serve_session(&cx, &mut session, &mut Cursor::new(input), &mut output)
+                .await
+                .unwrap_err();
+            let acknowledgement = output.attempted_update.as_ref().unwrap();
+            assert_eq!(acknowledgement["publication"], "committed");
+            assert_eq!(acknowledgement["serving"], "activated");
+            assert_eq!(acknowledgement["topology"], "fast_only");
+            assert_eq!(
+                acknowledgement["query_modes"],
+                serde_json::json!(["fast", "lexical"])
+            );
+            assert_eq!(acknowledgement["scope"]["eligible_documents"], 1);
+            assert_eq!(
+                acknowledgement["authority"],
+                serde_json::json!(session.receipt.authority)
+            );
+            let effect = publication_failure(error.as_ref()).unwrap();
+            assert_eq!(effect["publication"], "committed");
+            assert_eq!(effect["serving"], "activated");
+            assert_eq!(effect["reason"], "result_delivery_failed");
+            assert_eq!(effect["authority"], acknowledgement["authority"]);
+            assert_eq!(
+                frames(&output.bytes).len(),
+                1,
+                "only readiness was delivered"
+            );
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "the next query did not execute"
+            );
+            assert_ne!(session.receipt.authority, selected.authority);
+            assert_eq!(
+                session.snapshot.topology(),
+                NativeGenerationTopology::FastOnly
+            );
+            assert!(session.models.models().unwrap().quality.is_none());
+            assert!(session.query_models().models().unwrap().quality.is_none());
+            assert!(Arc::ptr_eq(
+                &raw_fast,
+                &session.models.models().unwrap().fast
+            ));
+            assert!(Arc::ptr_eq(
+                &cached_fast,
+                &session.query_models().models().unwrap().fast
+            ));
+            assert_eq!(session.scope.as_ref().unwrap().len(), 1);
+            // The failure happened at acknowledgement, after all successor state
+            // was installed. Clear cancellation only for independent verification.
+            cx.set_cancel_requested(false);
+            session.models.admit(&session.receipt).unwrap();
+            let committed = Receipt::read(&receipt_path).unwrap();
+            let reopened = committed.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(reopened.authority(), session.snapshot.authority());
+            assert_eq!(reopened.topology(), NativeGenerationTopology::FastOnly);
+            assert_eq!(reopened.metadata().total_documents, 2);
+            assert_eq!(retained.topology(), selected.topology());
+            assert_eq!(retained.metadata().total_documents, 3);
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({"query":"retry", "mode":"fast"})],
+            )
+            .await;
+            assert_eq!(output[1]["results"].as_array().unwrap().len(), 1);
+            assert_eq!(output[1]["results"][0]["doc_id"], "fast-only");
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "the fast query cache survives"
+            );
         });
     }
 
