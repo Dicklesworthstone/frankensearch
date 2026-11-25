@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 active direct-reader compactor progress — qualified source
+## November 25 active direct-reader compactor progress — qualified source published
 
 `bd-compactor-direct-reader-progress-pup0v`, OrangeSparrow. Actual installed
 default `12762434…` exits 2 when a real direct progressive search retains
@@ -32,8 +32,8 @@ the Bead before implementation. Shared dirty checkout and peer tasks stay intact
 - [x] Freeze clean source and pass all eighteen unchanged stock gate labels;
   record exact source/lock/toolchain/model/installed ELF and execution class.
 - [x] Perform fresh solo original acceptance on the stock installed ELF.
-- [ ] Verify published qualified source on both refs, close only this Bead
-  on cited evidence, export the closed status, and release owned leases.
+- [x] Verify published qualified source on both refs, close this Bead on
+  cited evidence, and export the closed status.
 
 The live candidate probe keeps both main/WAL/FEC sets byte-identical while
 the actual direct reader holds both kernel locks beyond the old budget.
@@ -84,6 +84,12 @@ Release qualification remains on `bd-dsbym`. At 14:51 UTC DSR found `mmini`
 reachable with 21.74 GiB against its 40 GiB floor, `wlap` unreachable, and
 `trj` healthy. `/data/tmp/fs-reader-release-hosts-20261125.json` preserves
 the admission results. The maintained tap at `61378995` has no fsfs formula.
+
+Both remote refs were verified at `ee23dd924b5a8efddb6c9786de8d7e9e773d7d0c`
+before closing `bd-compactor-direct-reader-progress-pup0v` at 16:07:55 UTC.
+The original acceptance text and all unrelated published rows are identical.
+The final ref and lease release receipt is
+`/data/tmp/fs-daemon-startup.sKDROXdS/reader-final-publication-result.json`.
 
 ## November 25 idle compactor writer progress — qualified source published
 
