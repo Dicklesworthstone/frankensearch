@@ -19276,7 +19276,10 @@ impl FsfsRuntime {
                         }
                         Err(error) => return Err(error),
                     };
-                if let Some(publication_lease) = publication_lease {
+                'maintenance: {
+                    let Some(publication_lease) = publication_lease else {
+                        break 'maintenance;
+                    };
                     // A writer may have appended to either tier since observation.
                     // Recheck both under exclusion before selecting maintenance.
                     let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] =
@@ -19305,7 +19308,13 @@ impl FsfsRuntime {
                     let mut indexes = Vec::with_capacity(tiers.len());
                     for (position, (tier, path, _)) in tiers.iter().enumerate() {
                         if pending[position] {
-                            indexes.push((*tier, Self::open_vector_index_for_mutation(path)?));
+                            let Some(index) = VectorIndex::try_open_writer(path)? else {
+                                // Drop any earlier tier writer and the publication
+                                // lease, keeping the pending baseline for the next poll.
+                                debug!(tier, "daemon: deferring compaction while vector readers are active");
+                                break 'maintenance;
+                            };
+                            indexes.push((*tier, index));
                         }
                     }
                     let mut rewritten = false;

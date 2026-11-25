@@ -1,5 +1,55 @@
 # Open bug repair TODO
 
+## November 25 active direct-reader compactor progress — in progress
+
+`bd-compactor-direct-reader-progress-pup0v`, OrangeSparrow. Actual installed
+default `12762434…` exits 2 when a real direct progressive search retains
+both kernel reader locks beyond two seconds. Pending artifacts stay unchanged;
+Refined succeeds after resuming the query, but maintenance needs a restart.
+Baseline and same-input recovery control:
+`/home/ubuntu/.fs-active-reader-tdnwa8aw/reader-held-observation.json` and
+`reader-released-control.json`. Original acceptance is recorded together in
+the Bead before implementation. Shared dirty checkout and peer tasks stay intact.
+
+- [x] Refresh graph/ref/ownership state; reproduce with the installed CLI,
+  actual pinned producers, acknowledged payload and kernel reader ownership.
+- [x] Claim one bug with complete positive/adverse criteria and reserve the
+  precise index/runtime/test/TODO surface under the graph structure lease.
+- [x] Distinguish OS WouldBlock from other lock/I/O/validation errors without
+  changing existing writer/reader admission or adding unsafe sites.
+- [x] Defer only contended maintenance on the normal daemon poll; release
+  partial tier writers and publication exclusion, retain pending baselines,
+  preserve strict two-tier WAL/FEC preflight and responsive selected stop.
+- [x] Add the named real CLI regression: actual suspended direct query,
+  unchanged pending bytes beyond the old budget, same live daemon, resume to
+  Refined, automatic both-tier merge with every acknowledged ID/producer.
+- [x] Exercise quality-only contention after a successful fast writer open;
+  prove the earlier writer and publication lease are released between polls.
+- [ ] Check absent/corrupt artifacts and non-contention lock errors stay hard
+  failures; retain the original seven startup and idle-writer controls.
+- [ ] Execute the named regression baseline-red/candidate-green, focused
+  compiler/lint/unit checks, review/UBS and diff checks with retained receipts.
+- [ ] Freeze clean source and pass all eighteen unchanged stock gate labels;
+  record exact source/lock/toolchain/model/installed ELF and execution class.
+- [ ] Perform fresh solo original acceptance on the stock installed ELF,
+  publish scoped qualified source/status, verify both refs, then close only
+  this Bead on cited evidence and export closed status. Release owned leases.
+
+The live candidate probe keeps both main/WAL/FEC sets byte-identical while
+the actual direct reader holds both kernel locks beyond the old budget.
+The reader emits Refined after resuming and the same daemon merges both tiers.
+Raw receipts are in `/home/ubuntu/.fs-active-reader-o4jfqf9m/`.
+The checked-in named test additionally passes quality-only contention with
+an independent fast writer and publication lease acquired between polls.
+Candidate `35f04799…` passes in 20.60 s. Previously installed `12762434…`
+fails at the asserted compactor exit in 11.79 s with the same harness
+`b70a5f64…`. Full receipts are `reader-candidate-v2-result.json` and
+`reader-baseline-v2-result.json` in `/data/tmp/fs-daemon-startup.sKDROXdS/`.
+The initial harness failed earlier because the expected stored MiniLM ID
+used the model directory's casing. Preserve `reader-baseline-v1-result.json`
+as a fixture failure outside the baseline regression evidence. Initial
+compiler refusals and error diagnostics remain in the focused build logs.
+
 ## November 25 idle compactor writer progress — qualified source published
 
 `bd-idle-compactor-writer-progress-u5mm1`, OrangeSparrow. Existing ready

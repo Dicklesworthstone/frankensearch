@@ -8373,6 +8373,325 @@ meta:
         );
     }
 
+    #[cfg(all(target_os = "linux", feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires pinned Potion and MiniLM caches and Linux reader-lock ownership observation"]
+    fn legacy_daemon_retries_active_direct_reader_contention() {
+        use frankensearch_fsfs::lifecycle::PublicationLease;
+        use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
+        use std::os::unix::fs::MetadataExt;
+
+        log_binary_profile("legacy-daemon-reader-progress");
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified real producers");
+        let root = tempfile::tempdir().unwrap().keep();
+        eprintln!(
+            "[default-build-e2e] stage=legacy-daemon-reader-progress artifacts={}",
+            root.display()
+        );
+        let fsfs = IsolatedFsfs::new(&root, models);
+        let corpus = root.join("corpus");
+        let index = root.join("index");
+        fs::create_dir(&corpus).unwrap();
+        fs::write(
+            corpus.join("first.md"),
+            "The veldquartz checkpoint recovery guide.",
+        )
+        .unwrap();
+        let common = ["--index-dir", index.to_str().unwrap(), "--offline"];
+        let env = [
+            ("FSFS_COMPLETE_GENERATIONS", "0"),
+            ("FRANKENSEARCH_PRESSURE_PROFILE", "performance"),
+            ("FRANKENSEARCH_SEARCH_QUALITY_TIMEOUT_MS", "10000"),
+            ("FRANKENSEARCH_CHECK_UPDATES", "0"),
+            ("FSFS_DISABLE_QUERY_CACHE", "1"),
+        ];
+        let run = |label: &str, args: &[&str]| {
+            fsfs.run_with_env(
+                &root,
+                label,
+                args.iter()
+                    .copied()
+                    .chain(common)
+                    .chain(["--format", "json"]),
+                QUICKSTART_TIMEOUT,
+                &env,
+            )
+        };
+        let start = |label: &str, args: &[&str]| {
+            let stdout = root.join(format!("{label}.stdout"));
+            let stderr = root.join(format!("{label}.stderr"));
+            let mut command = fsfs.command(&root);
+            command
+                .args(args)
+                .args(common)
+                .envs(env)
+                .env(
+                    "RUST_LOG",
+                    "frankensearch_fsfs=debug,frankensearch_index::map_lock=debug",
+                )
+                .stdout(File::create(&stdout).unwrap())
+                .stderr(File::create(&stderr).unwrap());
+            (WatchChild(command.spawn().unwrap()), stdout, stderr)
+        };
+        let setup = run(
+            "index-reader-contention",
+            &["index", corpus.to_str().unwrap(), "--no-watch-mode"],
+        );
+        assert_eq!(
+            parse_success_envelope("legacy index", &setup)["data"]["indexed_files"],
+            1
+        );
+        assert!(!index.join("FSFS-CURRENT").exists());
+        let paths = [
+            index.join("vector/index.fsvi"),
+            index.join("vector/quality.fsvi"),
+        ];
+        let producer_identity = |tier: &VectorIndex| {
+            (
+                tier.embedder_id().to_owned(),
+                tier.embedder_revision().to_owned(),
+                tier.dimension(),
+                tier.quantization(),
+            )
+        };
+        let producers = paths
+            .each_ref()
+            .map(|path| producer_identity(&VectorIndex::open_read_only(path).unwrap()));
+        assert_eq!(
+            (&*producers[0].0, producers[0].2),
+            ("potion-multilingual-128M", 256)
+        );
+        assert_eq!(
+            (&*producers[1].0, producers[1].2),
+            ("all-minilm-l6-v2", 384)
+        );
+        let snapshot = || {
+            paths.each_ref().map(|path| {
+                [
+                    path.clone(),
+                    frankensearch_index::wal_path_for(path),
+                    path.with_extension("fsvi.fec"),
+                ]
+                .map(|artifact| fs::read(artifact).unwrap())
+            })
+        };
+        let take_publication = || {
+            let started = Instant::now();
+            loop {
+                match PublicationLease::acquire(&index) {
+                    Ok(lease) => return lease,
+                    Err(error) => assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "daemon did not release publication lease: {error}"
+                    ),
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut expected = vec!["first.md"];
+        for (id, direct) in [("direct-reader.md", true), ("quality-reader.md", false)] {
+            let append = root.join(format!("{id}.jsonl"));
+            fs::write(&append, format!("{}\n", serde_json::json!({
+                "id": id, "text": format!("The veldquartz recovery guide restores the {id} checkpoint.")
+            }))).unwrap();
+            let appended = run(
+                &format!("append-{id}"),
+                &["append-batch", "--file", append.to_str().unwrap()],
+            );
+            assert_eq!(
+                parse_success_envelope("acknowledged append", &appended)["data"]["appended"],
+                1
+            );
+            for path in &paths {
+                let tier = VectorIndex::open_read_only(path).unwrap();
+                assert_eq!(tier.record_count(), expected.len());
+                assert_eq!(tier.wal_record_count(), 1);
+                assert!(tier.wal_records().any(|(actual, _)| actual == id));
+            }
+            expected.push(id);
+            let before = snapshot();
+
+            let query = if direct {
+                let (mut query, stdout, _) = start(
+                    "direct-query",
+                    &[
+                        "search",
+                        "veldquartz",
+                        "--no-daemon",
+                        "--stream",
+                        "--format",
+                        "jsonl",
+                    ],
+                );
+                wait_for_watch_output(
+                    &mut query,
+                    &stdout,
+                    "query.stream.initial_ready",
+                    1,
+                    Duration::from_secs(30),
+                );
+                let pid = Pid::from_raw(i32::try_from(query.0.id()).unwrap()).unwrap();
+                kill_process(pid, Signal::STOP).unwrap();
+                let started = Instant::now();
+                loop {
+                    if waitid(
+                        WaitId::Pid(pid),
+                        WaitIdOptions::STOPPED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                    )
+                    .unwrap()
+                    .is_some_and(|status| status.stopped())
+                    {
+                        break;
+                    }
+                    assert!(
+                        query.0.try_wait().unwrap().is_none(),
+                        "query exited before suspension"
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "query did not stop"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let locks = fs::read_to_string("/proc/locks").unwrap();
+                let owner = query.0.id().to_string();
+                for path in &paths {
+                    let metadata = fs::metadata(path).unwrap();
+                    let dev = metadata.dev();
+                    let key = format!(
+                        "{:02x}:{:02x}:{}",
+                        rustix::fs::major(dev),
+                        rustix::fs::minor(dev),
+                        metadata.ino()
+                    );
+                    assert!(
+                        locks.lines().any(|line| {
+                            line.split_whitespace().skip(1).take(5).eq([
+                                "FLOCK",
+                                "ADVISORY",
+                                "READ",
+                                owner.as_str(),
+                                key.as_str(),
+                            ])
+                        }),
+                        "suspended direct query must retain the reader lock for {}",
+                        path.display()
+                    );
+                }
+                Some((query, stdout, pid))
+            } else {
+                None
+            };
+            let quality_reader = (!direct).then(|| VectorIndex::open_read_only(&paths[1]).unwrap());
+            let (mut daemon, _, stderr) =
+                start(id, &["daemon", "--poll-ms", "25", "--idle-timeout-ms", "0"]);
+            let rejected = wait_for_watch_output(
+                &mut daemon,
+                &stderr,
+                "fsvi map lock refused",
+                1,
+                Duration::from_secs(10),
+            );
+            let blocked_path = &paths[usize::from(!direct)];
+            assert!(
+                rejected
+                    .lines()
+                    .any(|line| line.contains("fsvi map lock refused")
+                        && line.contains(blocked_path.to_str().unwrap())
+                        && line.contains("mode=\"exclusive\"")),
+                "{rejected}"
+            );
+            thread::sleep(Duration::from_millis(2250));
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "compactor exited while reader was active: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            let pid_file = index.join("daemon.pid");
+            let daemon_pid = daemon.0.id();
+            let pid_bytes = fs::read(&pid_file).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&pid_bytes).unwrap()["pid"],
+                daemon_pid
+            );
+
+            // Acquire while contention persists. The quality-only case must
+            // leave fast writers available as well as dropping the outer lease.
+            let publication = take_publication();
+            let fast_writer = (!direct).then(|| {
+                VectorIndex::open_writer(&paths[0]).expect("fast writer released between polls")
+            });
+            assert_eq!(
+                snapshot(),
+                before,
+                "pending main/WAL/FEC changed under reader contention"
+            );
+            drop(fast_writer);
+            if let Some((mut query, stdout, pid)) = query {
+                kill_process(pid, Signal::CONT).unwrap();
+                let frames = wait_for_watch_output(
+                    &mut query,
+                    &stdout,
+                    "\"event\":\"terminal\"",
+                    1,
+                    Duration::from_secs(15),
+                );
+                assert!(query.0.wait().unwrap().success());
+                let mut refined = frames
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .skip_while(|frame| {
+                        frame["payload"]["reason_code"] != "query.stream.refined_ready"
+                    });
+                assert!(
+                    refined.any(|frame| frame["payload"]["item"]["path"] == id),
+                    "resumed stream omitted Refined hit {id}: {frames}"
+                );
+            }
+            drop(quality_reader);
+            drop(publication);
+            wait_for_watch_output(
+                &mut daemon,
+                &stderr,
+                "daemon: compaction completed",
+                2,
+                Duration::from_secs(10),
+            );
+            drop(take_publication());
+            assert_eq!(fs::read(&pid_file).unwrap(), pid_bytes);
+            for (path, producer) in paths.iter().zip(&producers) {
+                let tier = VectorIndex::open_read_only(path).unwrap();
+                assert_eq!(tier.wal_record_count(), 0);
+                assert_eq!(tier.record_count(), expected.len());
+                assert_eq!(&producer_identity(&tier), producer);
+                let ids = tier.live_doc_ids().unwrap();
+                assert!(expected.iter().all(|id| ids.contains(*id)), "{ids:?}");
+            }
+            let search = run(
+                &format!("refined-after-{id}"),
+                &["search", "veldquartz", "--no-daemon"],
+            );
+            let refined = parse_success_envelope("Refined after compaction", &search);
+            assert_eq!(refined["data"]["phase"], "refined", "{refined}");
+            let hits = refined["data"]["hits"].as_array().unwrap();
+            assert!(
+                expected
+                    .iter()
+                    .all(|id| hits.iter().any(|hit| hit["path"] == *id)),
+                "{refined}"
+            );
+            let stop = run(&format!("stop-after-{id}"), &["daemon", "--stop"]);
+            assert_finished_successfully("stop the same compactor", &stop);
+            assert_eq!(
+                serde_json::from_str::<Value>(&stop.stdout).unwrap()["pid"],
+                daemon_pid
+            );
+            assert!(daemon.0.wait().unwrap().success());
+            assert!(!pid_file.exists());
+        }
+    }
+
     #[cfg(feature = "semantic-loaders")]
     #[test]
     #[ignore = "mock-free model-backed quickstart; provision the pinned cache, then run with --ignored --nocapture"]

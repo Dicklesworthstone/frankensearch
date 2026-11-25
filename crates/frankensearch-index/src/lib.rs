@@ -834,6 +834,30 @@ enum FsviMapLock {
     },
 }
 
+#[derive(Debug)]
+struct FsviOpenError {
+    error: SearchError,
+    lock_contended: bool,
+}
+
+impl From<SearchError> for FsviOpenError {
+    fn from(error: SearchError) -> Self {
+        Self {
+            error,
+            lock_contended: false,
+        }
+    }
+}
+
+impl FsviOpenError {
+    fn map_lock(path: &Path, access: &str, error: std::fs::TryLockError) -> Self {
+        Self {
+            error: map_lock_error(path, access, &error),
+            lock_contended: matches!(error, std::fs::TryLockError::WouldBlock),
+        }
+    }
+}
+
 impl FsviMapLock {
     const fn is_writer(&self) -> bool {
         matches!(self, Self::Exclusive { .. })
@@ -2055,7 +2079,7 @@ impl VectorIndex {
     /// `SearchError::IndexCorrupted` for invalid bytes, or a typed
     /// `fsvi.map_lock` refusal when a cooperating writer is live.
     pub fn open_read_only(path: &Path) -> SearchResult<Self> {
-        Self::open_with_lock(path, false)
+        Self::open_with_lock(path, false).map_err(|error| error.error)
     }
 
     /// Open an existing legacy FSVI index for mutation.
@@ -2071,11 +2095,30 @@ impl VectorIndex {
     /// `fsvi.map_lock` refusal when the artifact is already mapped by a
     /// cooperating reader or writer.
     pub fn open_writer(path: &Path) -> SearchResult<Self> {
-        Self::open_with_lock(path, true)
+        Self::open_with_lock(path, true).map_err(|error| error.error)
+    }
+
+    /// Open a legacy FSVI writer without waiting for active readers or writers.
+    ///
+    /// Returns `Ok(None)` only when the OS reports lock contention. A successful
+    /// open retains the same exclusive lock and validation as [`Self::open_writer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns all other lock, I/O, and artifact validation failures unchanged.
+    pub fn try_open_writer(path: &Path) -> SearchResult<Option<Self>> {
+        match Self::open_with_lock(path, true) {
+            Ok(index) => Ok(Some(index)),
+            Err(FsviOpenError {
+                lock_contended: true,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error.error),
+        }
     }
 
     #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
-    fn open_with_lock(path: &Path, writer: bool) -> SearchResult<Self> {
+    fn open_with_lock(path: &Path, writer: bool) -> Result<Self, FsviOpenError> {
         let file = open_fsvi_main_file(path, writer).map_err(|e| fsvi_open_error(path, e))?;
         let acquired = Instant::now();
         let map_lock = if writer {
@@ -2087,7 +2130,7 @@ impl VectorIndex {
                     thread = ?std::thread::current().id(),
                     "fsvi map lock refused: {error}"
                 );
-                map_lock_error(path, "exclusive writer", &error)
+                FsviOpenError::map_lock(path, "exclusive writer", error)
             })?;
             FsviMapLock::Exclusive {
                 file,
@@ -2104,7 +2147,7 @@ impl VectorIndex {
                     thread = ?std::thread::current().id(),
                     "fsvi map lock refused: {error}"
                 );
-                map_lock_error(path, "shared reader", &error)
+                FsviOpenError::map_lock(path, "shared reader", error)
             })?;
             FsviMapLock::Shared {
                 file,
@@ -2193,7 +2236,7 @@ impl VectorIndex {
                 // Future appends must not land behind a stale generation header.
                 wal::remove_wal(&wal_path)?;
             }
-        } else if writer && wal_path.try_exists()? {
+        } else if writer && wal_path.try_exists().map_err(SearchError::Io)? {
             let actual_len = std::fs::metadata(&wal_path).map_err(SearchError::Io)?.len();
             if actual_len > valid_len {
                 tracing::warn!(
@@ -2202,7 +2245,8 @@ impl VectorIndex {
                     valid_len,
                     "truncating corrupted WAL trailer"
                 );
-                let file = open_fsvi_regular_file(&wal_path, File::options().write(true))?;
+                let file = open_fsvi_regular_file(&wal_path, File::options().write(true))
+                    .map_err(SearchError::Io)?;
                 file.set_len(valid_len).map_err(SearchError::Io)?;
                 file.sync_all().map_err(SearchError::Io)?;
             }
@@ -12589,6 +12633,46 @@ mod tests {
                 .soft_delete("doc")
                 .expect("writer lock permits mutation"),
             "exclusive writer mutates only after acquiring the artifact lock"
+        );
+    }
+
+    #[test]
+    fn try_open_writer_defers_only_actual_lock_contention() {
+        let path = temp_index_path("nonblocking-writer-contention");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.write_record("kept", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let reader = VectorIndex::open_read_only(&path).unwrap();
+        assert!(VectorIndex::try_open_writer(&path).unwrap().is_none());
+        assert!(reader.live_doc_ids().unwrap().contains("kept"));
+        drop(reader);
+        let writer = VectorIndex::try_open_writer(&path).unwrap().unwrap();
+        assert!(VectorIndex::try_open_writer(&path).unwrap().is_none());
+        drop(writer);
+        assert!(VectorIndex::try_open_writer(&path).unwrap().is_some());
+
+        let absent = path.with_extension("absent");
+        assert!(matches!(
+            VectorIndex::try_open_writer(&absent),
+            Err(SearchError::IndexNotFound { .. })
+        ));
+        let corrupt = path.with_extension("corrupt");
+        std::fs::write(&corrupt, [0; 128]).unwrap();
+        assert!(matches!(
+            VectorIndex::try_open_writer(&corrupt),
+            Err(SearchError::IndexCorrupted { .. })
+        ));
+        let denied = FsviOpenError::map_lock(
+            &path,
+            "exclusive writer",
+            std::fs::TryLockError::Error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+        );
+        assert!(!denied.lock_contended);
+        assert!(
+            matches!(denied.error, SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock")
         );
     }
 
