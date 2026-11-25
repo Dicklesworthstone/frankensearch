@@ -3753,7 +3753,7 @@ impl TwoTierSearcher {
         pools: Option<&RefinementPools>,
         fast_hits: &mut Vec<VectorHit>,
         quality_hits: &mut Vec<VectorHit>,
-        graph_candidates: &mut Option<Vec<ScoredResult>>,
+        #[cfg(feature = "graph")] graph_candidates: &mut Option<Vec<ScoredResult>>,
         quality_budget: usize,
         quality_limit: &mut usize,
         exclusions: Option<&NormalizedExclusions>,
@@ -3865,8 +3865,6 @@ impl TwoTierSearcher {
                     &mut graph_revoked,
                 )
                 .await?;
-            #[cfg(not(feature = "graph"))]
-            let _ = graph_candidates;
             #[cfg(not(feature = "graph"))]
             let graph_replaced = false;
             if !quality_replaced && !fast_replaced && !graph_replaced {
@@ -4126,7 +4124,9 @@ impl TwoTierSearcher {
             std::borrow::Cow::Borrowed(query)
         };
         let lexical_budget = pools.map_or(0, |pools| pools.lexical_budget);
-        let mut graph_candidates = pools.and_then(|pools| pools.graph.clone());
+        let graph_candidates = pools.and_then(|pools| pools.graph.clone());
+        #[cfg(feature = "graph")]
+        let mut graph_candidates = graph_candidates;
         let mut quality_coverage = None;
         let mut replacement_fast_evidence = None;
         let mut quality_pool = match admission {
@@ -4177,6 +4177,7 @@ impl TwoTierSearcher {
                         pools,
                         &mut fast_hits,
                         &mut hits,
+                        #[cfg(feature = "graph")]
                         &mut graph_candidates,
                         quality_budget,
                         &mut retrieval_limit,
@@ -4252,6 +4253,7 @@ impl TwoTierSearcher {
                         pools,
                         &mut fast_hits,
                         &mut hits,
+                        #[cfg(feature = "graph")]
                         &mut graph_candidates,
                         quality_budget,
                         &mut retrieval_limit,

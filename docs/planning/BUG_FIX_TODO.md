@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 legacy startup WAL repair — qualified, publication pending
+## November 25 legacy startup WAL repair — integration qualification in progress
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
 Retire this active block at qualified publication or handoff with explicit
@@ -81,12 +81,33 @@ startup production/test implementation are byte-identical to `b692f5d4`.
   work/honesty review. This is solo verification, not independent certification.
 - [x] Exercise the newly connected preview API with twelve predeclared actual
   local-model command outcomes, including exact/HNSW and proper refusals.
+- [x] Preserve upstream changes encountered at publication: identical core lint
+  repair, warm coverage transitions (`03cf0caa`) and graph refinement
+  (`851021f1`). Keep failed push and retired partial gates as failed/partial
+  evidence; none qualifies the later source.
+- [x] Repair the demonstrated default-feature graph integration lint with a
+  feature-gated private argument and conditional local mutability. Preserve the
+  graph algorithm and all strict lint settings.
+- [ ] Freeze the combined source; pass all eighteen unchanged stock labels.
+- [ ] Pass strict Clippy with the optional graph feature and execute its actual
+  graph-filtered library regressions, including the incoming refinement cases.
+- [ ] Repeat the original baseline/default-installed-binary acceptance pair on
+  the combined source, retaining both executable and harness identities.
+- [ ] Repeat the twelve actual-model native preview command outcomes and add
+  fourteen predeclared actual-model warm coverage observations: exact promotes
+  partial coverage to full, HNSW retires quality, denied requests preserve the
+  authority, and same-stream/fresh-process queries use the committed selection.
+- [x] Scan both incoming changes and review all touched-line findings. Warm:
+  two files, 0 critical/3,426 warnings/479 informational, 174 nearby findings;
+  graph: nine files, 0 critical/4,222 warnings/757 informational, 69 nearby
+  findings. Test fixture assertions, bounded indices, retained handles and
+  comment text explain these reports; no new scanner exclusions.
 - [ ] Export only the owned tracker record, publish qualified code and evidence,
   and verify both remote refs without disturbing the peer's unpublished row.
 - [ ] Close only the owned bug on its original acceptance, publish the final
   status, verify both refs again and release the owned reservations.
 
-Final qualification: clean `b286a61d737ebbba0aff63dc73a67fec558d5686`, all
+Earlier qualification: clean `b286a61d737ebbba0aff63dc73a67fec558d5686`, all
 eighteen quality labels PASS, no label skips, terminal 0, 04:22:51–05:20:34 UTC,
 3,463.35 seconds. `stock-gate-v2-result.json` records source, commands, labels
 and terminal state; log SHA256:
@@ -121,7 +142,16 @@ Origin advanced only by `5b7bac4b` with the same two semicolon fixes already
 qualified here. Merge `c3f986d7` preserves that commit; its entire Git tree is
 identical to the qualified tree `6b420a4503a39dcd66096c0b101192ee1e7c4df7`.
 `merge-tree-equivalence.json` records the equality; the post-merge import makes
-zero updates. No product code changed after qualification.
+zero updates. That merge changed no product code. The later publication attempt
+was refused by the Agent Mail pre-push guard because the moving remote revision
+was not fetched locally; no guard bypass or remote write occurred. Origin then
+advanced through `03cf0caa` and `851021f1`. These substantive peer changes are
+preserved in merges `8e365f68` and `31e4e166`; their runtime qualification is
+separate from the earlier full pass. The clean v3 gate was retired after eleven
+PASS labels with terminal -15. The v4 gate demonstrated default/hybrid strict
+Clippy failures at the new graph argument, while graph-enabled Clippy passed;
+it too was retired before repair. Both partial/failed receipts remain retained.
+The small private cfg repair adds no lint exemption or runtime branch.
 
 Real-work worksheet (this startup repair and its integrated validation): the
 README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:
