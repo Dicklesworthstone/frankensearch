@@ -89,8 +89,19 @@ startup production/test implementation are byte-identical to `b692f5d4`.
   feature-gated private argument and conditional local mutability. Preserve the
   graph algorithm and all strict lint settings.
 - [ ] Freeze the combined source; pass all eighteen unchanged stock labels.
-- [ ] Pass strict Clippy with the optional graph feature and execute its actual
-  graph-filtered library regressions, including the incoming refinement cases.
+- [x] Pass strict Clippy with the optional graph feature and execute its actual
+  graph-filtered library regressions at clean `7a7dee9a`: 26 passed, zero failed
+  or ignored, including the incoming refinement cases. Retain this separate
+  result; the later fixture-only repair does not change graph production code.
+- [x] Preserve v5's failed native matrix: 406 pass/one fail/zero ignored in
+  393.71 seconds; reproduce its failed update independently. Diagnose the
+  `partial` case's collision with both initial `partial-work` and `partial.json`.
+- [x] Verify all sixteen original warm transition combinations with distinct
+  successor paths and four occupied-receipt controls; preserve every original
+  cache, producer, scope, result, predecessor and follow-up assertion.
+- [x] Refresh the existing Mac release admission check: DSR refuses `mmini` at
+  06:34:48 UTC with 22.17 GiB free against its unchanged 40 GiB requirement.
+  This is not an Apple build result or release qualification.
 - [ ] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
 - [ ] Repeat the twelve actual-model native preview command outcomes and add
@@ -152,6 +163,35 @@ PASS labels with terminal -15. The v4 gate demonstrated default/hybrid strict
 Clippy failures at the new graph argument, while graph-enabled Clippy passed;
 it too was retired before repair. Both partial/failed receipts remain retained.
 The small private cfg repair adds no lint exemption or runtime branch.
+
+The next clean run, v5 at `7a7dee9a`, passes fourteen stock labels but fails
+the native CLI suite as reported above. Its owned process group is retired
+before edits (terminal -15); no full-gate credit. Separate optional graph
+runtime evidence is terminal 0: 26/0/0, 14.21 seconds of test execution;
+`graph-feature-tests-result.json` includes build/queue time and log SHA256
+`b09112c63f0aba561a75986cfb46d2bf66d333806e9c75587403a0393048e665`.
+The combined 22-file Rust scanner exits 0 with 0 critical, 19,400 warnings and
+4,277 informational findings. The existing scoped triage applies.
+
+The native failure is a third demonstrated test-driver defect. Temporary
+test-only internal diagnostics identify the existing-destination refusal;
+that logging is removed, leaving production code byte-identical to `7a7dee9a`.
+Both initial fixture paths collide only when the scenario label is `partial`.
+The first correction separates the receipt but misses the work-directory
+collision; the added negative control catches that mistake, and its failed
+receipt remains retained. Both successor paths now have a distinct prefix.
+The original sixteen positive scenarios and assertions remain intact, with
+four new exact-refusal controls proving occupied receipts preserve authority,
+lock, receipt bytes, reader identity, inference counts and absent successor
+work. This admits valid fixture destinations and still rejects occupied ones;
+it changes no production policy, cache behavior, gate, tolerance or budget.
+The corrected focused test passes in 329.88 seconds: all sixteen original
+combinations plus four occupied-receipt refusals. Formatting, strict hybrid
+all-target Clippy and the corrected test-file scanner pass (0 critical, 3,307
+warnings, 375 informational across the whole file). The new-line findings are
+intentional test assertions, fixture unwraps, bounded frame access and retained
+test handles; no scanner exclusion is added. The source file remains under its
+existing test-only module. Full clean-source stock requalification is pending.
 
 Real-work worksheet (this startup repair and its integrated validation): the
 README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:

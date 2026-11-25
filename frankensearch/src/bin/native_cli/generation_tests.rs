@@ -9199,10 +9199,10 @@ mod progressive_authority {
                         assert_eq!(primed[0]["coverage_transition_enabled"], true);
                         assert_eq!(primed[2]["phase"], "refined");
                         let before = calls(&fast, &quality);
-                        let next_path = parent.join(format!("{label}.json"));
+                        let next_path = parent.join(format!("successor-{label}.json"));
                         let mut request = serde_json::json!({
                             "op":"update", "id":label, "expected_authority":selected.authority,
-                            "work_dir":parent.join(format!("{label}-work")), "new_receipt":next_path,
+                            "work_dir":parent.join(format!("successor-{label}-work")), "new_receipt":next_path,
                             "source_low":2, "source_high":8, "allow_coverage_transition":true,
                         });
                         let records: Vec<_> = original_source
@@ -9223,6 +9223,30 @@ mod progressive_authority {
                         } else {
                             "changes"
                         }] = serde_json::json!(records);
+                        if label == "partial" {
+                            let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+                            let lock = fs::read(selected.root.join("LOCK")).unwrap();
+                            let mut occupied = request.clone();
+                            occupied["new_receipt"] = serde_json::json!(initial.receipt);
+                            let error = session
+                                .update(&cx, serde_json::from_value(occupied).unwrap())
+                                .await
+                                .unwrap_err();
+                            assert_eq!(
+                                error.to_string(),
+                                "destination already exists; existing generations and receipts are never overwritten",
+                            );
+                            assert_eq!(fs::read(&initial.receipt).unwrap(), original_receipt);
+                            assert_eq!(
+                                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                                authority
+                            );
+                            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
+                            assert!(Arc::ptr_eq(&session.snapshot, &retained));
+                            assert_eq!(calls(&fast, &quality), before);
+                            assert!(!parent.join(format!("successor-{label}-work")).exists());
+                            assert!(!next_path.exists());
+                        }
                         let mut query =
                             serde_json::json!({"id":"after", "query":"retry", "stream":true});
                         if label == "partial" {
@@ -9231,7 +9255,12 @@ mod progressive_authority {
                         // Continue querying within the same request stream: no
                         // second ready frame may conceal an incomplete handoff.
                         let response = exchange(&cx, &mut session, &[request, query]).await;
-                        assert_eq!(response[1]["event"], "updated");
+                        assert_eq!(
+                            response[1]["event"],
+                            "updated",
+                            "ann={ann} replace_source={replace_source} outcome={label}: {:?}",
+                            response.get(1),
+                        );
                         assert_eq!(response[1]["publication"], "committed");
                         assert_eq!(response[1]["serving"], "activated");
                         assert_eq!(session.snapshot.topology(), topology);
