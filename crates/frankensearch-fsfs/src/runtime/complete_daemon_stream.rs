@@ -270,6 +270,9 @@ async fn drive_with_tick<T>(
         if let Some(result) = result {
             return Ok(result);
         }
+        // A producer poll may itself outlast the tick. Keep the outer owner
+        // able to enforce its deadline before polling that producer again.
+        super::admission::yield_turn(cx).await?;
     }
 }
 
@@ -323,6 +326,9 @@ async fn write_response_with_tick(
             }
         })
         .await?;
+        if offset < bytes.len() {
+            super::admission::yield_turn(cx).await?;
+        }
     }
     Ok(())
 }

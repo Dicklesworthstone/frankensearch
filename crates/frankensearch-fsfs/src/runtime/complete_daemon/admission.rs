@@ -303,6 +303,9 @@ impl Intake {
             if let Some(event) = event {
                 return Ok(event);
             }
+            // The tick can expire during synchronous owner polling. Return
+            // control before starting another bounded scheduler turn.
+            yield_turn(cx).await?;
         }
     }
 
@@ -348,6 +351,7 @@ impl Intake {
             if let Some(result) = result {
                 return Ok(result);
             }
+            yield_turn(cx).await?;
         }
     }
 
@@ -395,6 +399,7 @@ impl Intake {
             if let Some(result) = result {
                 return Ok(result);
             }
+            yield_turn(cx).await?;
         }
     }
 }
@@ -528,7 +533,11 @@ mod tests {
 
     #[test]
     fn concurrent_driver_bounds_intake_and_prioritizes_shutdown_over_all_owners() {
-        run_test_with_cx(|cx| async move {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned timer-backed runtime");
             let (_directory, listener) = listener();
             let mut intake = Intake::new(Duration::from_secs(60));
             let polls = std::sync::atomic::AtomicUsize::new(0);
@@ -540,7 +549,11 @@ mod tests {
                     Box::pin(async move {
                         let _owned = owned;
                         poll_fn(|_| {
-                            polls.fetch_add(1, Ordering::SeqCst);
+                            if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                // Expire the tick inside one owning poll, not
+                                // by waiting for an unobserved parked state.
+                                std::thread::sleep(IO_POLL_INTERVAL * 2);
+                            }
                             Poll::<()>::Pending
                         })
                         .await;
@@ -726,7 +739,11 @@ mod tests {
 
     #[test]
     fn shutdown_preempts_pending_work_without_a_model_wakeup_or_shared_cancellation() {
-        run_test_with_cx(|cx| async move {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned timer-backed runtime");
             let (_directory, listener) = listener();
             let mut intake = Intake::new(Duration::from_secs(60));
             let released = Arc::new(AtomicBool::new(false));
@@ -735,6 +752,9 @@ mod tests {
             let mut driving = Box::pin(intake.drive(&cx, &listener, async {
                 let _owned = owned;
                 poll_fn(|_| {
+                    if polls.get() == 0 {
+                        std::thread::sleep(IO_POLL_INTERVAL * 2);
+                    }
                     polls.set(polls.get() + 1);
                     Poll::<()>::Pending
                 })

@@ -1231,6 +1231,7 @@ async fn run_request<T>(
         if let Some(result) = result {
             return Ok(result);
         }
+        admission::yield_turn(cx).await?;
     }
 }
 
@@ -1324,6 +1325,7 @@ async fn read_request_from(
                 })
                 .await?
                 else {
+                    admission::yield_turn(cx).await?;
                     continue;
                 };
                 turn_calls = 1;
@@ -2340,6 +2342,11 @@ mod tests {
                     async {
                         let _owned = owned;
                         poll_fn(|_| {
+                            // Force expiry during synchronous work while
+                            // retaining the exact pending/drop/socket oracle.
+                            if polls.get() == 0 {
+                                std::thread::sleep(IO_POLL_INTERVAL * 2);
+                            }
                             polls.set(polls.get() + 1);
                             Poll::Pending
                         })

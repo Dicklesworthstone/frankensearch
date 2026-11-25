@@ -1,8 +1,11 @@
 # Open bug repair TODO
 
-## November 25 legacy startup WAL repair — integration qualification in progress
+## November 25 daemon repairs — integration qualification in progress
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
+The separate overdue-turn repair is `bd-daemon-overdue-tick-cooperation-z3qax`;
+its code and native regression coverage stay together and block final startup
+repair qualification. Close the two bugs only on their own original criteria.
 Retire this active block at qualified publication or handoff with explicit
 unmet criteria; preserve its history. Beads remains the task authority.
 
@@ -102,6 +105,24 @@ startup production/test implementation are byte-identical to `b692f5d4`.
 - [x] Refresh the existing Mac release admission check: DSR refuses `mmini` at
   06:34:48 UTC with 22.17 GiB free against its unchanged 40 GiB requirement.
   This is not an Apple build result or release qualification.
+- [x] Retain v6's three genuine fsfs ownership failures (3,361 passed, three
+  failed, sixteen ignored). Retire only its verified owned process group before
+  edits. Trace overdue periodic ticks re-entering pending work in one poll.
+- [x] Create/claim the separate fairness bug and add the startup blocker edge;
+  preserve every older criterion and keep the active dependency graph acyclic.
+- [x] Strengthen the three existing probes with real caller-owned native
+  contexts and first-poll work exceeding the unchanged 10 ms tick. Preserve
+  exact poll-count, cleanup, socket, output, shutdown and deadline assertions.
+- [x] Retain the old executable and execute all three strengthened probes red:
+  raw 3 versus 1, concurrent 16 versus 8, shutdown 2 versus 1, each exit 101.
+- [x] Wire the existing cancellation-aware `yield_turn` helper after overdue
+  intake, request, framing, producer and blocked-response turns. Keep every
+  ready result, strict control and original timeout ahead of repeat work.
+- [x] Execute all three repaired probes green and all 152 daemon-focused tests
+  green, zero ignored; formatting, strict all-target fsfs Clippy and three-file
+  scanner triage pass. No runtime, dependency, unsafe site or suppression added.
+- [ ] Preserve the additional upstream cache/recovery work at `de47fbda` before
+  freezing the next combined source. Requalify graph dependencies if changed.
 - [ ] Repeat the original baseline/default-installed-binary acceptance pair on
   the combined source, retaining both executable and harness identities.
 - [ ] Repeat the twelve actual-model native preview command outcomes and add
@@ -113,10 +134,10 @@ startup production/test implementation are byte-identical to `b692f5d4`.
   graph: nine files, 0 critical/4,222 warnings/757 informational, 69 nearby
   findings. Test fixture assertions, bounded indices, retained handles and
   comment text explain these reports; no new scanner exclusions.
-- [ ] Export only the owned tracker record, publish qualified code and evidence,
+- [ ] Export only the two owned tracker records, publish qualified code and evidence,
   and verify both remote refs without disturbing the peer's unpublished row.
-- [ ] Close only the owned bug on its original acceptance, publish the final
-  status, verify both refs again and release the owned reservations.
+- [ ] Close the fairness bug, then the startup bug on their original acceptance;
+  publish final status, verify both refs again and release owned reservations.
 
 Earlier qualification: clean `b286a61d737ebbba0aff63dc73a67fec558d5686`, all
 eighteen quality labels PASS, no label skips, terminal 0, 04:22:51–05:20:34 UTC,
@@ -192,6 +213,24 @@ warnings, 375 informational across the whole file). The new-line findings are
 intentional test assertions, fixture unwraps, bounded frame access and retained
 test handles; no scanner exclusion is added. The source file remains under its
 existing test-only module. Full clean-source stock requalification is pending.
+
+V6 at clean `6bfb8d44` exposes the overdue-turn bug rather than a fixture
+failure. Three original tests observe repeated pending-owner polls during one
+owning poll; the unmodified stock lane reports 3,361/3/16. The request and
+nested output drivers can outlast a 10 ms tick during synchronous work and
+immediately loop again. The retained old harness with strengthened native
+stimuli fails all three exact original oracles. The repaired harness passes
+each and the complete daemon group (152/0/0, 3.08 seconds). These are actual
+native runtime/Unix socket tests with existing pending-work controls, not
+real-model relevance or release evidence. `overdue-native-pair-result.json`
+binds both ELFs and the six logs; the old ELF SHA256 is
+`7f58b86415801eebc3888a5858aaa1595311618bcf80986cb37cc2c620acad59`.
+The existing helper supplies a real scheduler yield and cancellation checks;
+no sleep is added to production and no deadline or assertion is weakened.
+Three-file UBS exits 0: 0 critical, 855 warnings, 168 informational findings;
+the three touched-line findings are deliberate native test setup unwraps.
+Strict fsfs all-target Clippy passes. Both bug closures still require the full
+combined stock run, fresh solo original-criteria re-execution and publication.
 
 Real-work worksheet (this startup repair and its integrated validation): the
 README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:

@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- Complete-generation daemon I/O ticks now yield control before repeating an
+  overdue turn, keeping pending request polling bounded and preserving prompt
+  shutdown, disconnection and deadline checks after synchronous work.
 - The legacy WAL compaction daemon now merges records already pending at
   startup in both vector tiers. It checks repair sidecars and opens both
   pending WALs before merging either tier, repairs recoverable vector damage,
