@@ -2107,8 +2107,39 @@ impl VectorIndex {
     ///
     /// Returns all other lock, I/O, and artifact validation failures unchanged.
     pub fn try_open_writer(path: &Path) -> SearchResult<Option<Self>> {
-        match Self::open_with_lock(path, true) {
-            Ok(index) => Ok(Some(index)),
+        Self::try_lock_writer(path)?
+            .map(|lock| Self::open_locked(path, lock))
+            .transpose()
+    }
+
+    /// Open legacy FSVI writers in input order, acquiring every lock before
+    /// any open can recover a WAL. Paths must refer to distinct indexes.
+    /// Returns `Ok(None)` on lock contention, releasing acquired locks without
+    /// opening any WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns other lock, I/O, and index validation failures.
+    pub fn try_open_writers<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> SearchResult<Option<Vec<Self>>> {
+        let mut locked = Vec::new();
+        for path in paths {
+            let Some(lock) = Self::try_lock_writer(path)? else {
+                return Ok(None);
+            };
+            locked.push((path, lock));
+        }
+        locked
+            .into_iter()
+            .map(|(path, lock)| Self::open_locked(path, lock))
+            .collect::<SearchResult<Vec<_>>>()
+            .map(Some)
+    }
+
+    fn try_lock_writer(path: &Path) -> SearchResult<Option<FsviMapLock>> {
+        match Self::acquire_map_lock(path, true) {
+            Ok(lock) => Ok(Some(lock)),
             Err(FsviOpenError {
                 lock_contended: true,
                 ..
@@ -2117,8 +2148,12 @@ impl VectorIndex {
         }
     }
 
-    #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
     fn open_with_lock(path: &Path, writer: bool) -> Result<Self, FsviOpenError> {
+        let map_lock = Self::acquire_map_lock(path, writer)?;
+        Ok(Self::open_locked(path, map_lock)?)
+    }
+
+    fn acquire_map_lock(path: &Path, writer: bool) -> Result<FsviMapLock, FsviOpenError> {
         let file = open_fsvi_main_file(path, writer).map_err(|e| fsvi_open_error(path, e))?;
         let acquired = Instant::now();
         let map_lock = if writer {
@@ -2163,6 +2198,12 @@ impl VectorIndex {
             thread = ?std::thread::current().id(),
             "fsvi map lock acquired"
         );
+        Ok(map_lock)
+    }
+
+    #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
+    fn open_locked(path: &Path, map_lock: FsviMapLock) -> SearchResult<Self> {
+        let writer = map_lock.is_writer();
         let data = match &map_lock {
             FsviMapLock::Exclusive { file, .. } => VectorIndexData::Mutable(unsafe {
                 MmapMut::map_mut(file).map_err(SearchError::Io)?

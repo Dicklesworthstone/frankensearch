@@ -41,6 +41,7 @@ use frankensearch_core::{
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
 };
+use frankensearch_durability::fsvi_protector::FsviRepairError;
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::FastEmbedEmbedder;
 #[cfg(test)]
@@ -3555,7 +3556,7 @@ fn invalidate_vector_sidecars<'a>(paths: impl IntoIterator<Item = &'a Path>, rea
 /// Before a compaction opens a generation for rewriting, restore it from its
 /// sidecar if the bytes no longer match. A corruption the sidecar cannot
 /// repair is a typed error rather than a silent merge of damaged records.
-fn repair_vector_generations_if_corrupted(index_root: &Path) -> SearchResult<usize> {
+fn repair_vector_generations_if_corrupted(index_root: &Path) -> Result<usize, FsviRepairError> {
     let protector = fsfs_fsvi_protector()?;
     let mut repaired = 0usize;
     for (tier, rel) in FSFS_VECTOR_GENERATION_FILES {
@@ -3566,7 +3567,7 @@ fn repair_vector_generations_if_corrupted(index_root: &Path) -> SearchResult<usi
         match protector.verify(&path)? {
             FsviVerifyResult::Intact | FsviVerifyResult::NoSidecar => {}
             FsviVerifyResult::Corrupted { repairable: true } => {
-                let result = protector.repair(&path)?;
+                let result = protector.repair_with_contention(&path)?;
                 repaired = repaired.saturating_add(1);
                 info!(
                     path = %path.display(),
@@ -3583,7 +3584,7 @@ fn repair_vector_generations_if_corrupted(index_root: &Path) -> SearchResult<usi
                     detail: format!(
                         "{tier}-tier generation bytes no longer match the RaptorQ sidecar and the damage exceeds its repair budget; rebuild with `fsfs index --full`"
                     ),
-                });
+                }.into());
             }
         }
     }
@@ -19294,32 +19295,35 @@ impl FsfsRuntime {
                         warn!(error = %error, "daemon: query daemon quiesce failed; compaction may be refused");
                     }
                     publication_lease.fence("daemon vector repair preflight")?;
-                    repair_vector_generations_if_corrupted(&index_root)?;
+                    match repair_vector_generations_if_corrupted(&index_root) {
+                        Ok(_) => {}
+                        Err(FsviRepairError::Contended(error)) => {
+                            debug!(%error, "daemon: deferring vector repair while readers are active");
+                            break 'maintenance;
+                        }
+                        Err(FsviRepairError::Failed(error)) => return Err(error),
+                    }
 
+                    let pending_tiers = tiers.iter().zip(pending)
+                        .filter_map(|(tier, pending)| pending.then_some(tier));
                     // Validate both pending indexes and their WALs before rewriting
                     // either tier. A malformed quality WAL must not drain fast first.
                     // Writer opens may quarantine unusable WALs and continue, so
                     // first use strict readers to preserve malformed pending input.
-                    for (position, (_, path, _)) in tiers.iter().enumerate() {
-                        if pending[position] {
-                            drop(VectorIndex::open_read_only(path)?);
-                        }
+                    for (_, path, _) in pending_tiers.clone() {
+                        drop(VectorIndex::open_read_only(path)?);
                     }
-                    let mut indexes = Vec::with_capacity(tiers.len());
-                    for (position, (tier, path, _)) in tiers.iter().enumerate() {
-                        if pending[position] {
-                            let Some(index) = VectorIndex::try_open_writer(path)? else {
-                                // Drop any earlier tier writer and the publication
-                                // lease, keeping the pending baseline for the next poll.
-                                debug!(tier, "daemon: deferring compaction while vector readers are active");
-                                break 'maintenance;
-                            };
-                            indexes.push((*tier, index));
-                        }
-                    }
+                    // Lock every pending tier before any writer open can trim
+                    // a torn WAL suffix or discard a stale WAL generation.
+                    let Some(indexes) = VectorIndex::try_open_writers(
+                        pending_tiers.clone().map(|(_, path, _)| path.as_path()),
+                    )? else {
+                        debug!("daemon: deferring compaction while vector readers are active");
+                        break 'maintenance;
+                    };
                     let mut rewritten = false;
                     let mut compaction_error = None;
-                    for (tier, mut index) in indexes {
+                    for ((tier, _, _), mut index) in pending_tiers.zip(indexes) {
                         publication_lease.fence("daemon tier compaction")?;
                         match index.compact() {
                             Ok(stats) => {

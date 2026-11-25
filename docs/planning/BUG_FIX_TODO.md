@@ -1,5 +1,50 @@
 # Open bug repair TODO
 
+## November 25 fresh review of legacy compactor repair — in progress
+
+`bd-compactor-repair-admission-40m0c`, OrangeSparrow. The previously
+qualified installed `3d9adea8…` baseline exits 2 during sidecar repair
+with the actual direct query holding both reader locks. A quality-only
+reader also exposes premature fast WAL truncation when its valid prefix
+has a torn suffix. Both fixtures retain the acknowledged ID after repair
+or maintenance. Baselines are in `/data/tmp/fs-fresh-eyes-*-baseline.log`.
+
+- [x] Re-read all three modified Rust files and their callers. Confirm the
+  empty ready queue and preserve the dirty shared checkout.
+- [x] Reproduce both faults against the exact installed default binary,
+  record original acceptance, claim one Bead and reserve its edit surface.
+- [x] Classify OS WouldBlock before RaptorQ repair writes, retry on the same
+  compactor poll and preserve explicit compact and hard-error diagnostics.
+- [x] Acquire all pending writer locks before any WAL-open recovery.
+  Preserve normal indexed writer and read-only behavior.
+- [x] Strengthen the existing populated regression with repairable vector
+  damage and a torn WAL suffix. Check the fast lock with a plain descriptor
+  so the test cannot trim the WAL. Keep the healthy direct case.
+- [x] Prove old installed failures, candidate passage, no byte changes while
+  blocked, both-tier recovery, recorded identities, output and selected stop.
+- [ ] Review the final diff again, pass strict compiler checks and UBS,
+  and run all eighteen stock stages on frozen exact source.
+- [ ] Run fresh acceptance on the stock installed ELF, publish scoped code
+  and evidence, verify both remote refs, close the Bead and release leases.
+
+Fresh review of the test also found its stream observation could race the
+release of both index locks. `review-candidate-v1-result.json` failed that
+witness and does not qualify the candidate. Synchronize on both actual kernel
+locks before suspending the owned query and check Initial and Refined after
+resuming it. No production hooks or widened deadlines. With final harness
+`2c5fec55…`, `review-baseline-v2-result.json` records the expected repair
+failure on the old installed default and `review-candidate-v2-result.json`
+records all three cases passing in 29.6 s on Cargo-test CLI `425fbd34…`.
+Both receipts are in `/data/tmp/fs-daemon-startup.sKDROXdS/`.
+
+The independent quality-only probe also passes on `425fbd34…`: zero
+main/WAL/FEC changes under lock, both tiers compact after release, and
+Refined contains the acknowledged ID. See `/data/tmp/fs-fresh-eyes-torn-wal-under-reader-candidate.log`.
+Strict Rust Clippy for affected crates passed remotely on hz4 for the
+implementation. The final fixture, native checks and stock gate are
+tracked separately. The first native compile was superseded by the group
+lock API and its own process group was stopped at exit 143.
+
 ## November 25 active direct-reader compactor progress — qualified source published
 
 `bd-compactor-direct-reader-progress-pup0v`, OrangeSparrow. Actual installed

@@ -65,19 +65,65 @@ fn acquire_shared_fsvi_map_lock<'a>(
 fn acquire_exclusive_fsvi_writer_lock<'a>(
     file: &'a fs::File,
     path: &'a Path,
-) -> SearchResult<FsviOperationLock<'a>> {
-    file.try_lock().map_err(|error| SearchError::InvalidConfig {
-        field: "fsvi.map_lock".to_owned(),
-        value: path.display().to_string(),
-        reason: format!(
-            "cannot acquire exclusive writer lock before repairing this published FSVI: {error}; drop live readers/writers before retrying"
-        ),
+) -> Result<FsviOperationLock<'a>, FsviRepairError> {
+    file.try_lock().map_err(|error| {
+        let detail = SearchError::InvalidConfig {
+            field: "fsvi.map_lock".to_owned(),
+            value: path.display().to_string(),
+            reason: format!(
+                "cannot acquire exclusive writer lock before repairing this published FSVI: {error}; drop live readers/writers before retrying"
+            ),
+        };
+        if matches!(error, fs::TryLockError::WouldBlock) {
+            FsviRepairError::Contended(detail)
+        } else {
+            FsviRepairError::Failed(detail)
+        }
     })?;
     Ok(FsviOperationLock {
         file,
         path,
         creator_pid: std::process::id(),
     })
+}
+
+/// Distinguishes contention before a repair starts from an actual failure.
+#[derive(Debug)]
+pub enum FsviRepairError {
+    /// The initial exclusive lock would block. Repair has not written anything.
+    Contended(SearchError),
+    /// Any other error, including a failure after writing has started.
+    Failed(SearchError),
+}
+
+impl From<SearchError> for FsviRepairError {
+    fn from(error: SearchError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<FsviRepairError> for SearchError {
+    fn from(error: FsviRepairError) -> Self {
+        match error {
+            FsviRepairError::Contended(error) | FsviRepairError::Failed(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for FsviRepairError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contended(error) | Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for FsviRepairError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Contended(error) | Self::Failed(error) => Some(error),
+        }
+    }
 }
 
 /// Result of protecting an FSVI file with repair symbols.
@@ -295,8 +341,17 @@ impl FsviProtector {
     /// On success, the corrupted file is overwritten with the repaired data.
     /// A backup of the corrupted file is created at `<path>.corrupted` before
     /// overwriting.
-    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair(&self, fsvi_path: &Path) -> SearchResult<FsviRepairResult> {
+        self.repair_with_contention(fsvi_path).map_err(Into::into)
+    }
+
+    /// Repair a corrupted FSVI, identifying exclusive lock contention before
+    /// repair starts so a background caller can safely defer the operation.
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
+    pub fn repair_with_contention(
+        &self,
+        fsvi_path: &Path,
+    ) -> Result<FsviRepairResult, FsviRepairError> {
         let start = Instant::now();
         let sidecar_path = Self::sidecar_path(fsvi_path);
 
@@ -304,7 +359,8 @@ impl FsviProtector {
             return Err(SearchError::IndexCorrupted {
                 path: fsvi_path.to_path_buf(),
                 detail: "no .fec sidecar available for repair".to_owned(),
-            });
+            }
+            .into());
         }
 
         // Compute hash before repair (if file exists).
@@ -315,7 +371,7 @@ impl FsviProtector {
         {
             Ok(file) => Some(file),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(SearchError::Io(err)),
+            Err(err) => return Err(SearchError::Io(err).into()),
         };
         let source_guard = source_lock
             .as_ref()
@@ -436,7 +492,7 @@ impl FsviProtector {
                     detail: format!(
                         "repair failed: {reason:?} (received {symbols_received}/{k_required} symbols)"
                     ),
-                })
+                }.into())
             }
         }
     }

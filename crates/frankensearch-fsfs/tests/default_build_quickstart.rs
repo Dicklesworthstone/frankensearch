@@ -8379,6 +8379,7 @@ meta:
     fn legacy_daemon_retries_active_direct_reader_contention() {
         use frankensearch_fsfs::lifecycle::PublicationLease;
         use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
+        use std::io::Write;
         use std::os::unix::fs::MetadataExt;
 
         log_binary_profile("legacy-daemon-reader-progress");
@@ -8490,7 +8491,12 @@ meta:
             }
         };
         let mut expected = vec!["first.md"];
-        for (id, direct) in [("direct-reader.md", true), ("quality-reader.md", false)] {
+        for (id, repair, torn_wal) in [
+            ("direct-reader.md", false, false),
+            ("repair-reader.md", true, false),
+            ("quality-reader.md", false, true),
+        ] {
+            let direct = !torn_wal;
             let append = root.join(format!("{id}.jsonl"));
             fs::write(&append, format!("{}\n", serde_json::json!({
                 "id": id, "text": format!("The veldquartz recovery guide restores the {id} checkpoint.")
@@ -8510,6 +8516,22 @@ meta:
                 assert!(tier.wal_records().any(|(actual, _)| actual == id));
             }
             expected.push(id);
+            if repair {
+                // Damage one vector byte without invalidating the mapping's
+                // layout. A real search can still hold the corrupt inode.
+                let mut bytes = fs::read(&paths[0]).unwrap();
+                *bytes.last_mut().unwrap() ^= 1;
+                fs::write(&paths[0], bytes).unwrap();
+            }
+            if torn_wal {
+                let wal = frankensearch_index::wal_path_for(&paths[0]);
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(wal)
+                    .unwrap()
+                    .write_all(b"BATCH-truncated-review-tail")
+                    .unwrap();
+            }
             let before = snapshot();
 
             let query = if direct {
@@ -8524,13 +8546,45 @@ meta:
                         "jsonl",
                     ],
                 );
-                wait_for_watch_output(
-                    &mut query,
-                    &stdout,
-                    "query.stream.initial_ready",
-                    1,
-                    Duration::from_secs(30),
-                );
+                let keys = paths.each_ref().map(|path| {
+                    let metadata = fs::metadata(path).unwrap();
+                    let dev = metadata.dev();
+                    format!(
+                        "{:02x}:{:02x}:{}",
+                        rustix::fs::major(dev),
+                        rustix::fs::minor(dev),
+                        metadata.ino()
+                    )
+                });
+                let owner = query.0.id().to_string();
+                let holds_both_locks = || {
+                    let locks = fs::read_to_string("/proc/locks").unwrap();
+                    keys.iter().all(|key| {
+                        locks.lines().any(|line| {
+                            line.split_whitespace().skip(1).take(5).eq([
+                                "FLOCK",
+                                "ADVISORY",
+                                "READ",
+                                owner.as_str(),
+                                key.as_str(),
+                            ])
+                        })
+                    })
+                };
+                // Direct streaming can finish producing results before an
+                // observer sees Initial. Stop on the actual lock admission.
+                let started = Instant::now();
+                while !holds_both_locks() {
+                    assert!(
+                        query.0.try_wait().unwrap().is_none(),
+                        "query exited before both reader locks were observed"
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "query did not acquire both reader locks"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
                 let pid = Pid::from_raw(i32::try_from(query.0.id()).unwrap()).unwrap();
                 kill_process(pid, Signal::STOP).unwrap();
                 let started = Instant::now();
@@ -8554,31 +8608,10 @@ meta:
                     );
                     thread::sleep(Duration::from_millis(1));
                 }
-                let locks = fs::read_to_string("/proc/locks").unwrap();
-                let owner = query.0.id().to_string();
-                for path in &paths {
-                    let metadata = fs::metadata(path).unwrap();
-                    let dev = metadata.dev();
-                    let key = format!(
-                        "{:02x}:{:02x}:{}",
-                        rustix::fs::major(dev),
-                        rustix::fs::minor(dev),
-                        metadata.ino()
-                    );
-                    assert!(
-                        locks.lines().any(|line| {
-                            line.split_whitespace().skip(1).take(5).eq([
-                                "FLOCK",
-                                "ADVISORY",
-                                "READ",
-                                owner.as_str(),
-                                key.as_str(),
-                            ])
-                        }),
-                        "suspended direct query must retain the reader lock for {}",
-                        path.display()
-                    );
-                }
+                assert!(
+                    holds_both_locks(),
+                    "suspended direct query must retain both reader locks"
+                );
                 Some((query, stdout, pid))
             } else {
                 None
@@ -8586,20 +8619,18 @@ meta:
             let quality_reader = (!direct).then(|| VectorIndex::open_read_only(&paths[1]).unwrap());
             let (mut daemon, _, stderr) =
                 start(id, &["daemon", "--poll-ms", "25", "--idle-timeout-ms", "0"]);
-            let rejected = wait_for_watch_output(
-                &mut daemon,
-                &stderr,
-                "fsvi map lock refused",
-                1,
-                Duration::from_secs(10),
-            );
+            let refusal = if repair {
+                "cannot acquire exclusive writer lock before repairing"
+            } else {
+                "fsvi map lock refused"
+            };
+            let rejected =
+                wait_for_watch_output(&mut daemon, &stderr, refusal, 1, Duration::from_secs(10));
             let blocked_path = &paths[usize::from(!direct)];
             assert!(
-                rejected
-                    .lines()
-                    .any(|line| line.contains("fsvi map lock refused")
-                        && line.contains(blocked_path.to_str().unwrap())
-                        && line.contains("mode=\"exclusive\"")),
+                rejected.lines().any(|line| line.contains(refusal)
+                    && line.contains(blocked_path.to_str().unwrap())
+                    && (repair || line.contains("mode=\"exclusive\""))),
                 "{rejected}"
             );
             thread::sleep(Duration::from_millis(2250));
@@ -8620,7 +8651,11 @@ meta:
             // leave fast writers available as well as dropping the outer lease.
             let publication = take_publication();
             let fast_writer = (!direct).then(|| {
-                VectorIndex::open_writer(&paths[0]).expect("fast writer released between polls")
+                // A regular writer open would trim the suffix itself and
+                // invalidate this test's no-write observation.
+                let file = fs::OpenOptions::new().write(true).open(&paths[0]).unwrap();
+                file.try_lock().expect("fast writer released between polls");
+                file
             });
             assert_eq!(
                 snapshot(),
@@ -8638,6 +8673,7 @@ meta:
                     Duration::from_secs(15),
                 );
                 assert!(query.0.wait().unwrap().success());
+                assert!(frames.contains("query.stream.initial_ready"), "{frames}");
                 let mut refined = frames
                     .lines()
                     .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -8660,6 +8696,15 @@ meta:
             );
             drop(take_publication());
             assert_eq!(fs::read(&pid_file).unwrap(), pid_bytes);
+            if repair {
+                assert!(
+                    fs::read_to_string(&stderr)
+                        .unwrap()
+                        .contains("vector generation repaired from its RaptorQ sidecar")
+                );
+                let backup = paths[0].with_extension("fsvi.corrupted");
+                assert_eq!(fs::read(backup).unwrap(), before[0][0]);
+            }
             for (path, producer) in paths.iter().zip(&producers) {
                 let tier = VectorIndex::open_read_only(path).unwrap();
                 assert_eq!(tier.wal_record_count(), 0);
