@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 fresh review of legacy compactor repair — in progress
+## November 25 fresh review of legacy compactor repair — qualified source
 
 `bd-compactor-repair-admission-40m0c`, OrangeSparrow. The previously
 qualified installed `3d9adea8…` baseline exits 2 during sidecar repair
@@ -22,10 +22,11 @@ or maintenance. Baselines are in `/data/tmp/fs-fresh-eyes-*-baseline.log`.
   so the test cannot trim the WAL. Keep the healthy direct case.
 - [x] Prove old installed failures, candidate passage, no byte changes while
   blocked, both-tier recovery, recorded identities, output and selected stop.
-- [ ] Review the final diff again, pass strict compiler checks and UBS,
+- [x] Review the final diff again, pass strict compiler checks and UBS,
   and run all eighteen stock stages on frozen exact source.
-- [ ] Run fresh acceptance on the stock installed ELF, publish scoped code
-  and evidence, verify both remote refs, close the Bead and release leases.
+- [x] Run fresh solo acceptance on the stock installed ELF.
+- [ ] Publish qualified source and evidence, verify both references, close
+  the Bead on cited evidence, export the closed status, and release leases.
 
 Fresh review of the test also found its stream observation could race the
 release of both index locks. `review-candidate-v1-result.json` failed that
@@ -44,6 +45,25 @@ Strict Rust Clippy for affected crates passed remotely on hz4 for the
 implementation. The final fixture, native checks and stock gate are
 tracked separately. The first native compile was superseded by the group
 lock API and its own process group was stopped at exit 143.
+
+Strict native workspace Clippy and both UBS scans completed successfully
+with zero critical findings. All eighteen unchanged stock stages passed
+on clean `34e953426263cfea654aa016ea683a94060abfe5` in 4,812.45 s on
+thinkstation1 under UID 1000 and private tmpfs. The terminal receipt is
+`stock-gate-reader-repair-v1-result.json`. The real-model lane includes the
+extended reader regression and existing writer and seven startup cases.
+
+The invocation-built installed ELF `b1bfe7b8…` passed the stock quickstart
+with 12 commands, 22 controls, and zero remaining owned processes. Fresh
+solo original acceptance on that exact ELF passed in 31.47 s. Receipts are
+`review-quickstart-34e95342-receipt.json` and
+`review-installed-acceptance-v1-result.json`. A separate permission-denied
+run exited 1 with the pending bytes intact. Both tiers compacted after
+restoring permission. See `/data/tmp/fs-review-installed-denied-write-v1.log`.
+
+Release qualification remains in progress. The DSR refresh at 17:01 UTC
+found `mmini` below its 40 GiB floor at 20.63 GiB, `wlap` unreachable, and
+`trj` healthy. Receipt `/data/tmp/fs-fresh-eyes-release-hosts-20261125.json`.
 
 ## November 25 active direct-reader compactor progress — qualified source published
 
