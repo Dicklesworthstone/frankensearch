@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 fresh review of legacy compactor repair — qualified source
+## November 25 fresh review of legacy compactor repair — qualified source published
 
 `bd-compactor-repair-admission-40m0c`, OrangeSparrow. The previously
 qualified installed `3d9adea8…` baseline exits 2 during sidecar repair
@@ -25,8 +25,8 @@ or maintenance. Baselines are in `/data/tmp/fs-fresh-eyes-*-baseline.log`.
 - [x] Review the final diff again, pass strict compiler checks and UBS,
   and run all eighteen stock stages on frozen exact source.
 - [x] Run fresh solo acceptance on the stock installed ELF.
-- [ ] Publish qualified source and evidence, verify both references, close
-  the Bead on cited evidence, export the closed status, and release leases.
+- [x] Publish qualified source and evidence, verify both references, close
+  the Bead on cited evidence, and export the closed status.
 
 Fresh review of the test also found its stream observation could race the
 release of both index locks. `review-candidate-v1-result.json` failed that
@@ -64,6 +64,11 @@ restoring permission. See `/data/tmp/fs-review-installed-denied-write-v1.log`.
 Release qualification remains in progress. The DSR refresh at 17:01 UTC
 found `mmini` below its 40 GiB floor at 20.63 GiB, `wlap` unreachable, and
 `trj` healthy. Receipt `/data/tmp/fs-fresh-eyes-release-hosts-20261125.json`.
+
+Both remote refs were verified at `a547079420659530f4351e5f9443003b39ff153b`
+before closure at 18:29:54 UTC. The closure export preserves the original
+acceptance text and every unrelated row. Final refs and exact lease release
+are recorded in `/data/tmp/fs-daemon-startup.sKDROXdS/review-final-publication-result.json`.
 
 ## November 25 active direct-reader compactor progress — qualified source published
 
