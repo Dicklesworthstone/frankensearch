@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 manual legacy compaction admission — in progress
+## November 25 manual legacy compaction admission — source qualified
 
 `bd-explicit-compact-admission-kv0lf`, OrangeSparrow. The published installed
 default `b1bfe7b8…` drains fast and removes its FEC before returning a quality
@@ -20,10 +20,13 @@ complete manual compaction, followed by real Refined results.
   Check both tiers byte-for-byte and prove no quarantine. Retain all prior tests.
 - [x] Run matching red/green installed and candidate probes, including the
   positive explicit retry, retained IDs and protection sidecars.
-- [ ] Re-review, pass strict compiler/UBS checks and all eighteen unchanged
+- [x] Re-review, pass strict compiler/UBS checks and all eighteen unchanged
   stock stages on clean exact source. Retain exact artifacts and receipts.
-- [ ] Run fresh installed acceptance, publish scoped source/evidence, verify
-  both remote refs, close on cited criteria, export closure, and release leases.
+- [x] Run both named tests and all three direct CLI controls on the fresh
+  stock install. Verify the busy and malformed refusals, successful retries,
+  the retained search hit, both protection sidecars, and fast-only JSON.
+- [ ] Publish scoped source and evidence, verify both remote refs, close on
+  cited criteria, export closure, and release leases.
 
 Baseline and candidate receipts `manual-{busy,malformed}-{red,green}-v1-result.json`
 retain the same harness `0c819b33…` and exact tested binary identities.
@@ -42,6 +45,30 @@ instruction. The final version makes that value copyable and simplifies the
 missing-fast error path. This leaves admission and recovery unchanged. The
 failure remains in `fs-review-2-{native,rch}-clippy-v1.log`. UBS on the final
 changed files reports zero critical findings.
+
+Native `thinkstation1` passed all eighteen unchanged stock stages in 4,982 s
+on clean `ab2c175e1b27c7e44f597b4013df78db75306dc8`, with zero skips. The
+installed default had SHA-256
+`d7c7eedf2821df114f508f6c9ef57d63aba8c23e9e64e074eda863c36c11ed93`.
+Fresh runs of `legacy_daemon_retries_active_direct_reader_contention` and
+`legacy_daemon_compacts_existing_wal` against that executable passed in
+33.92 s and 75.44 s. Direct installed CLI runs independently confirmed exit
+2 for the busy reader and exit 1 for the malformed WAL, with the pending
+bytes preserved through both refusals. Both positive retries merged one
+WAL record per tier and returned the acknowledged ID in Refined search.
+Doctor confirmed both sidecars intact. The Potion-only control merged its
+pending record, exercised the normal vacuum and JSON path, and found the
+acknowledged hit. This preflight guarantee covers WAL recovery and compaction.
+Existing durability repair is evaluated separately.
+
+The gate receipt `stock-gate-manual-compaction-v1-result.json`, quickstart
+receipt `manual-compact-quickstart-ab2c175e-receipt.json`, and two
+`manual-installed-acceptance-v1-legacy_daemon_*-result.json` runs are under
+`/data/tmp/fs-daemon-startup.sKDROXdS`. Direct installed probe logs are
+`/data/tmp/fs-review-2-installed-{quality-busy,quality-bad-wal,fast-only}.log`.
+The DSR refresh at 18:50 UTC measured 20.18 GiB free on `mmini` against a
+40 GiB floor, with Windows `wlap` unreachable. Release bead `bd-dsbym`
+remains in progress.
 
 ## November 25 fresh review of legacy compactor repair — qualified source published
 
