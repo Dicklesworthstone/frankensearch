@@ -1,6 +1,6 @@
 # Open bug repair TODO
 
-## November 25 legacy startup WAL repair — OrangeSparrow
+## November 25 legacy startup WAL repair — qualified, publication pending
 
 Owner-requested execution checklist for `bd-legacy-daemon-startup-wal-420fg`.
 Retire this active block at qualified publication or handoff with explicit
@@ -12,7 +12,7 @@ unmet criteria; preserve its history. Beads remains the task authority.
   peer performance acceptance. Claim one concrete ordinary-product bug under
   the exclusive graph lease, with its code and named real-model test together.
 - [x] Inspect IcySnow's preserved unqualified candidate; credit its design and
-  leave that worktree untouched. The startup-counter defect remains upstream.
+  leave that worktree untouched. Confirm the old counter defect at `b27feb94`.
 - [x] Retain a matched baseline executable and reproduce the named populated
   daemon-startup test failing because both pending WALs remain unmerged.
 - [x] Finish the production fix: process existing work on the first poll,
@@ -25,7 +25,7 @@ unmet criteria; preserve its history. Beads remains the task authority.
   existing healthy unprotected policy with preserved sidecars outside the root.
 - [x] Compile/lint the integrated source and execute the named test red/green;
   triage the exact changed files with UBS and check formatting.
-- [ ] Freeze a clean source checkpoint and finish all eighteen unchanged stock
+- [x] Freeze a clean source checkpoint and finish all eighteen unchanged stock
   labels with real models and the genuine prior executable. Keep execution
   classes, all failed attempts and source/lock/ELF/model identities explicit.
   - [x] Preserve the first clean `b692f5d4` run: fmt/check/clippy-proxy pass;
@@ -35,7 +35,7 @@ unmet criteria; preserve its history. Beads remains the task authority.
     lints or gates: two unit-valued mutation statements need semicolons; an HNSW
     test needs its explicit default type; receipt values need Clone; native CLI
     preview checks need the authenticated policies and bounded source export.
-  - [ ] Re-execute the existing populated partial-quality migration, completion,
+  - [x] Re-execute the existing populated partial-quality migration, completion,
     source-recovery and transition cases; freeze and rerun all eighteen labels.
   - [x] Preserve and correct the warm-completion test's wrong API invocation:
     raw `ServingEmbedder::embed` deliberately bypasses caching, while production
@@ -73,13 +73,113 @@ tmpfs namespaces. Corrected warm cache retention passes in 92.42 seconds across
 all four original topology/retrieval combinations; corrected source-completion
 preflight passes in 32.58 seconds, including the exact refusal and matched
 valid-input control. Both affected core migration tests pass. Workspace strict
-Clippy and final hybrid strict Clippy pass; the new complete stock run remains
-pending. Neither correction changes production caching, default tests,
+Clippy and final hybrid strict Clippy pass; the complete stock run passes on
+the qualified source below. Neither correction changes production caching, default tests,
 model mocks, pass thresholds, or time budgets. The quality script, lockfile and
 startup production/test implementation are byte-identical to `b692f5d4`.
-- [ ] Reverify original acceptance in a fresh solo pass, write the bounded
-  work/honesty review, close only the owned bug on evidence, export only owned
-  tracker changes, publish and verify both refs, then release reservations.
+- [x] Reverify original acceptance in a fresh solo pass and write the bounded
+  work/honesty review. This is solo verification, not independent certification.
+- [x] Exercise the newly connected preview API with twelve predeclared actual
+  local-model command outcomes, including exact/HNSW and proper refusals.
+- [ ] Export only the owned tracker record, publish qualified code and evidence,
+  and verify both remote refs without disturbing the peer's unpublished row.
+- [ ] Close only the owned bug on its original acceptance, publish the final
+  status, verify both refs again and release the owned reservations.
+
+Final qualification: clean `b286a61d737ebbba0aff63dc73a67fec558d5686`, all
+eighteen quality labels PASS, no label skips, terminal 0, 04:22:51–05:20:34 UTC,
+3,463.35 seconds. `stock-gate-v2-result.json` records source, commands, labels
+and terminal state; log SHA256:
+`6bb94ed4256f3ac9429fdb01af214e61942fdc58dc09f3e4a3c6ca1257dcd797`.
+Execution is native thinkstation1 at the original UID/groups in a fresh private
+4 GiB tmpfs. The genuine prior executable is retained. `fast_cmaes` remains
+clean at `18b3910246862468893ca1d0cd345a379e4f7082`; lock/script hashes are
+unchanged. The native CLI suite passes 402/0/0, including both corrected drivers.
+The bounded Quill lane is not the separate full campaign or performance gate.
+
+The fresh final-harness acceptance pair uses the actual installed default
+quickstart binary: baseline main-count failure, exit 101; repaired executable,
+all seven scenarios, exit 0, 78.10 seconds. `final-acceptance-result.json` binds
+both ELFs, harness, logs and unchanged source. Installed default ELF SHA256:
+`b544d60bfeb1676e283a8ea024b12975b86b8191a6dd73da531ca5ce0a27da24`.
+The final combined scan of all twelve changed Rust files exits 0: 0 critical,
+11,883 warnings, 3,154 informational findings; the scoped triage and the three
+test-sentinel classifications above apply, without a warning-free claim.
+
+`native-preview-product-v1-result.json` records twelve actual registered
+Potion/MiniLM outcomes in 96.84 seconds: ten successful commands and two proper
+regression refusals. Exact and HNSW each index fast-only, backfill a strict
+quality subset, refuse regressing coverage before model loading/staging,
+replace the complete source with an explicitly authorized full-coverage
+successor, and reopen in fresh processes for Initial/Refined search and source
+fetch. Producer identities, result IDs, replacement title and metadata survive;
+refusals preserve AUTHORITY/LOCK and create no work or receipt. Artifact root:
+`/home/ubuntu/.native-preview-4rh7b5ba`. Native ELF SHA256:
+`d3bad6483ab47fdedb42b28da285f3ae9e4a4101ecc409a6e47833ddd78b311f`.
+
+Origin advanced only by `5b7bac4b` with the same two semicolon fixes already
+qualified here. Merge `c3f986d7` preserves that commit; its entire Git tree is
+identical to the qualified tree `6b420a4503a39dcd66096c0b101192ee1e7c4df7`.
+`merge-tree-equivalence.json` records the equality; the post-merge import makes
+zero updates. No product code changed after qualification.
+
+Real-work worksheet (this startup repair and its integrated validation): the
+README purpose is two-tier hybrid local search for Rust and fsfs. Inventory:
+`b692f5d4` fixes startup compaction with its real-model test; `b286a61d` connects
+the missing native preview APIs and repairs demonstrated test-driver defects;
+the merge preserves identical qualified bytes. By work item: USER 2, ENABLER 1
+(executed qualification), PROCESS 1 (requested tracking/publication record),
+UNKNOWN 0. The two-minute demonstration is append, start daemon, inspect both
+merged tiers and query the appended document. Removing the tracking would not
+change runtime capability; it would lose the requested evidence and honest
+closure boundary. Tests consumed the actual fixes. The oldest open epic,
+`bd-quill-e6-gauntlet-scale-rm3q`, requires its blocked children and two full
+nightly runs; this stock bounded lane cannot close it. No peer acceptance was
+split, rewritten or closed. Solo work; no swarm. Verdict: HEALTHY, with zero
+capability credit for this worksheet or the tracker record.
+
+Honesty inventory (bounded to these changes and retained attempts):
+
+1. No (checked: both source diffs and the stock script/lock hashes): no original
+   assertion, tolerance or budget was weakened. The new real-model case follows
+   the existing ignored-by-default convention and is executed by the e2e lane.
+2. No (checked: new executable regression and native diffs): no new model mock
+   or fake implementation; the matched negative uses the existing loader seam.
+3. No (checked: golden/config/dependency diffs): no golden regeneration.
+4. Yes: three explained local UBS annotations classify existing test-only panic
+   sentinels; their bodies remain intact and the unannotated production control
+   still blocks. Two demonstrated test-driver defects are corrected above,
+   preserving/strengthening assertions; production cache behavior is unchanged.
+5. No (checked: runtime/API diffs): no demo-path, environment or benchmark branch.
+6. No (checked: actual result counts): named probe 1/7 scenarios, native 402,
+   corrected core 2, live native commands 12 and all eighteen terminal labels.
+7. No (checked: command logs/receipts): no unexecuted check reported as passed.
+8. No (checked: execution classes): baseline remote build is distinguished from
+   native qualification; synthetic existing unit providers are not live proof.
+9. No (checked: failed receipts and progress comments): copy race, wrong expected
+   CRC diagnostic, WAL-quarantine defect, upstream compile/lint failures, both
+   failed native tests and the retired first stock run remain visible.
+10. No (checked: command redirections): stdout/stderr evidence is retained.
+11. No (checked: Beads): the owned bug remains in progress until publication;
+    broader migration, performance and release acceptance remains open.
+12. No (checked: original Bead description): acceptance/specification unchanged.
+13–17. Not applicable: truly solo; the prior prototype is credited and rechecked,
+    and no peer report or agreement substitutes for executed verification.
+18. No (checked: declarations): seven scenarios, eighteen labels and twelve live
+    command outcomes were selected before their results.
+19. The copy race and initial test assumptions warranted explanation; both were
+    disclosed and corrected, with failed runs preserved. No independent review
+    or competitive/performance/binary-release qualification is claimed.
+20. Strongest evidence: re-executable paired installed-binary red/green, actual
+    artifact/Refined-result assertions, the clean full gate, and live native
+    source/policy consumers. All are bound to the qualified source and ELFs.
+
+Six bounded CASS searches plus archived hit context checked older work and this
+named probe; this is a sample, not an exhaustive history audit. Disposition:
+the observed defects and annotation exceptions are corrected, disclosed and
+guarded by retained negative controls. Patterns guarded against are false/zero
+green, gate self-weakening, proof-class inflation and false closure. Publication
+and the final status update remain the only pending actions in this block.
 
 Current evidence: `/data/tmp/fs-daemon-startup.sKDROXdS`. The clean-overlay
 `b27feb94` build with explicit `fast_cmaes` revision completed on hz4 and its
@@ -89,7 +189,7 @@ The native-built permanent probe executes that baseline and fails at the actual
 startup result: daemon exit 0, fast main count 1 instead of 2. Both pending WALs
 also remain byte-identical in the separately retained product reproduction.
 Admission refusals (external containment, slots, queue timeout, disk) are saved
-and earn no compilation/test credit. Stock and fresh acceptance remain pending.
+and earn no compilation/test credit. Final stock/fresh results are recorded above.
 The first candidate launch raced an unfinished executable copy and failed to
 spawn; the next retained run passed all four positive scenarios, then caught
 an incorrect expected diagnostic in the new test. A first-byte sidecar edit
