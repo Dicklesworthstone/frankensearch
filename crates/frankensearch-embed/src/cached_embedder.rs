@@ -143,7 +143,8 @@ impl CacheState {
         self.small.retain(|key| matches!(key, CacheKey::Bound(_)));
         self.main.retain(|key| matches!(key, CacheKey::Bound(_)));
         self.ghost.retain(|key| matches!(key, CacheKey::Bound(_)));
-        self.ghost_set.retain(|key| matches!(key, CacheKey::Bound(_)));
+        self.ghost_set
+            .retain(|key| matches!(key, CacheKey::Bound(_)));
     }
 
     fn lookup_raw(&mut self, key: &str) -> Option<Vec<f32>> {

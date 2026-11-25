@@ -934,11 +934,8 @@ mod tests {
                     let plan =
                         super::recovery_plan_for_search_error(error, request, &policy, None, 0)
                             .expect("an unlocated producer failure has a diagnostic plan");
-                    let advice = advice_for_search_error(
-                        "query",
-                        Some(Path::new("/tmp/fsfs-index")),
-                        error,
-                    );
+                    let advice =
+                        advice_for_search_error("query", Some(Path::new("/tmp/fsfs-index")), error);
                     let (failure, reason, summary, wire_failure) =
                         if matches!(error, SearchError::HashMismatch { .. }) {
                             (
@@ -958,7 +955,10 @@ mod tests {
                     assert_eq!(advice.failure, failure);
                     assert_eq!(advice.reason_code, reason);
                     assert_eq!(advice.operator_summary, summary);
-                    assert_eq!(serde_json::to_value(&advice).unwrap()["failure"], wire_failure);
+                    assert_eq!(
+                        serde_json::to_value(&advice).unwrap()["failure"],
+                        wire_failure
+                    );
                     assert_eq!(advice.next_actions.len(), 1);
                     assert_eq!(
                         advice.next_actions[0].reason_code,
@@ -1033,13 +1033,7 @@ mod tests {
                     ..request
                 };
                 assert!(matches!(
-                    super::recovery_plan_for_readiness(
-                        &readiness,
-                        other_request,
-                        &policy,
-                        None,
-                        0,
-                    ),
+                    super::recovery_plan_for_readiness(&readiness, other_request, &policy, None, 0,),
                     Err(RecoveryContractError::UnavailableTierTopologyMismatch { .. })
                 ));
             }
