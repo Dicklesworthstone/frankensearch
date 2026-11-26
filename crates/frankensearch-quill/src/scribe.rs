@@ -3831,9 +3831,26 @@ struct FlushTokenRow {
     position: u32,
 }
 
+/// Once scattered, the owning range identifies the term. Only these two
+/// columns need to stay resident for every occurrence while sealing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TermOccurrence {
+    doc_ord: u32,
+    position: u32,
+}
+
+impl From<FlushTokenRow> for TermOccurrence {
+    fn from(row: FlushTokenRow) -> Self {
+        Self {
+            doc_ord: row.doc_ord,
+            position: row.position,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RadixPartition {
-    rows: Vec<FlushTokenRow>,
+    rows: Vec<TermOccurrence>,
     ranges: Vec<Range<usize>>,
 }
 
@@ -3850,7 +3867,7 @@ impl ChunkedRadixPartition {
     fn term_slices<'a>(
         &'a self,
         term_id: u32,
-        slices: &mut Vec<&'a [FlushTokenRow]>,
+        slices: &mut Vec<&'a [TermOccurrence]>,
     ) -> Result<(), FlushError> {
         let index = usize::try_from(term_id).map_err(|_| FlushError::ArithmeticOverflow {
             field: "local term host index",
@@ -5127,7 +5144,7 @@ where
         }
     }
 
-    let mut sorted = filled_vec(row_count, FlushTokenRow::default(), "radix output")?;
+    let mut sorted = filled_vec(row_count, TermOccurrence::default(), "radix output")?;
     let ranges = if term_count <= RADIX_DIGIT_BUCKETS {
         stable_digit_scatter_into(rows, 0, term_count, &mut sorted)?
     } else {
@@ -5146,7 +5163,7 @@ where
 fn stable_dense_term_scatter_into<I>(
     rows: I,
     term_count: usize,
-    output: &mut [FlushTokenRow],
+    output: &mut [TermOccurrence],
 ) -> Result<Vec<Range<usize>>, FlushError>
 where
     I: Iterator<Item = FlushTokenRow> + Clone,
@@ -5203,7 +5220,7 @@ where
             .ok_or(FlushError::ArithmeticOverflow {
                 field: "radix scatter destination",
             })?;
-        *slot = row;
+        *slot = row.into();
         range.end += 1;
     }
 
@@ -5231,7 +5248,7 @@ fn stable_digit_scatter_into<I>(
     rows: I,
     shift: u32,
     bucket_count: usize,
-    output: &mut [FlushTokenRow],
+    output: &mut [TermOccurrence],
 ) -> Result<Vec<Range<usize>>, FlushError>
 where
     I: Iterator<Item = FlushTokenRow> + Clone,
@@ -5291,7 +5308,7 @@ where
             .ok_or(FlushError::ArithmeticOverflow {
                 field: "radix scatter destination",
             })?;
-        *slot = row;
+        *slot = row.into();
         *destination += 1;
     }
     Ok(ranges)
@@ -5540,7 +5557,7 @@ where
 /// the term's rows in source order when read one after another.
 fn build_term_rows(
     term_id: u32,
-    slices: &[&[FlushTokenRow]],
+    slices: &[&[TermOccurrence]],
     lease_docid_base: u64,
     stores_positions: bool,
 ) -> Result<(Vec<Posting>, Option<Vec<u32>>), FlushError> {
@@ -5579,12 +5596,6 @@ fn build_term_rows(
     let mut frequency = 0_u32;
     let mut previous_position = None;
     for (index, row) in rows().enumerate() {
-        if row.term_id != term_id {
-            return Err(FlushError::TermIdOutOfRange {
-                field_ord: 0,
-                term_id: row.term_id,
-            });
-        }
         if row.doc_ord < current_doc {
             return Err(FlushError::NonAscendingTermDocuments {
                 term_id,
@@ -10188,6 +10199,11 @@ mod tests {
         assert_eq!(reader.header().docid_hi, 65_542);
     }
 
+    struct ReconstructedPartition {
+        rows: Vec<FlushTokenRow>,
+        ranges: Vec<Range<usize>>,
+    }
+
     /// Partition `rows` through the seal's span partitioner, presented as
     /// consecutive column spans of `span_lens` rows (the rest in a final
     /// span), and flatten the chunks back into one term-ordered row list.
@@ -10196,7 +10212,7 @@ mod tests {
         span_lens: &[usize],
         term_count: usize,
         chunk_count: usize,
-    ) -> Result<RadixPartition, FlushError> {
+    ) -> Result<ReconstructedPartition, FlushError> {
         let term_ids = rows.iter().map(|row| row.term_id).collect::<Vec<_>>();
         let doc_ords = rows.iter().map(|row| row.doc_ord).collect::<Vec<_>>();
         let positions = rows.iter().map(|row| row.position).collect::<Vec<_>>();
@@ -10218,17 +10234,19 @@ mod tests {
         let mut ranges = Vec::new();
         let mut slices = Vec::new();
         for term_id in 0..term_count {
-            partition.term_slices(
-                u32::try_from(term_id).expect("test term id fits u32"),
-                &mut slices,
-            )?;
+            let term_id = u32::try_from(term_id).expect("test term id fits u32");
+            partition.term_slices(term_id, &mut slices)?;
             let start = flattened.len();
             for slice in &slices {
-                flattened.extend_from_slice(slice);
+                flattened.extend(slice.iter().map(|row| FlushTokenRow {
+                    term_id,
+                    doc_ord: row.doc_ord,
+                    position: row.position,
+                }));
             }
             ranges.push(start..flattened.len());
         }
-        Ok(RadixPartition {
+        Ok(ReconstructedPartition {
             rows: flattened,
             ranges,
         })
@@ -10238,14 +10256,14 @@ mod tests {
         rows: &[FlushTokenRow],
         term_count: usize,
         chunk_count: usize,
-    ) -> Result<RadixPartition, FlushError> {
+    ) -> Result<ReconstructedPartition, FlushError> {
         partition_rows_in_spans(rows, &[], term_count, chunk_count)
     }
 
     fn partition_rows(
         rows: &[FlushTokenRow],
         term_count: usize,
-    ) -> Result<RadixPartition, FlushError> {
+    ) -> Result<ReconstructedPartition, FlushError> {
         let chunk_count = rayon::current_num_threads()
             .min(rows.len().div_ceil(PARALLEL_RADIX_ROWS_PER_CHUNK))
             .max(1);
@@ -10254,6 +10272,7 @@ mod tests {
 
     #[test]
     fn chunked_span_partition_matches_a_stable_sort_across_span_and_chunk_cuts() {
+        assert_eq!(std::mem::size_of::<TermOccurrence>(), 8);
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = || {
             seed = seed
@@ -10320,13 +10339,11 @@ mod tests {
         assert_eq!(
             slices.concat(),
             [
-                FlushTokenRow {
-                    term_id: 3,
+                TermOccurrence {
                     doc_ord: 0,
                     position: 0,
                 },
-                FlushTokenRow {
-                    term_id: 3,
+                TermOccurrence {
                     doc_ord: 1,
                     position: 0,
                 },
@@ -10409,7 +10426,7 @@ mod tests {
         ];
         let partition = stable_radix_partition_rows(rows.into_iter(), rows.len(), term_count)
             .expect("one populated high term");
-        assert_eq!(partition.rows, rows);
+        assert_eq!(partition.rows, rows.map(TermOccurrence::from));
         assert!(
             partition.ranges[..RADIX_DIGIT_BUCKETS]
                 .iter()
