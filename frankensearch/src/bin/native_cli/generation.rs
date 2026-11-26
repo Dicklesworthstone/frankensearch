@@ -327,6 +327,15 @@ swap; failure retains the old complete selection. Topology and prepared-input\n\
 contracts stay fixed. No model is downloaded and no new authority is published.\n\
 Partial model activation also requires the exact source checkpoint, full source,\n\
 Quill image and authenticated quality-covered IDs; it cannot expand coverage.\n\
+The same grant accepts op=activate_rollback with the exact receipt and\n\
+expected_authority to adopt an already published authority-rollback. Its current\n\
+authenticated manifest must declare rollback. The restored topology, source and\n\
+quality coverage replace the serving selection together; the primary tier and\n\
+prepared-input contracts stay fixed. Matching producers and their query caches\n\
+are retained, and fast-only restoration drops both quality handles. Missing or\n\
+changed producers require explicit local model paths for only those tiers.\n\
+Omit model options when all required producers can be retained. Admission, scope,\n\
+loading or concurrent-head failure preserves every previous serving field.\n\
 The same grant accepts op=activate_quality_completion for an already published\n\
 authority-complete-quality successor of a fast-only or partial session. Each\n\
 partial successor must preserve all covered IDs and expand actual membership.\n\
@@ -4384,6 +4393,8 @@ impl AuthoritySession {
         );
         let completion = semantic && incomplete && self.allow_model_activation;
         response["quality_completion_activation_enabled"] = serde_json::json!(completion);
+        response["rollback_activation_enabled"] =
+            serde_json::json!(semantic && self.allow_model_activation);
         response["quality_completion_enabled"] =
             serde_json::json!(completion && self.update_limits.is_some());
         response["coverage_transition_enabled"] = serde_json::json!(
@@ -4966,10 +4977,13 @@ async fn serve_session(
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
                 let previous = session.snapshot.authority();
                 let completes_quality = request.completes_quality();
-                let result = session.activate_model(cx, &request).map(|()| {
+                let restores_rollback = request.restores_rollback();
+                let result = session.activate_model(cx, &request).map(|activation| {
                     let mut response = session.response(
                         if completes_quality {
                             "quality_completion_activated"
+                        } else if restores_rollback {
+                            "rollback_activated"
                         } else {
                             "model_activated"
                         },
@@ -4982,15 +4996,15 @@ async fn serve_session(
                     response["previous_authority"] =
                         serde_json::json!(previous.canonical_bytes().as_slice());
                     response["documents"] = serde_json::json!(session.receipt.documents);
-                    response["models_loaded"] = serde_json::json!(if !completes_quality
-                        && session.receipt.quality_identity.is_some()
-                    {
-                        2
-                    } else {
-                        1
-                    });
+                    response["models_loaded"] = serde_json::json!(activation.models_loaded);
                     if completes_quality {
                         response["fast_model_retained"] = serde_json::json!(true);
+                    }
+                    if restores_rollback {
+                        response["primary_model_retained"] =
+                            serde_json::json!(activation.primary_retained);
+                        response["quality_model_retained"] =
+                            serde_json::json!(activation.quality_retained);
                     }
                     session.annotate_query_capabilities(&mut response);
                     Some(response)
