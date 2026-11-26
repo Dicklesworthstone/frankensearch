@@ -815,15 +815,17 @@ impl SyncTwoTierSearcher {
                 | SyncLexicalFailure::Retrieval(error @ SearchError::Cancelled { .. }),
             ) => Err(error),
             Err(SyncLexicalFailure::Retrieval(error)) => {
-                // Match the async searcher's optional-arm contract. Discard
-                // even a partially fetched prefix after a refill failure; it
-                // cannot stand in for a successful lexical retrieval. A caller
-                // cancellation still terminates the whole request above.
+                // Failed retrieval cannot contribute a partial lexical ranking.
+                // A successful prefix can still supply metadata that rejected
+                // a semantic candidate. Keep those observations binding for a
+                // filtered fallback; an outage cannot make them unknown.
                 tracing::warn!(
                     error_code = error.diagnostic_code(),
                     "lexical search failed, continuing without lexical"
                 );
-                context.metadata.clear();
+                if filter.is_none() {
+                    context.metadata.clear();
+                }
                 Ok(None)
             }
         }
@@ -2407,17 +2409,21 @@ impl SyncLexicalContext {
 
         let started = Instant::now();
         let mut observations = SyncMetadata::new();
-        match search_lexical_candidates(
+        let outcome = search_lexical_candidates(
             source.as_ref(),
             query_vec,
             target,
             Some(filter),
             &mut observations,
             Some(&self.metadata),
-        ) {
+        );
+        // A later refill or hydration failure cannot erase observations from a
+        // successful prefix. Refinement fallback needs them too when deciding
+        // whether the previously published Initial is still eligible.
+        self.metadata.extend(observations);
+        match outcome {
             Ok(refilled) => {
                 *hits = refilled;
-                self.metadata.extend(observations);
             }
             Err(
                 SyncLexicalFailure::Metadata(error)
@@ -6617,6 +6623,7 @@ mod tests {
         limits: Mutex<Vec<usize>>,
         initial_lookups: AtomicUsize,
         cancel_on_tail: bool,
+        fail_after_revalidation_prefix: bool,
     }
 
     impl SyncLexicalSearch for LateRefillLexical {
@@ -6633,6 +6640,23 @@ mod tests {
                         .take(limit)
                         .collect(),
                 );
+            }
+            if self.fail_after_revalidation_prefix {
+                if limit > 4 {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "test.lexical",
+                        source: "lexical revalidation refill unavailable".into(),
+                    });
+                }
+                return Ok(["doc-c", "doc-d", "blocked-filler-a", "blocked-filler-b"]
+                    .into_iter()
+                    .take(limit)
+                    .map(|id| {
+                        let mut hit = lexical_result(id, 8.0);
+                        hit.metadata = Some(Arc::new(serde_json::json!({"doc_type": "blocked"})));
+                        hit
+                    })
+                    .collect());
             }
             let mut hits = vec![
                 lexical_result("doc-c", 8.0),
@@ -6767,6 +6791,156 @@ mod tests {
             _ => panic!("unknown late-refill fixture mode"),
         };
         (directory, Arc::new(index), query)
+    }
+
+    #[test]
+    fn lexical_refill_failure_preserves_known_filter_rejections() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        #[derive(Default)]
+        struct PrefixOutage {
+            limits: Mutex<Vec<usize>>,
+        }
+
+        impl SyncLexicalSearch for PrefixOutage {
+            fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+                let first = {
+                    let mut limits = self.limits.lock().unwrap();
+                    limits.push(limit);
+                    limits.len() == 1
+                };
+                if !first {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "test.lexical",
+                        source: "lexical refill unavailable".into(),
+                    });
+                }
+                Ok(["doc-a", "doc-b"]
+                    .into_iter()
+                    .take(limit)
+                    .map(|id| {
+                        let mut hit = lexical_result(id, 10.0);
+                        hit.metadata = Some(Arc::new(serde_json::json!({"doc_type": "blocked"})));
+                        hit
+                    })
+                    .collect())
+            }
+        }
+
+        for mode in ["fast", "quality", "progressive"] {
+            for attested in [false, true] {
+                let (_directory, index, query) = late_refill_index(mode, attested, true);
+                for streamed in [false, true] {
+                    let lexical = Arc::new(PrefixOutage::default());
+                    let searcher = SyncTwoTierSearcher::new(
+                        Arc::clone(&index),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 1.0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_lexical(lexical.clone());
+                    let filter = DocTypeFilter::new(["keep"]);
+                    let results = if streamed {
+                        let phases: Vec<_> = searcher
+                            .search_iter_with_filter(&query, 2, Some(&filter))
+                            .collect();
+                        assert_eq!(phases.len(), if mode == "progressive" { 2 } else { 1 });
+                        for phase in &phases {
+                            match phase {
+                                SearchPhase::Initial { results, .. }
+                                | SearchPhase::Refined { results, .. } => {
+                                    assert!(results.iter().all(|hit| {
+                                        !matches!(hit.doc_id.as_str(), "doc-a" | "doc-b")
+                                            && hit.lexical_score.is_none()
+                                    }));
+                                }
+                                other => panic!("optional lexical outage failed search: {other:?}"),
+                            }
+                        }
+                        match phases.into_iter().last().unwrap() {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. } => results,
+                            other => panic!("unexpected final phase: {other:?}"),
+                        }
+                    } else {
+                        let (results, metrics) = searcher
+                            .search_collect_with_filter(&query, 2, Some(&filter))
+                            .expect("semantic fallback retains known filter observations");
+                        assert_eq!(metrics.lexical_candidates, 0);
+                        results
+                    };
+                    assert_eq!(
+                        results
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["doc-c", "doc-d"],
+                        "{mode}, attested={attested}, streamed={streamed}",
+                    );
+                    assert!(results.iter().all(|hit| hit.lexical_score.is_none()));
+                    assert_eq!(*lexical.limits.lock().unwrap(), [2, 4]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_revalidation_failure_preserves_new_filter_rejections() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        for mode in ["fast", "quality", "progressive"] {
+            for attested in [false, true] {
+                let (_directory, index, query) = late_refill_index(mode, attested, true);
+                for streamed in [false, true] {
+                    let lexical = Arc::new(LateRefillLexical {
+                        fail_after_revalidation_prefix: true,
+                        ..LateRefillLexical::default()
+                    });
+                    let searcher = SyncTwoTierSearcher::new(
+                        Arc::clone(&index),
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 1.0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_lexical(lexical.clone());
+                    let filter = DocTypeFilter::new(["keep"]);
+                    let results = if streamed {
+                        let phases: Vec<_> = searcher
+                            .search_iter_with_filter(&query, 2, Some(&filter))
+                            .collect();
+                        assert_eq!(phases.len(), if mode == "progressive" { 2 } else { 1 });
+                        match phases.into_iter().last().unwrap() {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. } => results,
+                            other => panic!("lexical revalidation failed search: {other:?}"),
+                        }
+                    } else {
+                        let (results, metrics) = searcher
+                            .search_collect_with_filter(&query, 2, Some(&filter))
+                            .expect("semantic refill retains newly learned rejections");
+                        assert_eq!(metrics.lexical_candidates, 0);
+                        results
+                    };
+                    assert_eq!(
+                        results
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["tail-a", "tail-b"],
+                        "{mode}, attested={attested}, streamed={streamed}",
+                    );
+                    assert!(results.iter().all(|hit| {
+                        hit.lexical_score.is_none()
+                            && hit.metadata.as_deref().unwrap()["doc_type"] == "keep"
+                    }));
+                    assert_eq!(*lexical.limits.lock().unwrap(), [2, 4, 8]);
+                }
+            }
+        }
     }
 
     #[test]
