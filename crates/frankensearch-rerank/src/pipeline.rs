@@ -195,7 +195,8 @@ pub async fn rerank_step_with_combine_and_admission(
         top_k_rerank,
         min_candidates,
         &admission,
-    )? else {
+    )?
+    else {
         return Ok(());
     };
     rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
@@ -254,7 +255,8 @@ pub fn rerank_step_sync_with_combine_and_admission(
         top_k_rerank,
         min_candidates,
         &admission,
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
@@ -2286,10 +2288,8 @@ mod tests {
                     Reply::InvalidScore(value) => scores[last].score = value,
                     Reply::InvalidLogit(value) => scores[last].raw_logit = Some(value),
                     Reply::CancelSuccess | Reply::CancelError => {
-                        self.cx.cancel_with(
-                            asupersync::CancelKind::User,
-                            Some("response cancelled"),
-                        );
+                        self.cx
+                            .cancel_with(asupersync::CancelKind::User, Some("response cancelled"));
                         if matches!(self.probe.reply, Reply::CancelError) {
                             return Err(SearchError::RerankFailed {
                                 model: "probe".to_owned(),

@@ -74,9 +74,8 @@ impl Request {
         tier: EmbedderTierTag,
         has_quality_component: bool,
     ) -> Result<models::QualityOptions> {
-        let options = self.validated_model_options(
-            tier == EmbedderTierTag::Quality || has_quality_component,
-        )?;
+        let options = self
+            .validated_model_options(tier == EmbedderTierTag::Quality || has_quality_component)?;
         // Do not let a request inherit a process default, environment-selected
         // cache, or the old model directory. Native quality selects its exact
         // directory through QualityOptions; fast/ONNX require an explicit root.
@@ -228,10 +227,10 @@ impl AuthoritySession {
             admission?;
             Some(request.model_options(EmbedderTierTag::Quality, true)?)
         } else {
-            Some(request.model_options(
-                self.receipt.tier,
-                self.receipt.quality_identity.is_some(),
-            )?)
+            Some(
+                request
+                    .model_options(self.receipt.tier, self.receipt.quality_identity.is_some())?,
+            )
         };
         let selected = Receipt::read(&request.receipt);
         checkpoint(cx)?;
@@ -484,14 +483,13 @@ impl AuthoritySession {
             let fast = if retain_primary {
                 Arc::clone(&previous.fast)
             } else {
-                self.query_cache.wrap_embedder(cx, Arc::clone(&loaded.fast))?
+                self.query_cache
+                    .wrap_embedder(cx, Arc::clone(&loaded.fast))?
             };
-            let quality = Some(Arc::clone(
-                previous
-                    .quality
-                    .as_ref()
-                    .ok_or_else(|| serve_refused("session_provider_topology_mismatch"))?,
-            ));
+            let quality =
+                Some(Arc::clone(previous.quality.as_ref().ok_or_else(|| {
+                    serve_refused("session_provider_topology_mismatch")
+                })?));
             Some(AuthorityModels::Semantic(Models { fast, quality }))
         } else {
             self.cache_replacement_models(cx, &loaded, retain_primary)?
