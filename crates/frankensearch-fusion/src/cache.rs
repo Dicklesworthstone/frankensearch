@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use frankensearch_core::config::TwoTierConfig;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{EmbeddingIdentityBundleV1, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -355,6 +355,7 @@ struct TierCacheIdentity<'a> {
     dimension: Option<usize>,
     embedder: Option<&'a str>,
     revision: Option<&'a str>,
+    declared_identity: Option<&'a EmbeddingIdentityBundleV1>,
     space: Option<&'a str>,
     attested: bool,
 }
@@ -367,6 +368,7 @@ impl<'a> TierCacheIdentity<'a> {
             dimension: Some(index.fast_dimension()),
             embedder: Some(index.fast_embedder_id()),
             revision: Some(index.fast_embedder_revision()),
+            declared_identity: index.fast_declared_identity(),
             space: index.fast_space_fingerprint_hex(),
             attested: index.fast_identity_is_attested(),
         }
@@ -379,6 +381,7 @@ impl<'a> TierCacheIdentity<'a> {
             dimension: index.quality_dimension(),
             embedder: index.quality_embedder_id(),
             revision: index.quality_embedder_revision(),
+            declared_identity: index.quality_declared_identity(),
             space: index.quality_space_fingerprint_hex(),
             attested: index.quality_identity_is_attested(),
         }
@@ -394,6 +397,22 @@ impl<'a> TierCacheIdentity<'a> {
                 value: self.tier.to_owned(),
                 reason: format!(
                     "replacement {} tier dimensionality differs from the retained index",
+                    self.tier
+                ),
+            });
+        }
+        // A builder-declared v1 tier carries a complete producing contract.
+        // Its space alone cannot detect a changed backend/protocol or output
+        // representation. Refresh preserves the caller's query producers, so
+        // keep every declared component, just as admitted v2 replacement does.
+        if let Some(expected) = self.declared_identity
+            && candidate.declared_identity != Some(expected)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "index_cache.replace".to_owned(),
+                value: self.tier.to_owned(),
+                reason: format!(
+                    "replacement {} tier changes or drops the retained complete declared embedding identity",
                     self.tier
                 ),
             });
@@ -602,6 +621,8 @@ impl IndexCache {
     /// Rejects changes to retained artifact paths, tier topology, embedding
     /// spaces, per-tier dimensions, or identity attestation with
     /// [`SearchError::InvalidConfig`].
+    /// Builder-declared tiers must preserve their complete producing identity,
+    /// including producer, input and storage contracts, not only their space.
     /// When both versions of a tier lack a space fingerprint, their model
     /// identifiers and revisions must match, including for the quality tier.
     /// These legacy checks reject obvious drift; they do not attest the old
@@ -1729,6 +1750,7 @@ mod tests {
                 dimension: Some(4),
                 embedder: Some("stub-model"),
                 revision: Some(""),
+                declared_identity: None,
                 space: None,
                 attested: false,
             };
@@ -1757,6 +1779,134 @@ mod tests {
                     .validate_replacement(lost_identity)
                     .expect_err("identity cannot disappear after enrichment")
             ));
+        }
+    }
+
+    #[test]
+    fn declared_identity_replacement_preserves_each_complete_tier_contract() {
+        use frankensearch_core::EmbeddingIdentityBundleV1;
+
+        let build = |dir: &Path,
+                     fast: &EmbeddingIdentityBundleV1,
+                     quality: &EmbeddingIdentityBundleV1,
+                     doc_id: &str| {
+            let mut builder = TwoTierIndex::create(dir, TwoTierConfig::default()).unwrap();
+            builder.set_fast_embedder_id("potion-128M");
+            builder.set_quality_embedder_id("potion-128M");
+            builder.set_fast_identity(fast).unwrap();
+            builder.set_quality_identity(quality).unwrap();
+            builder
+                .add_fast_record(doc_id, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+            builder
+                .add_quality_record(doc_id, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+            builder.finish().unwrap()
+        };
+
+        for tier in ["fast", "quality"] {
+            for component in ["producer", "input", "storage"] {
+                let dir = temp_dir("cache-declared-contract");
+                write_fast_index(&dir, &[]);
+                write_index(&dir.join(VECTOR_INDEX_QUALITY_FILENAME), &[]);
+                let cache = IndexCache::open(
+                    &dir,
+                    TwoTierConfig::default(),
+                    Box::new(SentinelFileDetector::new()),
+                )
+                .unwrap();
+                let fast = EmbeddingIdentityBundleV1::explicit_test_model("fast-space", 4);
+                let quality = EmbeddingIdentityBundleV1::explicit_test_model("quality-space", 4);
+                cache
+                    .replace(build(&dir, &fast, &quality, "retained"))
+                    .expect("an empty legacy seed may acquire declared identities");
+                let retained = cache.current();
+
+                let mut next_fast = fast.clone();
+                let mut next_quality = quality.clone();
+                let changed = if tier == "fast" {
+                    &mut next_fast
+                } else {
+                    &mut next_quality
+                };
+                let space_before = changed.space.fingerprint();
+                match component {
+                    "producer" => changed
+                        .producer
+                        .implementation_revision
+                        .push_str("-private-contract-canary"),
+                    "input" => {
+                        changed
+                            .input
+                            .canonicalization
+                            .push_str("-private-contract-canary");
+                        changed.space.input_contract_fingerprint = changed.input.fingerprint();
+                        changed.producer.space_fingerprint = changed.space.fingerprint();
+                    }
+                    "storage" => changed.storage.format.push_str("-private-contract-canary"),
+                    _ => unreachable!(),
+                }
+                changed.validate().expect("valid changed contract");
+                if component != "input" {
+                    assert_eq!(changed.space.fingerprint(), space_before);
+                }
+
+                for conditional in [false, true] {
+                    let candidate = build(&dir, &next_fast, &next_quality, "foreign");
+                    let candidate_fast =
+                        std::fs::read(dir.join(VECTOR_INDEX_FAST_FILENAME)).unwrap();
+                    let candidate_quality =
+                        std::fs::read(dir.join(VECTOR_INDEX_QUALITY_FILENAME)).unwrap();
+                    let result = if conditional {
+                        cache.replace_if_current(&retained, candidate)
+                    } else {
+                        cache.replace(candidate).map(|()| true)
+                    };
+                    let error =
+                        result.expect_err("a cache refresh cannot change producer contracts");
+                    assert!(is_replace_rejection(&error), "{tier}/{component}: {error:?}");
+                    assert!(!error.to_string().contains("private-contract-canary"));
+                    assert!(Arc::ptr_eq(&retained, &cache.current()));
+                    assert_eq!(
+                        std::fs::read(dir.join(VECTOR_INDEX_FAST_FILENAME)).unwrap(),
+                        candidate_fast
+                    );
+                    assert_eq!(
+                        std::fs::read(dir.join(VECTOR_INDEX_QUALITY_FILENAME)).unwrap(),
+                        candidate_quality
+                    );
+                    let hits = cache
+                        .current()
+                        .search_fast(&[1.0, 0.0, 0.0, 0.0], 10)
+                        .unwrap();
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].doc_id, "retained");
+                    let scores = retained
+                        .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
+                        .unwrap();
+                    assert_eq!(scores.len(), 1);
+                    assert!(scores[0].is_some());
+                }
+
+                assert!(
+                    cache
+                        .replace_if_current(&retained, build(&dir, &fast, &quality, "compatible"))
+                        .expect("unchanged complete identities may publish new content")
+                );
+                assert!(!Arc::ptr_eq(&retained, &cache.current()));
+                assert_eq!(
+                    cache
+                        .current()
+                        .search_fast(&[1.0, 0.0, 0.0, 0.0], 10)
+                        .unwrap()[0]
+                        .doc_id,
+                    "compatible"
+                );
+                assert_eq!(
+                    retained.search_fast(&[1.0, 0.0, 0.0, 0.0], 10).unwrap()[0].doc_id,
+                    "retained"
+                );
+            }
         }
     }
 
