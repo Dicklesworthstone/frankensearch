@@ -2086,7 +2086,7 @@ impl SyncTwoTierSearcher {
         // callbacks may change policy while this final stage is running.
         let retained: Option<SyncMetadata> = context
             .filter
-            .and_then(|_| outcome.final_ranking.as_ref())
+            .and(outcome.final_ranking.as_ref())
             .map(|ranking| {
                 ranking
                     .candidates
