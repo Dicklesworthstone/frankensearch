@@ -2416,8 +2416,8 @@ impl CassWildcardPattern {
 /// - OR / || (OR)
 /// - NOT / -prefix (negation)
 /// - \"quoted phrases\" (phrase match)
-/// - ( ) grouping: a `(` opens a group only at the start of a word and a `)`
-///   closes one only while a group is open, so `foo(bar)` stays one term
+/// - ( ) grouping: a `(` opens a group only at the start of a word; a `)`
+///   closes its matching opener, so `foo(bar)` stays intact inside groups
 #[must_use]
 pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
     match cass_parse_boolean_query_with_sink(query, |tokens, token| {
@@ -2449,23 +2449,24 @@ where
     let mut tokens = Vec::new();
     let mut chars = query.chars().peekable();
     let mut current_word = String::new();
-    // Groups currently open. A `(` inside a word and a `)` with no group
-    // open stay word characters, so code terms like `foo(bar)` survive.
-    let mut open_groups = 0_usize;
+    // Match each closer to its opener: true is a Boolean group, false is
+    // literal punctuation in a code term. A call's ')' must not close an
+    // enclosing group and let a following OR escape that group's scope.
+    let mut open_parentheses = Vec::new();
 
     while let Some(c) = chars.next() {
         match c {
             '(' if current_word.is_empty() => {
                 push_token(&mut tokens, CassQueryToken::LParen)?;
-                open_groups += 1;
+                open_parentheses.push(true);
             }
-            ')' if open_groups > 0 => {
+            ')' if open_parentheses.last() == Some(&true) => {
                 if !current_word.is_empty() {
                     let token = cass_classify_query_word(std::mem::take(&mut current_word));
                     push_token(&mut tokens, token)?;
                 }
                 push_token(&mut tokens, CassQueryToken::RParen)?;
-                open_groups -= 1;
+                open_parentheses.pop();
             }
             '"' => {
                 if !current_word.is_empty() {
@@ -2518,7 +2519,16 @@ where
                     push_token(&mut tokens, token)?;
                 }
             }
-            _ => current_word.push(c),
+            _ => {
+                match c {
+                    '(' => open_parentheses.push(false),
+                    ')' => {
+                        open_parentheses.pop();
+                    }
+                    _ => {}
+                }
+                current_word.push(c);
+            }
         }
     }
 
@@ -4507,7 +4517,7 @@ mod cass_query_tests {
     /// separates the standard reading from the legacy OR-binds-tighter one.
     #[test]
     fn cass_boolean_grammar_uses_standard_precedence_and_parentheses() {
-        use CassQueryToken::{LParen, Not, Or, RParen, Term};
+        use CassQueryToken::{And, LParen, Not, Or, RParen, Term};
         let term = |text: &str| Term(text.to_owned());
         // `(` inside a word and `)` with no open group are term characters.
         assert_eq!(
@@ -4521,6 +4531,22 @@ mod cass_query_tests {
         assert_eq!(
             cass_parse_boolean_query("(a OR)"),
             [LParen, term("a"), Or, RParen]
+        );
+        assert_eq!(
+            cass_parse_boolean_query("required AND (foo(bar) OR fallback)"),
+            [
+                term("required"),
+                And,
+                LParen,
+                term("foo(bar)"),
+                Or,
+                term("fallback"),
+                RParen,
+            ]
+        );
+        assert_eq!(
+            cass_parse_boolean_query("(foo(bar(baz)) OR baz)"),
+            [LParen, term("foo(bar(baz))"), Or, term("baz"), RParen]
         );
 
         let (_directory, index) = cass_result_fixture();
@@ -4542,6 +4568,10 @@ mod cass_query_tests {
             ("active && beta || deprecated", vec![1, 2]),
             ("(deprecated OR gamma) AND active", vec![3]),
             ("active AND (beta OR deprecated)", vec![2]),
+            ("active AND (beta(active) OR deprecated)", vec![2]),
+            ("active AND NOT (beta(active) OR deprecated)", vec![0, 3]),
+            ("active AND (beta((active)) OR deprecated)", vec![2]),
+            ("active AND (\"beta(active)\" OR deprecated)", vec![2]),
             ("-(beta OR gamma)", vec![0, 1, 4, 5]),
             ("alpha -(active OR deprecated)", vec![5]),
             ("deprecated OR -(alpha OR active)", vec![1, 4]),
@@ -4575,6 +4605,44 @@ mod cass_query_tests {
                     .map(|(msg_idx, score)| (*msg_idx, score.to_bits()))
                     .collect::<Vec<_>>(),
                 "{grouped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_literal_calls_cannot_hide_excessive_boolean_group_depth() {
+        let (_directory, index) = cass_result_fixture();
+        let reader = index.reader().expect("open CASS depth reader");
+        reader.reload().expect("reload CASS depth reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let nested = |depth| {
+            format!(
+                "{}active{}",
+                "(beta(active) AND ".repeat(depth),
+                ")".repeat(depth)
+            )
+        };
+        let filters = CassQueryFilters::default();
+        assert_eq!(
+            cass_result_ids(
+                &searcher,
+                &fields,
+                &nested(CASS_MAX_QUERY_NESTING),
+                &filters,
+            ),
+            vec![2],
+            "the depth boundary remains searchable with literal calls",
+        );
+        let excessive = nested(CASS_MAX_QUERY_NESTING + 1);
+        for raw in [
+            excessive.clone(),
+            format!("deprecated OR {excessive}"),
+            format!("NOT {excessive}"),
+        ] {
+            assert!(
+                cass_result_ids(&searcher, &fields, &raw, &filters).is_empty(),
+                "literal calls must not hide excessive Boolean depth: {raw:?}",
             );
         }
     }

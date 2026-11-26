@@ -5172,8 +5172,8 @@ impl CassParserFields {
 ///
 /// Standard precedence: NOT binds tightest, then AND (explicit, `&&`, or
 /// implied between adjacent operands), then OR (`OR`, `||`). Parentheses
-/// group. A `(` opens a group only at the start of a word and a `)` closes
-/// one only while a group is open, so code such as `foo(bar)` stays a term.
+/// group. A `(` opens a group only at the start of a word; a `)` closes
+/// the matching opener, keeping code such as `foo(bar)` intact inside groups.
 /// Negation is parity-based (`NOT NOT x` is `x`), and a negative used as an
 /// OR operand or as the complete root is wrapped in `All + MustNot` so it
 /// denotes a complement. Malformed input is recovered with a
@@ -5953,19 +5953,20 @@ fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexT
     let mut chars = query.char_indices().peekable();
     let mut word = String::new();
     let mut word_offset = 0_usize;
-    // Groups currently open. A `(` inside a word and a `)` with no group
-    // open stay word characters, so code terms like `foo(bar)` survive.
-    let mut open_groups = 0_usize;
+    // Match each closer to its opener: true is a Boolean group, false is
+    // literal punctuation in a code term. A call's ')' must not close an
+    // enclosing group and let a following OR escape that group's scope.
+    let mut open_parentheses = Vec::new();
     while let Some((offset, ch)) = chars.next() {
         match ch {
             '(' if word.is_empty() => {
                 tokens.push(CassLexToken::LParen { offset });
-                open_groups += 1;
+                open_parentheses.push(true);
             }
-            ')' if open_groups > 0 => {
+            ')' if open_parentheses.last() == Some(&true) => {
                 cass_flush_word(&mut tokens, &mut word, word_offset);
                 tokens.push(CassLexToken::RParen { offset });
-                open_groups -= 1;
+                open_parentheses.pop();
             }
             '"' => {
                 cass_flush_word(&mut tokens, &mut word, word_offset);
@@ -6011,6 +6012,13 @@ fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexT
                 cass_flush_word(&mut tokens, &mut word, word_offset);
             }
             _ => {
+                match ch {
+                    '(' => open_parentheses.push(false),
+                    ')' => {
+                        open_parentheses.pop();
+                    }
+                    _ => {}
+                }
                 if word.is_empty() {
                     word_offset = offset;
                 }
@@ -7985,6 +7993,11 @@ mod tests {
             "(auth OR token) cache",
             "-(auth token)",
             "foo(bar) x)",
+            "auth AND (token(cache) OR cache)",
+            "auth AND NOT (token(cache) OR cache)",
+            "(foo(bar(baz)) OR baz)",
+            "((foo(bar)) OR baz)",
+            "(foo(bar) OR baz",
             "((auth)",
             "(auth OR)",
             "auth ()",
@@ -8591,7 +8604,7 @@ mod tests {
             doc(3, "cache"),
             doc(4, "auth cache"),
         ];
-        let cases: [(&str, Vec<u64>); 9] = [
+        let cases: [(&str, Vec<u64>); 14] = [
             // auth ∪ (token ∩ cache); legacy: (auth ∪ token) ∩ cache = {1, 4}
             ("auth OR token AND cache", vec![0, 1, 4]),
             // (auth ∩ token) ∪ cache; legacy: auth ∩ (token ∪ cache) = {4}
@@ -8599,6 +8612,12 @@ mod tests {
             ("auth token OR cache", vec![1, 3, 4]),
             ("(auth OR token) AND cache", vec![1, 4]),
             ("auth AND (token OR cache)", vec![4]),
+            // Literal call parentheses must not release OR from its group.
+            ("auth AND (token(cache) OR cache)", vec![4]),
+            ("auth AND NOT (token(cache) OR cache)", vec![0]),
+            ("NOT (token(cache) OR auth)", vec![2, 3]),
+            ("auth AND (token((cache)) OR cache)", vec![4]),
+            ("auth AND (\"token(cache)\" OR cache)", vec![4]),
             ("NOT NOT auth", vec![0, 4]),
             ("-(token OR cache)", vec![0]),
             ("auth -(token OR cache)", vec![0]),
@@ -8718,6 +8737,107 @@ mod tests {
             "{:?}",
             empty.diagnostics
         );
+    }
+
+    #[test]
+    fn cass_lexer_matches_literal_parentheses_before_boolean_group_closers() {
+        use CassLexToken::{And, LParen, Not, Or, RParen, Term};
+
+        let term = |text: &str, offset| Term {
+            text: text.to_owned(),
+            offset,
+        };
+        for (raw, expected) in [
+            (
+                "required AND (foo(bar) OR fallback)",
+                vec![
+                    term("required", 0),
+                    And { offset: 9 },
+                    LParen { offset: 13 },
+                    term("foo(bar)", 14),
+                    Or { offset: 23 },
+                    term("fallback", 26),
+                    RParen { offset: 34 },
+                ],
+            ),
+            (
+                "(foo(bar(baz)) OR baz)",
+                vec![
+                    LParen { offset: 0 },
+                    term("foo(bar(baz))", 1),
+                    Or { offset: 15 },
+                    term("baz", 18),
+                    RParen { offset: 21 },
+                ],
+            ),
+            (
+                "-(foo(bar) OR baz)",
+                vec![
+                    Not { offset: 0 },
+                    LParen { offset: 1 },
+                    term("foo(bar)", 2),
+                    Or { offset: 11 },
+                    term("baz", 14),
+                    RParen { offset: 17 },
+                ],
+            ),
+            (
+                "((foo(bar)) OR baz)",
+                vec![
+                    LParen { offset: 0 },
+                    LParen { offset: 1 },
+                    term("foo(bar)", 2),
+                    RParen { offset: 10 },
+                    Or { offset: 12 },
+                    term("baz", 15),
+                    RParen { offset: 18 },
+                ],
+            ),
+            (
+                "(foo(bar) OR baz",
+                vec![
+                    LParen { offset: 0 },
+                    term("foo(bar)", 1),
+                    Or { offset: 10 },
+                    term("baz", 13),
+                ],
+            ),
+            ("foo(bar))", vec![term("foo(bar))", 0)]),
+        ] {
+            assert_eq!(cass_lex(raw, &mut Vec::new()), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn cass_literal_calls_cannot_hide_excessive_boolean_group_depth() {
+        let parser = cass_parser();
+        let filters = CassQueryFilters::default();
+        let nested = |depth| {
+            format!(
+                "{}leaf{}",
+                "(foo(bar) AND ".repeat(depth),
+                ")".repeat(depth)
+            )
+        };
+        let boundary = parser.parse(&nested(CASS_MAX_QUERY_GROUP_DEPTH), &filters);
+        assert!(!boundary.query.is_empty(), "the depth boundary stays valid");
+        assert!(boundary.diagnostics.is_empty(), "{:?}", boundary.diagnostics);
+
+        let excessive = nested(CASS_MAX_QUERY_GROUP_DEPTH + 1);
+        for raw in [
+            excessive.clone(),
+            format!("backup OR {excessive}"),
+            format!("NOT {excessive}"),
+        ] {
+            let parsed = parser.parse(&raw, &filters);
+            assert!(parsed.query.is_empty(), "refuse excessive depth: {raw:?}");
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::DepthLimit)
+            );
+        }
     }
 
     #[test]
