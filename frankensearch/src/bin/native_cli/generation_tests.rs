@@ -8672,8 +8672,249 @@ mod progressive_authority {
                                 "new"
                             );
                         }
+
+                        let current_path = if keep.is_empty() {
+                            parent.join("repopulated.json")
+                        } else {
+                            options.receipt.clone()
+                        };
+                        let current = Receipt::read(&current_path).unwrap();
+                        let current_reader = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        let current_receipt = fs::read(&current_path).unwrap();
+                        let before_rollback = calls(&fast, &quality);
+                        let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
+                        let lock = fs::read(selected.root.join("LOCK")).unwrap();
+                        let mut undo = parse(&rollback_arguments()).unwrap().unwrap();
+                        undo.from_receipt = Some(current_path.clone());
+                        undo.receipt = parent.join("restored-partial.json");
+
+                        // A different topology is allowed only when the target's
+                        // own producer and actual covered subset authenticate.
+                        for forged in ["quality-producer", "quality-coverage"] {
+                            let mut wrong = selected.clone();
+                            if forged == "quality-producer" {
+                                let mut identity =
+                                    wrong.quality_identity.as_ref().unwrap().identity.clone();
+                                identity.producer.implementation_revision =
+                                    "forged-rollback-quality".to_owned();
+                                wrong.quality_identity = Some(identity.freeze().unwrap());
+                            } else {
+                                wrong.quality_documents = Some(2);
+                            }
+                            let path = parent.join(format!("{forged}.json"));
+                            fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                            undo.target_receipt = Some(path);
+                            let mut rejected = Vec::new();
+                            assert!(rollback(&cx, &undo, &mut rejected).is_err());
+                            assert!(rejected.is_empty());
+                            assert!(!undo.receipt.exists());
+                            assert_eq!(calls(&fast, &quality), before_rollback);
+                            assert_eq!(fs::read(selected.root.join("AUTHORITY")).unwrap(), authority);
+                            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
+                        }
+
+                        undo.target_receipt = Some(initial.receipt.clone());
+                        let mut rolled_back = Vec::new();
+                        rollback(&cx, &undo, &mut rolled_back).unwrap();
+                        assert_eq!(calls(&fast, &quality), before_rollback);
+                        let restored = Receipt::read(&undo.receipt).unwrap();
+                        let restored_reader = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                        assert_eq!(restored.schema, PARTIAL_QUALITY_RECEIPT_SCHEMA);
+                        assert_eq!(restored.topology(), selected.topology());
+                        assert_eq!(restored.generation, selected.generation);
+                        assert_eq!(restored.identity, selected.identity);
+                        assert_eq!(restored.quality_identity, selected.quality_identity);
+                        assert_eq!(restored.quality_documents, Some(1));
+                        assert_eq!(
+                            restored.authority().unwrap().sequence,
+                            current.authority().unwrap().sequence + 1
+                        );
+                        assert_eq!(
+                            restored_reader.retained_snapshot().manifest().components(),
+                            retained.retained_snapshot().manifest().components()
+                        );
+                        assert_eq!(
+                            restored_reader.partial_quality_document_ids(&cx).unwrap(),
+                            ["quality"]
+                        );
+                        assert_eq!(
+                            serde_json::to_value(
+                                restored_reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
+                            )
+                            .unwrap(),
+                            serde_json::to_value(&source).unwrap()
+                        );
+                        assert_eq!(current_reader.authority(), current.authority().unwrap());
+                        assert_eq!(fs::read(&current_path).unwrap(), current_receipt);
+                        assert_eq!(fs::read(&initial.receipt).unwrap(), receipt_bytes);
+
+                        for mode in [QueryMode::Full, QueryMode::Quality] {
+                            let query = partial_search_options(&undo.receipt, Some(mode));
+                            let mut rejected = Vec::new();
+                            assert!(
+                                search_with_loader(&cx, &query, &mut rejected, |_| {
+                                    panic!(
+                                        "restored partial coverage must refuse before model loading"
+                                    )
+                                })
+                                .await
+                                .is_err()
+                            );
+                            assert!(rejected.is_empty());
+                        }
+                        let query = partial_search_options(&undo.receipt, Some(QueryMode::Partial));
+                        let mut requested = Vec::new();
+                        let mut result = Vec::new();
+                        search_with_loader(&cx, &query, &mut result, |tier| {
+                            requested.push(tier);
+                            Ok(match tier {
+                                EmbedderTierTag::Fast => fast.clone(),
+                                EmbedderTierTag::Quality => quality.clone(),
+                            })
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(requested, [EmbedderTierTag::Fast, EmbedderTierTag::Quality]);
+                        let response = frames(&result);
+                        assert_eq!(response.len(), 2);
+                        assert_eq!(response[1]["topology"], "partial_quality");
+                        assert_eq!(
+                            response[1]["authority"],
+                            serde_json::json!(restored.authority)
+                        );
+                        assert_eq!(response[1]["quality_coverage"]["quality_documents"], 1);
+                        assert_eq!(response[1]["quality_coverage"]["total_documents"], 3);
                     }
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn rollback_removes_a_completed_quality_tier_and_restores_fast_query_policy() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ann in [false, true] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let mut initial = partial_index_options(&parent, ann);
+                initial.partial_quality = false;
+                initial.quality_ids = None;
+                index_with_loader(&cx, &initial, &mut Vec::new(), |mode| {
+                    assert_eq!(mode, QueryMode::Fast);
+                    Ok(Models {
+                        fast: fast.clone(),
+                        quality: None,
+                    })
+                })
+                .await
+                .unwrap();
+                let target = Receipt::read(&initial.receipt).unwrap();
+                let retained = target.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(retained.topology(), NativeGenerationTopology::FastOnly);
+                let source = retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+                let completed = retained
+                    .begin_quality_completion(
+                        &cx,
+                        parent.join("completion-work"),
+                        new_generation(2).unwrap(),
+                        fast.clone(),
+                        quality.clone(),
+                        MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .with_quality_storage(
+                        NativeBuildPrecision::F32,
+                        retained.retrieval_configuration(),
+                    )
+                    .unwrap()
+                    .build(&cx, DEFAULT_IMAGE_BYTES)
+                    .await
+                    .unwrap();
+                let prepared = prepare_publication_with_intent(
+                    &completed,
+                    Some(&retained),
+                    DEFAULT_IMAGE_BYTES,
+                    PublicationIntent::CompleteQuality,
+                )
+                .unwrap();
+                let root = admit_root(&target.root).unwrap();
+                let current_path = parent.join("completed.json");
+                let current = stage_prepared_and_publish(
+                    &cx,
+                    &root,
+                    &target.root,
+                    &current_path,
+                    &completed,
+                    prepared,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap();
+                assert_eq!(
+                    current.snapshot.topology(),
+                    NativeGenerationTopology::FullProgressive
+                );
+                let before_rollback = calls(&fast, &quality);
+                let mut undo = parse(&rollback_arguments()).unwrap().unwrap();
+                undo.from_receipt = Some(current_path);
+                undo.target_receipt = Some(initial.receipt.clone());
+                undo.receipt = parent.join("restored-fast.json");
+                rollback(&cx, &undo, &mut Vec::new()).unwrap();
+                assert_eq!(calls(&fast, &quality), before_rollback);
+                let restored = Receipt::read(&undo.receipt).unwrap();
+                let reopened = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(restored.schema, RECEIPT_SCHEMA);
+                assert_eq!(restored.topology(), NativeGenerationTopology::FastOnly);
+                assert_eq!(restored.quality_identity, None);
+                assert_eq!(restored.quality_documents, None);
+                assert_eq!(restored.generation, target.generation);
+                assert_eq!(restored.identity, target.identity);
+                assert_eq!(
+                    restored.authority().unwrap().sequence,
+                    current.receipt.authority().unwrap().sequence + 1
+                );
+                assert_eq!(
+                    reopened.retained_snapshot().manifest().components(),
+                    retained.retained_snapshot().manifest().components()
+                );
+                assert_eq!(
+                    serde_json::to_value(reopened.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(&source).unwrap()
+                );
+                assert_eq!(
+                    current.snapshot.topology(),
+                    NativeGenerationTopology::FullProgressive,
+                    "already retained readers keep their complete quality tier"
+                );
+                for mode in [QueryMode::Full, QueryMode::Quality, QueryMode::Partial] {
+                    let query = partial_search_options(&undo.receipt, Some(mode));
+                    let mut rejected = Vec::new();
+                    assert!(
+                        search_with_loader(&cx, &query, &mut rejected, |_| {
+                            panic!("restored fast-only coverage must refuse before model loading")
+                        })
+                        .await
+                        .is_err()
+                    );
+                    assert!(rejected.is_empty());
+                }
+                let query = partial_search_options(&undo.receipt, None);
+                let mut result = Vec::new();
+                search_with_loader(&cx, &query, &mut result, |tier| {
+                    assert_eq!(tier, EmbedderTierTag::Fast);
+                    Ok(fast.clone())
+                })
+                .await
+                .unwrap();
+                let response = frames(&result);
+                assert_eq!(response.len(), 1);
+                assert_eq!(response[0]["topology"], "fast_only");
+                assert_eq!(
+                    response[0]["authority"],
+                    serde_json::json!(restored.authority)
+                );
+                assert_eq!(quality.calls.load(Ordering::Relaxed), before_rollback.1);
             }
         });
     }

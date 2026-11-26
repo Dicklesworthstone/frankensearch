@@ -255,8 +255,10 @@ authority-recover reconciles that attempt without republishing or loading models
 authority-rollback restores an authenticated retained ancestor of a healthy\n\
 current generation. It publishes a new higher authority sequence using the\n\
 target's original images, producer and source checkpoint, without inference.\n\
-Both receipts must name the same root, security profile and topology. The target\n\
-must be linked by exact retained manifests, with at most 1024 predecessor links.\n\
+Both receipts must name the same root and security profile. The target restores\n\
+its original tier topology and exact quality coverage, including when undoing\n\
+quality completion or an explicit coverage transition. It must be linked by\n\
+exact retained manifests, with at most 1024 predecessor links.\n\
 The new receipt is outside the root and supports authority-recover after a crash.\n\
 Rollback normally admits the complete current generation. Explicit\n\
 --allow-damaged-current instead authenticates its exact control state and\n\
@@ -3324,12 +3326,15 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     if selected.root != target.root
         || selected.root_id != target.root_id
         || selected.profile != target.profile
-        || !selected.same_topology(&target)
     {
         return Err(bad(
-            "rollback receipts must select the same root, security profile, and tier",
+            "rollback receipts must select the same root and security profile",
         ));
     }
+    // Quality completion and explicit coverage transitions can change topology.
+    // Restore the target's independently admitted tiers rather than requiring
+    // the current shape. The exact ancestry walk and target admission below
+    // still verify every producer, component and coverage claim before staging.
     let receipt_path = new_path(&options.receipt)?;
     separate_destinations(&[&selected.root, &receipt_path])?;
     let root = admit_root(&selected.root)?;
