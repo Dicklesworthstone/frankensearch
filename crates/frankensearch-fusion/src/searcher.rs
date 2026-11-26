@@ -1376,6 +1376,8 @@ impl TwoTierSearcher {
     /// [`SearchPhase::Refined`] or [`SearchPhase::RefinementFailed`].
     ///
     /// Returns collected metrics from all phases.
+    /// Empty and zero-limit requests still validate the requested semantic
+    /// producer contracts and caller cancellation, without embedding or retrieval.
     ///
     /// # Parameters
     ///
@@ -1618,6 +1620,14 @@ impl TwoTierSearcher {
                 None
             };
 
+        // Empty progressive requests keep the same producer admission as real
+        // retrieval, without invoking the canonicalizer or either embedder.
+        if mode == SearchExecutionMode::Progressive && (k == 0 || query.is_empty()) {
+            let admission = self.admit_semantic_query();
+            cancellation_checkpoint(cx, "query_identity_admission")?;
+            admission?;
+        }
+
         if k == 0 {
             metrics.zero_signal = Some(ZeroSignalReason::CallerRequestedZeroK);
             return Ok(metrics);
@@ -1640,6 +1650,20 @@ impl TwoTierSearcher {
             let parsed = ParsedQuery::parse(&canonical);
             (canonical, parsed)
         });
+        let lexical_complement = parsed_query.is_positive_empty() && parsed_query.has_negations();
+        // Admit before the canonicalized-empty exit, inference, embedding
+        // caches or vector/ANN reads. A lexical complement has no semantic
+        // query and does not consult either producer.
+        let admitted = if lexical_complement {
+            cancellation_checkpoint(cx, "lexical_complement_admission")?;
+            None
+        } else if mode == SearchExecutionMode::QualityOnly {
+            quality_admission
+        } else {
+            let admission = self.admit_semantic_query();
+            cancellation_checkpoint(cx, "query_identity_admission")?;
+            Some(admission?)
+        };
         if canon_query.trim().is_empty() {
             return Ok(metrics);
         }
@@ -1659,8 +1683,6 @@ impl TwoTierSearcher {
         } else {
             None
         };
-        let lexical_complement =
-            parsed_query.is_positive_empty() && normalized_exclusions.is_some();
         let semantic_query = if parsed_query.is_positive_empty() {
             canon_query.as_str()
         } else {
@@ -1682,24 +1704,6 @@ impl TwoTierSearcher {
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
         }
 
-        // bd-ctzo C1: the identity join happens HERE -- before the fast
-        // embedder is invoked, before any embedding cache is consulted, and
-        // before a single vector or ANN node is read. A refusal therefore
-        // costs a fingerprint comparison, and the work it would have
-        // authorized never starts.
-        // A lexical complement has no semantic query to admit. An unrelated
-        // missing, stale or foreign vector producer cannot prevent browsing
-        // the lexical corpus, nor may it contribute candidates to that corpus.
-        let admitted = if lexical_complement {
-            cancellation_checkpoint(cx, "lexical_complement_admission")?;
-            None
-        } else if mode == SearchExecutionMode::QualityOnly {
-            quality_admission
-        } else {
-            let admission = self.admit_semantic_query();
-            cancellation_checkpoint(cx, "query_identity_admission")?;
-            Some(admission?)
-        };
         if let Some((admission, _)) = admitted.as_ref() {
             match admission {
                 SemanticAdmission::OwnerBacked { quality } => tracing::debug!(
@@ -11369,20 +11373,24 @@ mod tests {
                         .with_quality_embedder(quality)
                         .with_embedding_cache(8)
                         .with_lexical(Arc::new(StubLexical));
-                    let error = searcher
-                        .search(
-                            &cx,
-                            "query",
-                            3,
-                            |_| None,
-                            |phase| panic!("invalid contract published {phase:?}"),
-                        )
-                        .await
-                        .expect_err("the request must validate both contracts before inference");
-                    assert!(
-                        matches!(error, SearchError::InvalidConfig { .. }),
-                        "{tier}/{fault}: {error}"
-                    );
+                    for (query, k) in [("query", 3), ("", 3), ("query", 0), ("", 0), ("  ", 3)] {
+                        let error = searcher
+                            .search(
+                                &cx,
+                                query,
+                                k,
+                                |_| None,
+                                |phase| panic!("invalid contract published {phase:?}"),
+                            )
+                            .await
+                            .expect_err(
+                                "the request must validate both contracts before inference",
+                            );
+                        assert!(
+                            matches!(error, SearchError::InvalidConfig { .. }),
+                            "{tier}/{fault}/{query:?}/{k}: {error}"
+                        );
+                    }
                     for provider in [&refused, &other] {
                         assert_eq!(provider.bound_embeds.load(Ordering::Relaxed), 0);
                         assert_eq!(provider.embed_count(), 0);
@@ -13524,6 +13532,77 @@ mod tests {
             assert_eq!(phases, 0);
             assert_eq!(calls.load(Ordering::Relaxed), 0);
         });
+    }
+
+    #[test]
+    fn empty_progressive_requests_admit_both_tiers_without_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_index_dir, index) = query_admission_index(layout);
+                let fast = Arc::new(query_admission_embedder("fast"));
+                let quality = Arc::new(query_admission_embedder("quality"));
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality.clone())
+                    .with_embedding_cache(8);
+                for (query, k) in [("", 3), ("query", 0), ("", 0), ("  ", 3)] {
+                    let before = [fast.identity_count(), quality.identity_count()];
+                    let metrics = searcher
+                        .search(
+                            &cx,
+                            query,
+                            k,
+                            |_| panic!("an empty request must not hydrate text"),
+                            |phase| panic!("an empty request published {phase:?}"),
+                        )
+                        .await
+                        .expect("matching empty requests remain successful");
+                    for (provider, previous) in [&fast, &quality].into_iter().zip(before) {
+                        assert!(
+                            provider.identity_count() > previous,
+                            "{layout}/{query:?}/{k}"
+                        );
+                        assert_eq!(provider.embed_count(), 0);
+                        assert_eq!(provider.bound_embeds.load(Ordering::Relaxed), 0);
+                    }
+                    assert_eq!(metrics.phase1_vectors_searched, 0);
+                    assert_eq!(metrics.phase2_vectors_searched, 0);
+                    assert_eq!(
+                        metrics.zero_signal,
+                        (k == 0).then_some(ZeroSignalReason::CallerRequestedZeroK)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn empty_progressive_requests_preserve_cancellation() {
+        for (query, k) in [("", 3), ("query", 0), ("", 0), ("  ", 3)] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = query_admission_index("exact-v2");
+                let fast = Arc::new(query_admission_embedder("fast"));
+                let quality = Arc::new(query_admission_embedder("quality"));
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality.clone())
+                    .with_embedding_cache(8);
+                cx.set_cancel_requested(true);
+                let error = searcher
+                    .search(
+                        &cx,
+                        query,
+                        k,
+                        |_| panic!("a cancelled request must not hydrate text"),
+                        |phase| panic!("a cancelled request published {phase:?}"),
+                    )
+                    .await
+                    .expect_err("an empty request must preserve cancellation");
+                assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
+                for provider in [&fast, &quality] {
+                    assert_eq!(provider.embed_count(), 0);
+                    assert_eq!(provider.bound_embeds.load(Ordering::Relaxed), 0);
+                }
+            });
+        }
     }
 
     #[test]
