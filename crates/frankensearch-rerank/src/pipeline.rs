@@ -48,6 +48,7 @@ pub enum RerankCombine {
     /// rank high by **both** retrieval and the reranker to climb, so the retrieval score
     /// vetoes the reranker's mistakes. Measured the safe, best-default integration — never
     /// catastrophic, parameter-light (see `docs/NEGATIVE_EVIDENCE.md`).
+    /// Candidates without available text retain only their retrieval contribution.
     RrfCombine {
         /// RRF constant; see [`DEFAULT_RRF_COMBINE_K`].
         k: f32,
@@ -463,9 +464,9 @@ struct RrfOrder {
 /// Reorder `window` (the reranked candidates, arriving in pre-rerank/fused order — so
 /// index `i` is the pre-rerank rank) by reciprocal-rank fusion of the pre-rerank rank
 /// and the rerank-score rank: `1/(k+pre_rank) + 1/(k+rerank_rank)`, descending. Ties
-/// break on `doc_id` for determinism. Candidates without a finite rerank score sort to
-/// the worst rerank rank (they keep their pre-rerank contribution but earn none from the
-/// reranker), matching the graceful-skip semantics of the pure-reorder path.
+/// break on `doc_id` for determinism. Candidates without a finite rerank score keep
+/// only their pre-rerank contribution: unavailable document text is absence of model
+/// evidence, not a low-ranked model vote.
 #[allow(clippy::cast_precision_loss)]
 fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
     let n = window.len();
@@ -486,7 +487,15 @@ fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
         .collect();
     order.sort_by(|a, b| compare_by_rerank_score(&window[a.position], &window[b.position]));
     for (rerank_rank, entry) in order.iter_mut().enumerate() {
-        entry.fused_key = 1.0 / (kf + entry.position as f64) + 1.0 / (kf + rerank_rank as f64);
+        let rerank_contribution = if window[entry.position]
+            .rerank_score
+            .is_some_and(f32::is_finite)
+        {
+            1.0 / (kf + rerank_rank as f64)
+        } else {
+            0.0
+        };
+        entry.fused_key = 1.0 / (kf + entry.position as f64) + rerank_contribution;
     }
     order.sort_by(|a, b| {
         b.fused_key
@@ -696,16 +705,27 @@ mod tests {
         }
         let kf = f64::from(k.max(1.0));
 
-        let mut by_rerank: Vec<usize> = (0..n).collect();
-        by_rerank.sort_by(|&a, &b| compare_by_rerank_score(&window[a], &window[b]));
-        let mut rerank_rank = vec![0usize; n];
-        for (rank, &pos) in by_rerank.iter().enumerate() {
-            rerank_rank[pos] = rank;
-        }
-
-        let key: Vec<f64> = (0..n)
-            .map(|i| 1.0 / (kf + i as f64) + 1.0 / (kf + rerank_rank[i] as f64))
+        // Independent two-list RRF oracle: every retrieval result votes once;
+        // only documents actually scored by the model belong to its rank list.
+        let mut key: Vec<f64> = (0..n).map(|rank| 1.0 / (kf + rank as f64)).collect();
+        let mut by_rerank: Vec<(usize, f32)> = window
+            .iter()
+            .enumerate()
+            .filter_map(|(position, candidate)| {
+                candidate
+                    .rerank_score
+                    .filter(|score| score.is_finite())
+                    .map(|score| (position, score))
+            })
             .collect();
+        by_rerank.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| window[*left].doc_id.cmp(&window[*right].doc_id))
+        });
+        for (rank, &(position, _)) in by_rerank.iter().enumerate() {
+            key[position] += 1.0 / (kf + rank as f64);
+        }
         let mut perm: Vec<usize> = (0..n).collect();
         perm.sort_by(|&a, &b| {
             key[b]
@@ -797,6 +817,132 @@ mod tests {
             );
             // The reranked window still carries fresh rerank scores in both modes.
             assert!(rrf.iter().all(|c| c.rerank_score.is_some()));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rrf_combine_missing_text_uses_only_scored_votes_in_sync_and_async() {
+        use frankensearch_core::traits::SyncRerankerAdapter;
+
+        struct SparseReranker;
+
+        impl SyncRerank for SparseReranker {
+            fn rerank_sync(
+                &self,
+                _query: &str,
+                documents: &[RerankDocument],
+            ) -> SearchResult<Vec<RerankScore>> {
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(original_rank, document)| RerankScore {
+                        doc_id: document.doc_id.clone(),
+                        score: if document.doc_id == "winner" { 0.9 } else { 0.5 },
+                        original_rank,
+                        raw_logit: None,
+                    })
+                    .collect())
+            }
+
+            fn id(&self) -> &str {
+                "sparse-reranker"
+            }
+
+            fn model_name(&self) -> &str {
+                "sparse-reranker"
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = SyncRerankerAdapter(SparseReranker);
+            let ids = [
+                "z-missing", "a-missing", "z-tied", "a-tied", "low", "winner", "tail",
+            ];
+            // Freeze the independent two-list RRF outcomes. Missing text must
+            // not supply a second vote that defeats the scored hidden winner.
+            // Equal model scores use doc-ID ties; unscored rows retain their
+            // retrieval order even when that order opposes their IDs.
+            let cases: &[(&[&str], &[&str])] = &[
+                (
+                    &["winner"],
+                    &[
+                        "winner", "z-missing", "a-missing", "z-tied", "a-tied", "low", "tail",
+                    ],
+                ),
+                (
+                    &["z-tied", "a-tied"],
+                    &[
+                        "a-tied", "z-tied", "z-missing", "a-missing", "low", "winner", "tail",
+                    ],
+                ),
+                (
+                    &["z-tied", "a-tied", "winner"],
+                    &[
+                        "a-tied", "z-tied", "winner", "z-missing", "a-missing", "low", "tail",
+                    ],
+                ),
+            ];
+            for &(available, expected) in cases {
+                let mut before = make_candidates(ids.len());
+                for (candidate, id) in before.iter_mut().zip(ids) {
+                    candidate.doc_id = id.into();
+                }
+                before[0].rerank_score = Some(999.0);
+                before[6].rerank_score = Some(444.0);
+                let mut asynchronous = before.clone();
+                let mut synchronous = before.clone();
+                let text = |id: &str| available.contains(&id).then(|| format!("text for {id}"));
+                let combine = RerankCombine::RrfCombine { k: 60.0 };
+                rerank_step_with_combine(
+                    &cx,
+                    &provider,
+                    "query",
+                    &mut asynchronous,
+                    text,
+                    6,
+                    1,
+                    combine,
+                )
+                .await
+                .unwrap();
+                let applied = rerank_step_sync_with_combine_and_admission(
+                    &cx,
+                    &provider.0,
+                    "query",
+                    &mut synchronous,
+                    text,
+                    6,
+                    1,
+                    combine,
+                    || Ok(()),
+                )
+                .unwrap();
+                assert_eq!(applied.as_deref(), Some("sparse-reranker"));
+                assert_eq!(
+                    asynchronous
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                );
+                assert_eq!(
+                    serde_json::to_value(&synchronous).unwrap(),
+                    serde_json::to_value(&asynchronous).unwrap(),
+                );
+                assert_eq!(
+                    serde_json::to_value(&asynchronous[6]).unwrap(),
+                    serde_json::to_value(&before[6]).unwrap(),
+                    "the candidate tail lies outside the reranking window",
+                );
+                for hit in &asynchronous[..6] {
+                    assert_eq!(
+                        hit.rerank_score.is_some(),
+                        available.contains(&hit.doc_id.as_str()),
+                    );
+                }
+            }
         });
     }
 
