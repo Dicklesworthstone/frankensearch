@@ -779,7 +779,7 @@ impl SyncTwoTierSearcher {
         } else {
             prepared.initial
         };
-        let outcome = self.search_final(outcome, false);
+        let outcome = self.search_final(outcome, filter, false)?;
         Ok((outcome.final_results, outcome.metrics))
     }
 
@@ -813,7 +813,10 @@ impl SyncTwoTierSearcher {
     /// [`Self::search_collect_with_filter`]. A terminal refinement failure retains
     /// the previously emitted Initial only while its candidate pool stays
     /// eligible. If new metadata rejects any retained candidate, the failure
-    /// payload is empty and no final diversity ranking runs.
+    /// payload is empty and no final diversity ranking runs. Final ranking
+    /// rechecks all retained candidates when the iterator advances and before
+    /// returning its output. A policy change yields an empty terminal
+    /// `RefinementFailed` with an invalid `search.filter` configuration.
     #[must_use]
     pub const fn search_iter_with_filter<'a>(
         &'a self,
@@ -1367,7 +1370,7 @@ impl SyncTwoTierSearcher {
         let SyncSearchOutcome {
             final_results: initial_results,
             mut metrics,
-            final_ranking,
+            mut final_ranking,
             ..
         } = initial;
         let SyncRefinement {
@@ -1540,6 +1543,12 @@ impl SyncTwoTierSearcher {
                         error,
                         latency,
                     }));
+                }
+                // Preserve metadata resolved during the failed refinement for
+                // the next lazy ranking call, without rewriting the phase that
+                // has already been displayed to the caller.
+                if let Some(ranking) = &mut final_ranking {
+                    lexical_context.attach_metadata(&mut ranking.candidates);
                 }
                 metrics.phase2_total_ms = ms(latency);
                 metrics.skip_reason = Some(error.diagnostic_code().to_owned());
@@ -1788,7 +1797,61 @@ impl SyncTwoTierSearcher {
         sync_tier_embeddings(self.index.fast_index(), results)
     }
 
-    fn search_final(&self, mut outcome: SyncSearchOutcome, want_phase: bool) -> SyncSearchOutcome {
+    fn search_final(
+        &self,
+        outcome: SyncSearchOutcome,
+        filter: Option<&dyn SearchFilter>,
+        want_phase: bool,
+    ) -> SearchResult<SyncSearchOutcome> {
+        let Some(filter) = filter.filter(|_| outcome.final_ranking.is_some()) else {
+            return Ok(self.rank_final_candidates(outcome, want_phase));
+        };
+        let candidates = outcome.final_ranking.as_ref().map_or(
+            outcome.final_results.as_slice(),
+            |ranking| ranking.candidates.as_slice(),
+        );
+        let refusal = || SearchError::InvalidConfig {
+            field: "search.filter".to_owned(),
+            value: "eligibility_changed".to_owned(),
+            reason: "document eligibility changed before final ranking completed".to_owned(),
+        };
+        if candidates
+            .iter()
+            .any(|hit| !filter.matches(&hit.doc_id, hit.metadata.as_deref()))
+        {
+            return Err(refusal());
+        }
+        // The caller can change policy between iterator phases. Retain only
+        // identities and pinned metadata so both successful ranking and its
+        // fallback are checked without cloning vectors or complete results.
+        let retained: SyncMetadata = candidates
+            .iter()
+            .map(|hit| (hit.doc_id.clone(), hit.metadata.clone()))
+            .collect();
+        let outcome = self.rank_final_candidates(outcome, want_phase);
+        if retained
+            .iter()
+            .any(|(id, metadata)| !filter.matches(id, metadata.as_deref()))
+            || outcome.final_results.iter().any(|hit| {
+                !filter.matches(
+                    &hit.doc_id,
+                    retained
+                        .get(&hit.doc_id)
+                        .and_then(Option::as_deref)
+                        .or(hit.metadata.as_deref()),
+                )
+            })
+        {
+            return Err(refusal());
+        }
+        Ok(outcome)
+    }
+
+    fn rank_final_candidates(
+        &self,
+        mut outcome: SyncSearchOutcome,
+        want_phase: bool,
+    ) -> SyncSearchOutcome {
         outcome.phase = None;
         let Some(ranking) = outcome.final_ranking.take() else {
             return outcome;
@@ -2202,7 +2265,17 @@ impl Iterator for SyncSearchIterator<'_> {
                     }),
                 }
             }
-            SyncIteratorState::Rank(pending) => self.searcher.search_final(*pending, true).phase,
+            SyncIteratorState::Rank(pending) => {
+                let started = Instant::now();
+                match self.searcher.search_final(*pending, self.filter, true) {
+                    Ok(outcome) => outcome.phase,
+                    Err(error) => Some(SearchPhase::RefinementFailed {
+                        initial_results: Vec::new(),
+                        error,
+                        latency: started.elapsed(),
+                    }),
+                }
+            }
             SyncIteratorState::Done => None,
         }
     }
@@ -3409,6 +3482,167 @@ mod tests {
             lambda: 0.3,
             candidate_pool: 3,
         }
+    }
+
+    #[test]
+    fn sync_mmr_revalidates_filters_between_retrieval_and_ranking() {
+        struct PhaseFilter(Mutex<Option<DocId>>);
+        impl SearchFilter for PhaseFilter {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                self.0.lock().unwrap().as_deref() != Some(id)
+            }
+
+            fn name(&self) -> &str {
+                "phase-filter"
+            }
+        }
+
+        for attested in [false, true] {
+            for mode in ["fast", "quality", "progressive"] {
+                for revoked in [None, Some("shown"), Some("hidden")] {
+                    let directory = temp_dir("mmr-phase-filter");
+                    let (index, fast, quality) =
+                        sync_mmr_fixture(directory.path(), attested, true);
+                    let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap();
+                    let quality =
+                        BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap();
+                    let query = match mode {
+                        "fast" => TieredQueryEmbeddings::fast_only(fast),
+                        "quality" => TieredQueryEmbeddings::quality_only(quality),
+                        _ => TieredQueryEmbeddings::progressive(fast, quality),
+                    };
+                    let searcher = SyncTwoTierSearcher::new(
+                        index,
+                        TwoTierConfig {
+                            candidate_multiplier: 1,
+                            quality_weight: 0.0,
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_mmr_config(sync_mmr_config());
+                    let filter = PhaseFilter(Mutex::new(None));
+                    let mut phases =
+                        searcher.search_iter_with_filter(&query, 1, Some(&filter));
+                    let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                        panic!("retrieval must precede optional diversity ranking");
+                    };
+                    let displayed = if mode == "progressive" {
+                        let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+                            panic!("progressive retrieval must refine before ranking");
+                        };
+                        results
+                    } else {
+                        results
+                    };
+                    assert_eq!(displayed.len(), 1);
+                    *filter.0.lock().unwrap() = revoked.map(|which| {
+                        if which == "shown" {
+                            displayed[0].doc_id.clone()
+                        } else {
+                            ["a", "b", "c"]
+                                .into_iter()
+                                .find(|id| *id != displayed[0].doc_id.as_str())
+                                .expect("the retained pool has an undisplayed candidate")
+                                .into()
+                        }
+                    });
+                    let terminal = phases.next().expect("final ranking emits a terminal phase");
+                    if revoked.is_some() {
+                        let SearchPhase::RefinementFailed {
+                            initial_results,
+                            error,
+                            ..
+                        } = terminal
+                        else {
+                            panic!("revoked retained candidates must not be reranked");
+                        };
+                        assert!(initial_results.is_empty());
+                        assert!(matches!(
+                            error,
+                            SearchError::InvalidConfig { field, value, .. }
+                                if field == "search.filter" && value == "eligibility_changed"
+                        ));
+                    } else {
+                        let SearchPhase::Reranked { results, .. } = terminal else {
+                            panic!("unchanged eligibility must preserve diversity ranking");
+                        };
+                        let (expected, _) = searcher.search_collect(&query, 1).unwrap();
+                        let (collected, _) = searcher
+                            .search_collect_with_filter(&query, 1, Some(&filter))
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&results).unwrap(),
+                            serde_json::to_value(expected).unwrap()
+                        );
+                        assert_eq!(
+                            serde_json::to_value(results).unwrap(),
+                            serde_json::to_value(collected).unwrap()
+                        );
+                    }
+                    assert!(phases.next().is_none());
+                    assert!(phases.next().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_mmr_rechecks_earlier_admissions_before_returning_results() {
+        use std::sync::atomic::AtomicBool;
+
+        struct LateRevocation {
+            armed: AtomicBool,
+            revoked: AtomicBool,
+        }
+        impl SearchFilter for LateRevocation {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                if id == "c" && self.armed.load(Ordering::Relaxed) {
+                    self.revoked.store(true, Ordering::Relaxed);
+                }
+                id != "a" || !self.revoked.load(Ordering::Relaxed)
+            }
+
+            fn name(&self) -> &str {
+                "late-final-revocation"
+            }
+        }
+
+        let directory = temp_dir("mmr-final-recheck");
+        let (index, fast, _) = sync_mmr_fixture(directory.path(), true, true);
+        let query = TieredQueryEmbeddings::fast_only(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+        );
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+            .with_mmr_config(sync_mmr_config());
+        let filter = LateRevocation {
+            armed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        };
+        let mut phases = searcher.search_iter_with_filter(&query, 2, Some(&filter));
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("Initial must precede final ranking");
+        };
+        assert_eq!(results[0].doc_id, "a");
+        assert!(!filter.revoked.load(Ordering::Relaxed));
+        // Checking a later retained candidate simulates a policy update after
+        // the earlier candidate was admitted. Final output must be rechecked.
+        filter.armed.store(true, Ordering::Relaxed);
+        let Some(SearchPhase::RefinementFailed {
+            initial_results,
+            error,
+            ..
+        }) = phases.next()
+        else {
+            panic!("a final result must not reuse an earlier eligibility decision");
+        };
+        assert!(filter.revoked.load(Ordering::Relaxed));
+        assert!(initial_results.is_empty());
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, .. }
+                if field == "search.filter" && value == "eligibility_changed"
+        ));
+        assert!(phases.next().is_none());
     }
 
     #[test]
@@ -6700,6 +6934,103 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    #[test]
+    fn sync_mmr_preserves_known_metadata_after_refinement_failure() {
+        use std::sync::atomic::AtomicBool;
+
+        struct MetadataPolicy(AtomicBool);
+        impl SearchFilter for MetadataPolicy {
+            fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+                metadata.is_none_or(|value| {
+                    value.get("doc_type").is_some_and(|kind| kind == "keep")
+                        && !self.0.load(Ordering::Relaxed)
+                })
+            }
+
+            fn name(&self) -> &str {
+                "changed-metadata-policy"
+            }
+        }
+
+        let directory = temp_dir("mmr-fallback-metadata");
+        let fast = semantic_identity("fallback-fast", 2);
+        let quality = semantic_identity("fallback-quality", 3);
+        let mut writer =
+            frankensearch_index::TwoTierIndex::create(directory.path(), TwoTierConfig::default())
+                .unwrap();
+        writer.set_fast_embedder_id("fallback-fast");
+        writer.set_quality_embedder_id("fallback-quality");
+        writer.set_fast_identity(&fast).unwrap();
+        writer.set_quality_identity(&quality).unwrap();
+        writer.add_fast_record("shown", &[1.0, 0.0]).unwrap();
+        writer.add_fast_record("hidden", &[0.8, 0.6]).unwrap();
+        for (id, score) in [
+            ("quality-blocked", 1.0_f32),
+            ("shown", 0.99),
+            ("hidden", 0.8),
+            ("replacement", 0.6),
+        ] {
+            writer
+                .add_quality_record(id, &[score, (1.0 - score * score).sqrt(), 0.0])
+                .unwrap();
+        }
+        drop(writer.finish().unwrap());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_mmr_config(MmrConfig {
+            enabled: true,
+            lambda: 0.3,
+            candidate_pool: 2,
+        })
+        .with_lexical(Arc::new(RefinementMetadataFailure {
+            revoked: None,
+            cancelled: false,
+            lookups: AtomicUsize::new(0),
+        }));
+        let filter = MetadataPolicy(AtomicBool::new(false));
+        let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("Initial must precede metadata hydration");
+        };
+        assert_eq!(results[0].doc_id, "shown");
+        assert!(results[0].metadata.is_none());
+        let Some(SearchPhase::RefinementFailed { error, .. }) = phases.next() else {
+            panic!("the wider metadata lookup must fail after resolving shown");
+        };
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, .. } if field == "quality-refill.metadata"
+        ));
+        // Unknown metadata stays admissible, but the now-known metadata no
+        // longer is. Losing that retained observation would wrongly admit MMR.
+        filter.0.store(true, Ordering::Relaxed);
+        let Some(SearchPhase::RefinementFailed {
+            initial_results,
+            error,
+            ..
+        }) = phases.next()
+        else {
+            panic!("final ranking must use the latest retained metadata");
+        };
+        assert!(initial_results.is_empty());
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, .. }
+                if field == "search.filter" && value == "eligibility_changed"
+        ));
+        assert!(phases.next().is_none());
     }
 
     #[test]
