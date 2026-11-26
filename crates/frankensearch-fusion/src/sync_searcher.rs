@@ -1004,7 +1004,10 @@ impl SyncTwoTierSearcher {
     /// Execute a synchronous filtered search and stream progressive phases.
     ///
     /// Metadata upgrades and stable predicate requirements match
-    /// [`Self::search_collect_with_filter`]. A terminal refinement failure retains
+    /// [`Self::search_collect_with_filter`]. Retained candidates are rechecked
+    /// before quality refinement and after its retrieval, even without a final
+    /// reranker. A policy revocation produces an empty terminal failure.
+    /// A terminal refinement failure retains
     /// the previously emitted Initial only while its candidate pool stays
     /// eligible. If new metadata rejects any retained candidate, the failure
     /// payload is empty and no final diversity ranking runs. Final ranking
@@ -1632,6 +1635,20 @@ impl SyncTwoTierSearcher {
         let quality_embedder_id = quality_index.embedder_id().unwrap_or("sync-quality-query");
 
         let phase2_started = Instant::now();
+        // A lazy caller can change policy after Initial. Refuse stale retained
+        // inputs before quality work, using only this request's observations.
+        if let Err(error) = lexical_context.validate_refinement_inputs(
+            context,
+            &fast_hits,
+            &[],
+            lexical_hits.as_deref(),
+        ) {
+            return Err(Box::new(SyncRefinementFailure {
+                initial_results: Vec::new(),
+                error,
+                latency: phase2_started.elapsed(),
+            }));
+        }
         // Retrieve independently after joining the quality query to its
         // retained producer. Both admitted v2 and producer-stamped v1 sources
         // can find documents outside the fast pool, matching the async path.
@@ -1804,6 +1821,25 @@ impl SyncTwoTierSearcher {
                 });
             }
         };
+        // Retrieval and metadata callbacks can revoke an earlier admission.
+        // Validate the reconciled inputs, including undisplayed candidates,
+        // before any of their evidence participates in the refined ranking.
+        let quality_hits = match &quality_pool {
+            SyncQualityPool::Retrieved(hits) => hits.as_slice(),
+            SyncQualityPool::RescoredFastPool(_) => &[],
+        };
+        if let Err(error) = lexical_context.validate_refinement_inputs(
+            context,
+            &refined_fast_hits,
+            quality_hits,
+            lexical_hits.as_deref(),
+        ) {
+            return Err(Box::new(SyncRefinementFailure {
+                initial_results: Vec::new(),
+                error,
+                latency: phase2_started.elapsed(),
+            }));
+        }
         metrics.lexical_search_ms += ms(lexical_refill_time);
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         if let Some(reason) = reconciled_zero_signal {
@@ -2435,6 +2471,46 @@ impl SyncLexicalContext {
             ),
         }
         Ok(started.elapsed())
+    }
+
+    fn validate_refinement_inputs(
+        &self,
+        context: SyncSearchContext<'_>,
+        fast_hits: &[VectorHit],
+        quality_hits: &[VectorHit],
+        lexical_hits: Option<&[ScoredResult]>,
+    ) -> SearchResult<()> {
+        context.checkpoint("sync_search.refinement_admission")?;
+        let Some(filter) = context.filter else {
+            return Ok(());
+        };
+        let candidates = fast_hits
+            .iter()
+            .chain(quality_hits)
+            .map(|hit| (hit.doc_id.as_str(), None))
+            .chain(
+                lexical_hits
+                    .into_iter()
+                    .flatten()
+                    .map(|hit| (hit.doc_id.as_str(), hit.metadata.as_deref())),
+            );
+        for (id, metadata) in candidates {
+            context.checkpoint("sync_search.refinement_admission")?;
+            let eligible = filter.matches(
+                id,
+                self.metadata.get(id).and_then(Option::as_deref).or(metadata),
+            );
+            context.checkpoint("sync_search.refinement_admission")?;
+            if !eligible {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.filter".to_owned(),
+                    value: "eligibility_changed".to_owned(),
+                    reason: "document eligibility changed before quality refinement completed"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn attach_metadata(&self, results: &mut [ScoredResult]) {
@@ -3354,9 +3430,9 @@ mod tests {
 
         impl SearchFilter for ObserveQualityScan {
             fn matches(&self, doc_id: &str, _: Option<&serde_json::Value>) -> bool {
-                // Only the quality owner contains b/c. Observing their scan
-                // proves where refinement executes without counting Initial
-                // or the exact evidence lookup for the retained fast row.
+                // Only the quality owner contains b/c. Worker visits prove
+                // parallel retrieval; refinement admission can also validate
+                // these candidates on the caller after that scan completes.
                 if doc_id != "a" {
                     let visits = if std::thread::current().id() == self.caller {
                         &self.caller_visits
@@ -3453,7 +3529,6 @@ mod tests {
                     assert!(results[0].index.is_none());
                     assert!(phases.next().is_none());
                     if parallel == Some(true) {
-                        assert_eq!(observed.caller_visits.load(Ordering::Relaxed), 0);
                         assert!(observed.worker_visits.load(Ordering::Relaxed) > 0);
                     } else {
                         assert!(observed.caller_visits.load(Ordering::Relaxed) > 0);
@@ -9114,6 +9189,211 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn sync_refinement_rejects_revoked_retained_fast_and_lexical_inputs() {
+        use std::sync::atomic::AtomicBool;
+
+        struct RevocableFilter {
+            denied: &'static str,
+            revoked: AtomicBool,
+        }
+
+        impl SearchFilter for RevocableFilter {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                id != self.denied || !self.revoked.load(Ordering::SeqCst)
+            }
+
+            fn name(&self) -> &'static str {
+                "refinement-revocation"
+            }
+        }
+
+        for (hybrid, denied) in [
+            (false, "a"),
+            (false, "b"),
+            (true, "a"),
+            (true, "b"),
+            (true, "lex-only"),
+        ] {
+            let mut searcher = SyncTwoTierSearcher::new(
+                make_index(),
+                TwoTierConfig {
+                    candidate_multiplier: 3,
+                    quality_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            );
+            if hybrid {
+                searcher = searcher.with_lexical(Arc::new(StaticLexical {
+                    hits: vec![lexical_result("a", 10.0), lexical_result("lex-only", 9.0)],
+                }));
+            }
+            let query = tiered(vec![1.0, 0.0]);
+            let filter = RevocableFilter {
+                denied,
+                revoked: AtomicBool::new(false),
+            };
+            let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
+            let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                panic!("Initial must precede lazy refinement");
+            };
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "a");
+
+            filter.revoked.store(true, Ordering::SeqCst);
+            let Some(SearchPhase::RefinementFailed {
+                initial_results,
+                error,
+                ..
+            }) = phases.next()
+            else {
+                panic!("revoked retained input {denied} must refuse refinement");
+            };
+            assert!(initial_results.is_empty());
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "search.filter" && value == "eligibility_changed"
+            ));
+            assert!(phases.next().is_none());
+            assert!(phases.next().is_none());
+        }
+    }
+
+    #[test]
+    fn sync_refinement_rechecks_retained_fast_inputs_after_quality_callbacks() {
+        use std::sync::atomic::AtomicBool;
+
+        struct LateRevocation {
+            armed: AtomicBool,
+            revoked: AtomicBool,
+        }
+
+        impl SearchFilter for LateRevocation {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                if id == "b" && self.armed.load(Ordering::SeqCst) {
+                    self.revoked.store(true, Ordering::SeqCst);
+                }
+                id != "a" || !self.revoked.load(Ordering::SeqCst)
+            }
+
+            fn name(&self) -> &'static str {
+                "quality-callback-revocation"
+            }
+        }
+
+        let directory = temp_dir("sync-refinement-callback-revocation");
+        let (fast, quality) = persisted_producer_pair(directory.path());
+        let index = Arc::new(InMemoryTwoTierIndex::from_dir(directory.path()).unwrap());
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap(),
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap(),
+        );
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_search_params(SearchParams {
+            parallel_enabled: false,
+            ..SearchParams::default()
+        });
+        let filter = LateRevocation {
+            armed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+        };
+        let mut phases = searcher.search_iter_with_filter(&query, 3, Some(&filter));
+        let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+            panic!("Initial must precede quality callbacks");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "a");
+        assert!(!filter.revoked.load(Ordering::SeqCst));
+
+        filter.armed.store(true, Ordering::SeqCst);
+        let Some(SearchPhase::RefinementFailed {
+            initial_results,
+            error,
+            ..
+        }) = phases.next()
+        else {
+            panic!("quality callbacks cannot readmit revoked fast evidence");
+        };
+        assert!(filter.revoked.load(Ordering::SeqCst));
+        assert!(initial_results.is_empty());
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, .. }
+                if field == "search.filter" && value == "eligibility_changed"
+        ));
+        assert!(phases.next().is_none());
+        assert!(phases.next().is_none());
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn sync_refinement_admission_cancellation_precedes_filter_refusal() {
+        use std::sync::atomic::AtomicBool;
+
+        struct CancelAndReject<'a> {
+            cx: &'a asupersync::Cx,
+            armed: AtomicBool,
+        }
+
+        impl SearchFilter for CancelAndReject<'_> {
+            fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+                if self.armed.load(Ordering::SeqCst) {
+                    self.cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel during refinement admission"),
+                    );
+                    return false;
+                }
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "cancel-refinement-admission"
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
+            let query = tiered(vec![1.0, 0.0]);
+            let filter = CancelAndReject {
+                cx: &cx,
+                armed: AtomicBool::new(false),
+            };
+            let text = |_: &str| -> Option<String> {
+                panic!("an unconfigured ranker cannot request text")
+            };
+            let mut phases = searcher.search_iter_with_text_and_filter(
+                &cx,
+                "query",
+                &query,
+                1,
+                &text,
+                Some(&filter),
+            );
+            assert!(matches!(phases.next(), Some(SearchPhase::Initial { .. })));
+            filter.armed.store(true, Ordering::SeqCst);
+            let Some(SearchPhase::RefinementFailed {
+                initial_results,
+                error,
+                ..
+            }) = phases.next()
+            else {
+                panic!("predicate cancellation must terminate refinement");
+            };
+            assert!(initial_results.is_empty());
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert!(phases.next().is_none());
+        });
     }
 
     #[test]
