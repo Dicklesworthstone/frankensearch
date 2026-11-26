@@ -97,10 +97,22 @@ impl<'a> RequestFilter<'a> {
     }
 
     fn includes(&self, cx: &Cx, id: &str) -> SearchResult<bool> {
+        Self::matches_candidate(
+            cx,
+            self.predicate,
+            id,
+            self.metadata.get(id).and_then(Option::as_deref),
+        )
+    }
+
+    pub(crate) fn matches_candidate(
+        cx: &Cx,
+        predicate: Option<&dyn SearchFilter>,
+        id: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> SearchResult<bool> {
         cancellation_checkpoint(cx, "filter_candidate")?;
-        let included = self.predicate.is_none_or(|predicate| {
-            predicate.matches(id, self.metadata.get(id).and_then(Option::as_deref))
-        });
+        let included = predicate.is_none_or(|predicate| predicate.matches(id, metadata));
         cancellation_checkpoint(cx, "filter_candidate_to_search")?;
         Ok(included)
     }
@@ -146,7 +158,7 @@ impl<'a> RequestFilter<'a> {
         Ok(())
     }
 
-    pub(super) fn attach_metadata(&self, results: &mut [ScoredResult]) {
+    pub(crate) fn attach_metadata(&self, results: &mut [ScoredResult]) {
         if self.is_active() {
             for result in results {
                 if let Some(Some(metadata)) = self.metadata.get(&result.doc_id) {

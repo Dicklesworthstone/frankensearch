@@ -193,7 +193,8 @@ pub struct FederatedCoverage {
     /// including empty answers and quality-only requests that pass admission
     /// without inference.
     pub answered: Vec<String>,
-    /// Shards that returned an error.
+    /// Shards that returned an error or whose published results became
+    /// ineligible while waiting for other shards.
     pub failed: Vec<FederatedShardError>,
     /// Shards that exceeded `per_index_timeout_ms` without a usable published
     /// phase. This includes a previously published phase that later filter
@@ -666,6 +667,7 @@ impl FederatedSearcher {
                 .collect(),
             ..FederatedCoverage::default()
         };
+        let mut shard_filters = AHashMap::new();
         let mut pending: Vec<ShardFuture<'_>> = self
             .indices
             .iter()
@@ -675,6 +677,9 @@ impl FederatedSearcher {
                 let index_weight = index.weight;
                 let searcher = Arc::clone(&index.searcher);
                 let filter = filter_fn(index.name.as_str());
+                if let Some(filter) = filter {
+                    shard_filters.insert(index.name.as_str(), filter);
+                }
                 Box::pin(async move {
                     let timeout_start = cx.now();
                     let mut last_results = None;
@@ -722,6 +727,11 @@ impl FederatedSearcher {
                                 .cancel_reason()
                                 .map_or_else(|| error.to_string(), |reason| reason.to_string()),
                         };
+                    }
+                    // Refinement can resolve metadata that was unknown when
+                    // Initial was published, even if it later times out.
+                    if let Some(hits) = last_results.as_deref_mut() {
+                        request_filter.attach_metadata(hits);
                     }
                     match response {
                         Ok(Ok(_metrics)) => ShardCompletion::Completed {
@@ -849,7 +859,16 @@ impl FederatedSearcher {
             if self.config.wait_for_indices > 0
                 && shard_results.len() >= self.config.wait_for_indices
             {
-                break;
+                revalidate_shards(
+                    cx,
+                    &shard_filters,
+                    &mut shard_results,
+                    &mut coverage,
+                    &mut first_shard_error,
+                )?;
+                if shard_results.len() >= self.config.wait_for_indices {
+                    break;
+                }
             }
         }
 
@@ -879,6 +898,13 @@ impl FederatedSearcher {
                     .map_or_else(|| error.to_string(), |reason| reason.to_string()),
             });
         }
+        revalidate_shards(
+            cx,
+            &shard_filters,
+            &mut shard_results,
+            &mut coverage,
+            &mut first_shard_error,
+        )?;
         if shard_results.is_empty()
             && let Some(error) = first_shard_error
         {
@@ -887,6 +913,63 @@ impl FederatedSearcher {
 
         Ok((shard_results, coverage))
     }
+}
+
+/// A different shard can change a request predicate while this shard is
+/// waiting for the gather. Recheck each source with its own published metadata
+/// before it counts toward early stopping and after unfinished work is dropped.
+fn revalidate_shards(
+    cx: &Cx,
+    filters: &AHashMap<&str, &dyn SearchFilter>,
+    shards: &mut Vec<ShardResult>,
+    coverage: &mut FederatedCoverage,
+    first_error: &mut Option<SearchError>,
+) -> SearchResult<()> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    let mut index = 0;
+    while index < shards.len() {
+        let shard = &shards[index];
+        let Some(filter) = filters.get(shard.name.as_str()) else {
+            index += 1;
+            continue;
+        };
+        let mut eligible = true;
+        for hit in &shard.hits {
+            if !RequestFilter::matches_candidate(
+                cx,
+                Some(*filter),
+                &hit.doc_id,
+                hit.metadata.as_deref(),
+            )? {
+                eligible = false;
+                break;
+            }
+        }
+        if eligible {
+            index += 1;
+            continue;
+        }
+
+        let name = shards.swap_remove(index).name;
+        coverage.answered.retain(|entry| entry != &name);
+        coverage.refinement_timed_out.retain(|entry| entry != &name);
+        coverage
+            .refinement_failed
+            .retain(|entry| entry.index != name);
+        let error = SearchError::InvalidConfig {
+            field: "search.filter".to_owned(),
+            value: "eligibility_changed".to_owned(),
+            reason: "document eligibility changed before federated fusion".to_owned(),
+        };
+        coverage.failed.push(FederatedShardError {
+            index: name,
+            error: error.diagnostic_code().to_owned(),
+        });
+        first_error.get_or_insert(error);
+    }
+    Ok(())
 }
 
 /// Floating-point addition is not associative. Sorting only the final hits
@@ -2978,6 +3061,74 @@ mod tests {
     }
 
     #[test]
+    fn sibling_revocation_excludes_a_completed_shard_from_fusion_and_quorum() {
+        use std::sync::atomic::AtomicBool;
+
+        use frankensearch_core::filter::SearchFilter;
+
+        struct LiveFilter<'a>(&'a AtomicBool);
+
+        impl SearchFilter for LiveFilter<'_> {
+            fn matches(&self, _id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+                !self.0.load(Ordering::SeqCst)
+            }
+
+            fn name(&self) -> &'static str {
+                "live-filter"
+            }
+        }
+
+        for min_indices in [1, 2] {
+            asupersync::test_utils::run_test_with_cx(move |cx| async move {
+                let (_first_dir, first) = build_searcher(&[("shared", &[1.0, 0.0])]);
+                let (_later_dir, later) = build_yielding_searcher(&[("shared", &[1.0, 0.0])]);
+                let revoked = AtomicBool::new(false);
+                let filter = LiveFilter(&revoked);
+                let federated = FederatedSearcher::new()
+                    .with_config(FederatedConfig {
+                        min_indices,
+                        ..FederatedConfig::default()
+                    })
+                    .add_index("first", first, 10.0)
+                    .add_index("later", later, 1.0);
+                let outcome = federated
+                    .search_with_index_filter(
+                        &cx,
+                        "query -omit",
+                        1,
+                        |name| (name == "first").then_some(&filter as &dyn SearchFilter),
+                        |name, _| {
+                            if name == "later" {
+                                revoked.store(true, Ordering::SeqCst);
+                            }
+                            Some("keep".to_owned())
+                        },
+                    )
+                    .await;
+                assert!(revoked.load(Ordering::SeqCst));
+                if min_indices == 2 {
+                    assert!(matches!(
+                        outcome,
+                        Err(SearchError::FederatedInsufficientResponses {
+                            required: 2,
+                            received: 1,
+                        })
+                    ));
+                } else {
+                    let response = outcome.unwrap();
+                    assert_eq!(response.coverage.answered, ["later"]);
+                    assert_eq!(response.coverage.failed.len(), 1);
+                    assert_eq!(response.coverage.failed[0].index, "first");
+                    assert_eq!(response.hits.len(), 1);
+                    assert_eq!(response.hits[0].source_index, "later");
+                    assert_eq!(response.hits[0].appeared_in, ["later"]);
+                    assert!(!response.coverage.is_complete());
+                }
+            });
+        }
+    }
+
+    #[test]
     fn indexed_filters_borrow_request_state_and_keep_equal_ids_source_local() {
         use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
 
@@ -3385,11 +3536,14 @@ mod tests {
                         assert!(response.coverage.refinement_timed_out.is_empty());
                     } else {
                         assert_eq!(response.hits.len(), 2);
-                        assert!(
-                            response
-                                .hits
-                                .iter()
-                                .any(|hit| hit.result.doc_id == "initial")
+                        let initial = response
+                            .hits
+                            .iter()
+                            .find(|hit| hit.result.doc_id == "initial")
+                            .unwrap();
+                        assert_eq!(
+                            initial.result.metadata.as_deref().unwrap()["doc_type"],
+                            "keep"
                         );
                         assert_eq!(response.coverage.answered.len(), 2);
                         assert!(response.coverage.timed_out.is_empty());
