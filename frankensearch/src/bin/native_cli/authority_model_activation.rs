@@ -25,11 +25,13 @@ use super::{
 const MAX_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
 enum Operation {
-    ActivateModel,
-    ActivateQualityCompletion,
-    ActivateRollback,
+    #[serde(rename = "activate_model")]
+    Model,
+    #[serde(rename = "activate_quality_completion")]
+    QualityCompletion,
+    #[serde(rename = "activate_rollback")]
+    Rollback,
 }
 
 #[derive(Debug)]
@@ -54,18 +56,18 @@ pub(super) struct Request {
 
 impl Request {
     pub(super) const fn completes_quality(&self) -> bool {
-        matches!(self.operation, Operation::ActivateQualityCompletion)
+        matches!(self.operation, Operation::QualityCompletion)
     }
 
     pub(super) const fn restores_rollback(&self) -> bool {
-        matches!(self.operation, Operation::ActivateRollback)
+        matches!(self.operation, Operation::Rollback)
     }
 
     pub(super) const fn operation(&self) -> &'static str {
         match self.operation {
-            Operation::ActivateModel => "activate_model",
-            Operation::ActivateQualityCompletion => "activate_quality_completion",
-            Operation::ActivateRollback => "activate_rollback",
+            Operation::Model => "activate_model",
+            Operation::QualityCompletion => "activate_quality_completion",
+            Operation::Rollback => "activate_rollback",
         }
     }
 
