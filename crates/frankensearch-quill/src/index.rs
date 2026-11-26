@@ -959,6 +959,7 @@ fn delta_lease_overlap_comparisons() -> usize {
 
 pub struct QuillSearchSnapshot {
     snapshot_epoch: u64,
+    metadata_field: Option<u16>,
     keeper: Arc<KeeperSnapshot>,
     deltas: Box<[Arc<DeltaSnapshot>]>,
     delta_lease_lookup: Vec<DeltaLeaseLookup>,
@@ -968,6 +969,14 @@ pub struct QuillSearchSnapshot {
 }
 
 impl QuillSearchSnapshot {
+    fn metadata_field(schema: SchemaDescriptor) -> Option<u16> {
+        schema
+            .fields
+            .iter()
+            .find(|field| field.name == "metadata_json" && field.stored)
+            .map(|field| field.id)
+    }
+
     fn compose(
         snapshot_epoch: u64,
         keeper: Arc<KeeperSnapshot>,
@@ -1001,6 +1010,7 @@ impl QuillSearchSnapshot {
 
         Ok(Self {
             snapshot_epoch,
+            metadata_field: Self::metadata_field(schema),
             keeper,
             deltas: deltas.into_boxed_slice(),
             delta_lease_lookup,
@@ -1181,10 +1191,13 @@ impl QuillSearchSnapshot {
         &self,
         global_docid: u32,
     ) -> Result<Option<Arc<serde_json::Value>>, QuillIndexError> {
-        let Some(stored) = self.materialize_stored_value(METADATA_FIELD, global_docid)? else {
+        let Some(field) = self.metadata_field else {
             return Ok(None);
         };
-        let metadata: serde_json::Value = serde_json::from_slice(&stored)?;
+        let Some(stored) = self.stored_field_bytes(field, global_docid)? else {
+            return Ok(None);
+        };
+        let metadata: serde_json::Value = serde_json::from_slice(stored)?;
         // Ingest always writes a canonical metadata object, so a document indexed
         // without metadata stores `{}`. Tantivy omits the field entirely in that
         // case, and an empty object carries no information anyway — materialize
@@ -1225,6 +1238,15 @@ impl QuillSearchSnapshot {
         field_ord: u16,
         global_docid: u32,
     ) -> Result<Option<&[u8]>, QuillIndexError> {
+        if self
+            .keeper
+            .schema()
+            .fields
+            .get(usize::from(field_ord))
+            .is_none_or(|field| !field.stored)
+        {
+            return Ok(None);
+        }
         if let Some(delta) = self.delta_for_docid(global_docid) {
             match delta.materialize_stored_value(field_ord, global_docid) {
                 DeltaStoredMaterialization::NotLive => {}
@@ -1799,6 +1821,7 @@ impl SnapshotPublisher {
     ) -> Arc<QuillSearchSnapshot> {
         let next = Arc::new(QuillSearchSnapshot {
             snapshot_epoch: prepared.snapshot_epoch,
+            metadata_field: QuillSearchSnapshot::metadata_field(keeper.schema()),
             keeper,
             deltas: prepared.deltas,
             delta_lease_lookup: prepared.delta_lease_lookup,
@@ -12828,6 +12851,19 @@ impl QuillReader {
         self.search_with_snippets_on(cx, query, limit, snippet_config, snapshot.as_ref())
     }
 
+    fn snippet_content_field(&self) -> Result<(u16, Analyzer), QuillIndexError> {
+        let field = self
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name == "content")
+            .ok_or_else(|| invalid_state("schema has no content field"))?;
+        let FieldKind::Text { analyzer, .. } = field.kind else {
+            return Err(invalid_state("content field is not text"));
+        };
+        Ok((field.id, analyzer))
+    }
+
     /// Generate snippets against the exact caller-pinned composite snapshot.
     fn search_with_snippets_on(
         &self,
@@ -12850,9 +12886,11 @@ impl QuillReader {
             self.schema,
             self.config.glob_expansion_limit,
         )?;
+        let (content_field, analyzer) = self.snippet_content_field()?;
         let tail_work_upper_bound = snippet_tail_work_upper_bound(
             &parsed.query,
             snapshot,
+            content_field,
             limit,
             self.config.glob_expansion_limit,
         )?;
@@ -12883,16 +12921,9 @@ impl QuillReader {
             &checkpoint,
             &parsed.query,
             snapshot,
-            self.schema,
+            content_field,
             self.config.glob_expansion_limit,
         )?;
-        let analyzer = match self.schema.fields.get(usize::from(CONTENT_FIELD)) {
-            Some(field) => match field.kind {
-                FieldKind::Text { analyzer, .. } => analyzer,
-                _ => return Err(invalid_state("content field is not text")),
-            },
-            None => return Err(invalid_state("schema has no content field")),
-        };
         let mut generator = SnippetGenerator::new(analyzer, terms, snippet_config.clone());
         let mut results = Vec::new();
         results
@@ -12907,7 +12938,7 @@ impl QuillReader {
             // sized for this query cannot be refused here.
             checkpoint.admit(QueryWorkKind::PositionDocument, 1)?;
             let snippet = snapshot
-                .stored_field_bytes(CONTENT_FIELD, hit.global_docid)?
+                .stored_field_bytes(content_field, hit.global_docid)?
                 .map(|content| {
                     std::str::from_utf8(content)
                         .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
@@ -12968,9 +12999,11 @@ impl QuillReader {
         }
         let mut parsed = self.default_parser()?.parse_lenient(query);
         let _canonicalization = canonicalize_query(&mut parsed.query);
+        let (content_field, analyzer) = self.snippet_content_field()?;
         let work_upper_bound = snippet_tail_work_upper_bound(
             &parsed.query,
             snapshot,
+            content_field,
             document_ids.len(),
             self.config.glob_expansion_limit,
         )?;
@@ -12985,16 +13018,9 @@ impl QuillReader {
             &checkpoint,
             &parsed.query,
             snapshot,
-            self.schema,
+            content_field,
             self.config.glob_expansion_limit,
         )?;
-        let analyzer = match self.schema.fields.get(usize::from(CONTENT_FIELD)) {
-            Some(field) => match field.kind {
-                FieldKind::Text { analyzer, .. } => analyzer,
-                _ => return Err(invalid_state("content field is not text")),
-            },
-            None => return Err(invalid_state("schema has no content field")),
-        };
         let mut generator = SnippetGenerator::new(analyzer, terms, snippet_config.clone());
         let mut snippets = Vec::new();
         snippets
@@ -13011,7 +13037,7 @@ impl QuillReader {
             // Keep full UTF-8 validation (including bytes beyond the preview)
             // and the ordinary stored-section integrity checks.
             let content = snapshot
-                .stored_field_bytes(CONTENT_FIELD, global_docid)?
+                .stored_field_bytes(content_field, global_docid)?
                 .map(|content| {
                     std::str::from_utf8(content)
                         .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
@@ -16221,7 +16247,7 @@ impl SnippetTailWorkShape {
         self.add_term_count(expansion_limit);
     }
 
-    fn visit(&mut self, query: &Query, expansion_limit: usize) {
+    fn visit(&mut self, query: &Query, content_field: u16, expansion_limit: usize) {
         let mut pending = Vec::new();
         if pending.try_reserve_exact(query.node_count()).is_err() {
             self.wildcard_glob_scans = u64::MAX;
@@ -16233,7 +16259,7 @@ impl SnippetTailWorkShape {
         while let Some(node_id) = pending.pop() {
             match query.node(node_id) {
                 QueryNode::Term { fields, .. }
-                    if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
+                    if fields.iter().any(|field| field.field_id == content_field) =>
                 {
                     self.add_term_count(1);
                 }
@@ -16242,7 +16268,7 @@ impl SnippetTailWorkShape {
                     terms,
                     prefix,
                     ..
-                } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
+                } if fields.iter().any(|field| field.field_id == content_field) => {
                     if *prefix && !terms.is_empty() {
                         self.add_term_count(terms.len().saturating_sub(1));
                         self.add_wildcard_glob(expansion_limit);
@@ -16259,7 +16285,7 @@ impl SnippetTailWorkShape {
                             .map(|clause| clause.query),
                     );
                 }
-                QueryNode::Set { field_id, values } if *field_id == CONTENT_FIELD => {
+                QueryNode::Set { field_id, values } if *field_id == content_field => {
                     self.add_term_count(
                         values
                             .iter()
@@ -16267,7 +16293,7 @@ impl SnippetTailWorkShape {
                             .count(),
                     );
                 }
-                QueryNode::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
+                QueryNode::Glob { field_ids, pattern } if field_ids.contains(&content_field) => {
                     self.add_glob(pattern.as_bytes(), expansion_limit);
                 }
                 QueryNode::Boost { query: child, .. } => pending.push(*child),
@@ -16299,11 +16325,12 @@ fn delta_ordered_view_blocks(term_count: usize) -> u64 {
 fn snippet_tail_work_upper_bound(
     query: &Query,
     snapshot: &QuillSearchSnapshot,
+    content_field: u16,
     limit: usize,
     expansion_limit: usize,
 ) -> Result<u64, QuillIndexError> {
     let mut shape = SnippetTailWorkShape::default();
-    shape.visit(query, expansion_limit);
+    shape.visit(query, content_field, expansion_limit);
 
     let keeper = snapshot.keeper_snapshot();
     let keeper_segment_count = u64::try_from(keeper.segments().len()).unwrap_or(u64::MAX);
@@ -19740,7 +19767,7 @@ fn compiled_snippet_terms(
     checkpoint: &QueryCheckpointHandle<'_>,
     query: &Query,
     snapshot: &QuillSearchSnapshot,
-    schema: SchemaDescriptor,
+    content_field: u16,
     expansion_limit: usize,
 ) -> Result<Vec<SnippetTerm>, QuillIndexError> {
     let mut terms = BTreeSet::<Vec<u8>>::new();
@@ -19748,7 +19775,7 @@ fn compiled_snippet_terms(
         checkpoint,
         query,
         snapshot,
-        schema,
+        content_field,
         expansion_limit,
         &mut terms,
     )?;
@@ -19758,7 +19785,7 @@ fn compiled_snippet_terms(
             let document_frequency = checkpointed_snapshot_doc_freq(
                 checkpoint,
                 snapshot,
-                CONTENT_FIELD,
+                content_field,
                 &term,
                 SnapshotDocFreqDeltaAdmission::TailPerGeneration,
             )?;
@@ -19773,10 +19800,11 @@ fn collect_snippet_term_bytes(
     checkpoint: &QueryCheckpointHandle<'_>,
     query: &Query,
     snapshot: &QuillSearchSnapshot,
-    schema: SchemaDescriptor,
+    content_field: u16,
     expansion_limit: usize,
     terms: &mut BTreeSet<Vec<u8>>,
 ) -> Result<(), QuillIndexError> {
+    let schema = snapshot.keeper_snapshot().schema();
     let mut pending = Vec::new();
     pending
         .try_reserve_exact(query.node_count())
@@ -19788,7 +19816,7 @@ fn collect_snippet_term_bytes(
     while let Some(node_id) = pending.pop() {
         match query.node(node_id) {
             QueryNode::Term { fields, text }
-                if fields.iter().any(|field| field.field_id == CONTENT_FIELD) =>
+                if fields.iter().any(|field| field.field_id == content_field) =>
             {
                 terms.insert(text.as_bytes().to_vec());
             }
@@ -19797,7 +19825,7 @@ fn collect_snippet_term_bytes(
                 terms: phrase_terms,
                 prefix,
                 ..
-            } if fields.iter().any(|field| field.field_id == CONTENT_FIELD) => {
+            } if fields.iter().any(|field| field.field_id == content_field) => {
                 let prefix_index = (*prefix).then_some(phrase_terms.len().saturating_sub(1));
                 for (index, term) in phrase_terms.iter().enumerate() {
                     if prefix_index == Some(index) {
@@ -19806,7 +19834,7 @@ fn collect_snippet_term_bytes(
                             Some(checkpoint),
                             snapshot,
                             schema,
-                            CONTENT_FIELD,
+                            content_field,
                             pattern.as_bytes(),
                             expansion_limit,
                         )?);
@@ -19824,18 +19852,18 @@ fn collect_snippet_term_bytes(
                         .map(|clause| clause.query),
                 );
             }
-            QueryNode::Set { field_id, values } if *field_id == CONTENT_FIELD => {
+            QueryNode::Set { field_id, values } if *field_id == content_field => {
                 terms.extend(values.iter().filter_map(|value| match value {
                     QueryValue::Str(text) => Some(text.as_bytes().to_vec()),
                     QueryValue::I64(_) | QueryValue::U64(_) => None,
                 }));
             }
-            QueryNode::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
+            QueryNode::Glob { field_ids, pattern } if field_ids.contains(&content_field) => {
                 terms.extend(snapshot_glob_terms(
                     Some(checkpoint),
                     snapshot,
                     schema,
-                    CONTENT_FIELD,
+                    content_field,
                     pattern.as_bytes(),
                     expansion_limit,
                 )?);
@@ -22932,6 +22960,7 @@ mod tests {
             let tail_upper_bound = snippet_tail_work_upper_bound(
                 &query,
                 &snapshot,
+                CONTENT_FIELD,
                 10,
                 index.reader.config.glob_expansion_limit,
             )
@@ -22947,7 +22976,7 @@ mod tests {
                     &checkpoint,
                     &query,
                     &snapshot,
-                    DEFAULT_SCHEMA,
+                    CONTENT_FIELD,
                     index.reader.config.glob_expansion_limit,
                 )
                 .expect_err("the second Delta lookup must exhaust the remaining tail fuel")
@@ -27811,6 +27840,76 @@ mod tests {
         });
     }
 
+    #[test]
+    fn reopened_reader_hydrates_named_fields_at_their_schema_ordinals() {
+        const FIELDS: [FieldDescriptor; 4] = [
+            FieldDescriptor {
+                id: 0,
+                ..DEFAULT_SCHEMA.fields[2]
+            },
+            FieldDescriptor {
+                id: 1,
+                ..DEFAULT_SCHEMA.fields[0]
+            },
+            FieldDescriptor {
+                id: 2,
+                ..DEFAULT_SCHEMA.fields[3]
+            },
+            FieldDescriptor {
+                id: 3,
+                ..DEFAULT_SCHEMA.fields[1]
+            },
+        ];
+        const SCHEMA: SchemaDescriptor = SchemaDescriptor {
+            name: "reordered-named-fields",
+            fields: &FIELDS,
+        };
+
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("directory");
+            let config = deterministic_config();
+            let index =
+                QuillIndex::create_with_schema(&cx, directory.path(), SCHEMA, config.clone())
+                    .await
+                    .expect("create custom index");
+            let doc = SchemaDocument {
+                id: "winner".to_owned(),
+                indexed: vec![(3, "buried treasure".to_owned())],
+                stored: vec![(2, br#"{"island":true}"#.to_vec())],
+                ..SchemaDocument::default()
+            };
+            index
+                .upsert_schema_documents(&cx, &[doc])
+                .await
+                .expect("index");
+            index.commit(&cx).await.expect("publish");
+            drop(index);
+            let reader = QuillSearchIndex::open_with_schema(&cx, directory.path(), SCHEMA, config)
+                .await
+                .expect("reopen");
+            let selected = reader
+                .metadata_for_documents(&cx, &["winner", "missing"])
+                .expect("hydrate");
+            assert_eq!(
+                selected[0].as_deref(),
+                Some(&serde_json::json!({"island": true}))
+            );
+            assert!(selected[1].is_none());
+
+            let config = SnippetConfig::default();
+            let ranked = reader
+                .search_with_snippets(&cx, "treasure", 3, &config)
+                .expect("rank");
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].metadata, selected[0]);
+            assert_eq!(ranked[0].snippet.as_deref(), Some("buried <b>treasure</b>"));
+            let chosen = reader
+                .snippets_for_documents(&cx, "treasure", &["winner"], &config, usize::MAX)
+                .expect("preview");
+            assert_eq!(chosen[0], ranked[0].snippet);
+        });
+    }
+
     /// A durable index can be created and reopened on the CASS descriptor.
     ///
     /// This is the seam the cass migration needs: the schema-parameterized
@@ -27842,6 +27941,31 @@ mod tests {
             .await
             .expect("reopen durable CASS-schema index");
             assert_eq!(reopened.doc_count().expect("count"), 0);
+
+            let document = SchemaDocument {
+                id: "cass-doc".to_owned(),
+                stored: vec![(3, b"/logs/session".to_vec())],
+                ..SchemaDocument::default()
+            };
+            reopened
+                .upsert_schema_documents(&cx, &[document])
+                .await
+                .expect("index CASS source path");
+            reopened.commit(&cx).await.expect("publish CASS document");
+            let reader = QuillSearchIndex::open_with_schema(
+                &cx,
+                &root,
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                deterministic_config(),
+            )
+            .await
+            .expect("open CASS reader");
+            assert_eq!(
+                reader
+                    .metadata_for_documents(&cx, &["cass-doc"])
+                    .expect("CASS has no metadata_json field"),
+                vec![None]
+            );
 
             // The descriptor is verified, not inferred: opening the same
             // directory with the shipping schema must fail rather than
