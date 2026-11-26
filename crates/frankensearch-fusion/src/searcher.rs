@@ -1451,6 +1451,9 @@ impl TwoTierSearcher {
     /// its retained candidates still satisfy the filter. If refinement learned
     /// that one of those candidates is ineligible, the original error or timeout
     /// is returned without reusing that pool for fallback or final ranking.
+    /// Final ranking rechecks the entire retained pool after public callbacks
+    /// and ranker work. Changed eligibility returns an invalid `search.filter`
+    /// configuration instead of publishing or falling back to revoked results.
     /// Cancellation always terminates the request.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(query_len = query.len(), k))]
@@ -2341,14 +2344,30 @@ impl TwoTierSearcher {
                 return Err(SearchError::Cancelled { phase, reason });
             }
             let final_candidates = refined_ranking_pool.unwrap_or(initial_hits);
+            // Public phase callbacks and asynchronous rankers can change a
+            // request predicate. Hidden candidates belong to the same policy
+            // boundary as the displayed prefix. Retain only their identities,
+            // and allocate nothing for the unfiltered path.
+            let final_candidate_ids = if request_filter.is_active() {
+                final_candidates
+                    .iter()
+                    .map(|hit| hit.doc_id.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let phase3_start = Instant::now();
             let phase3 = async {
+                request_filter.validate_retained_ids(cx, &final_candidate_ids)?;
                 #[cfg(feature = "rerank")]
                 let (final_candidates, ranker_id) = self
                     .run_cross_encoder(cx, semantic_query, final_candidates, &text_fn)
                     .await?;
                 #[cfg(not(feature = "rerank"))]
                 let ranker_id = None;
+                // Even a gracefully skipped or failed cross-encoder can have
+                // changed eligibility. Do not pass its stale pool into MMR.
+                request_filter.validate_retained_ids(cx, &final_candidate_ids)?;
                 self.run_phase3(
                     cx,
                     k,
@@ -2360,6 +2379,16 @@ impl TwoTierSearcher {
                 )
             }
             .await;
+            // A ranking failure may keep the preceding phase only while its
+            // entire retained pool remains eligible. Preserve cancellation
+            // instead of replacing it with a later predicate refusal.
+            let phase3 = if matches!(&phase3, Err(SearchError::Cancelled { .. })) {
+                phase3
+            } else {
+                request_filter
+                    .validate_retained_ids(cx, &final_candidate_ids)
+                    .and(phase3)
+            };
             match phase3 {
                 Ok(Some(outcome)) => {
                     let phase3_latency = phase3_start.elapsed();
@@ -2415,6 +2444,21 @@ impl TwoTierSearcher {
                 Err(err) => {
                     self.export_error(&err);
                     tracing::warn!(error_code = err.diagnostic_code(), "reranking phase failed");
+                    if matches!(&err, SearchError::InvalidConfig { field, .. }
+                        if field == "search.filter")
+                    {
+                        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                            self.emit_session_stop_telemetry(
+                                root_request_id,
+                                telemetry_last_event_id.clone(),
+                                LifecycleState::Degraded,
+                                LifecycleSeverity::Warn,
+                                Some("filter_eligibility_changed".to_owned()),
+                                search_started_at.elapsed(),
+                            );
+                        }
+                        return Err(err);
+                    }
                     // Keep the preceding valid phase. A final-ranking failure
                     // is not a second quality-refinement outcome.
                 }
@@ -22010,6 +22054,300 @@ mod tests {
             assert_eq!(submitted.len(), 1);
             assert_eq!(submitted[0].len(), 3);
             assert!(submitted[0].iter().all(|id| id != "doc-a"));
+        });
+    }
+
+    #[test]
+    fn async_filter_revalidates_retained_candidates_before_final_ranking() {
+        use std::sync::atomic::AtomicBool;
+
+        for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fast_rows: &[(&str, &[f32])] = &[
+                    ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                    ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ];
+                let quality_rows: &[(&str, &[f32])] = &[
+                    ("doc-a", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                    ("doc-b", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                ];
+                let (_dir, index) =
+                    query_admission_index_with_rows(layout, fast_rows, quality_rows);
+                for mode in ["fast", "progressive", "quality"] {
+                    for target in ["doc-a", "doc-b"] {
+                        let revoked = AtomicBool::new(false);
+                        let filter =
+                            AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                                id != target || !revoked.load(Ordering::SeqCst)
+                            });
+                        let mut searcher = TwoTierSearcher::new(
+                            index.clone(),
+                            Arc::new(query_admission_embedder("fast")),
+                            TwoTierConfig {
+                                candidate_multiplier: 1,
+                                ..TwoTierConfig::default()
+                            },
+                        )
+                        .with_mmr_config(MmrConfig {
+                            enabled: true,
+                            candidate_pool: 2,
+                            ..MmrConfig::default()
+                        });
+                        if mode != "fast" {
+                            searcher = searcher.with_quality_embedder(Arc::new(
+                                query_admission_embedder("quality"),
+                            ));
+                        }
+                        #[cfg(feature = "rerank")]
+                        let reranker = Arc::new(WindowReranker::default());
+                        #[cfg(feature = "rerank")]
+                        {
+                            searcher = searcher
+                                .with_reranker(reranker.clone())
+                                .with_rerank_window(2)
+                                .unwrap();
+                        }
+                        let text_calls = AtomicU64::new(0);
+                        let mut phases = Vec::new();
+                        let error = searcher
+                            .search_with_mode(
+                                &cx,
+                                "find relevant documents",
+                                1,
+                                |_| {
+                                    text_calls.fetch_add(1, Ordering::SeqCst);
+                                    Some("document text".to_owned())
+                                },
+                                |phase| match phase {
+                                    SearchPhase::Initial { results, .. } => {
+                                        assert_eq!(results.len(), 1);
+                                        assert_eq!(results[0].doc_id, "doc-a");
+                                        phases.push("initial");
+                                        if mode != "progressive" {
+                                            revoked.store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                    SearchPhase::Refined { results, .. } => {
+                                        assert_eq!(mode, "progressive");
+                                        assert_eq!(results.len(), 1);
+                                        assert_eq!(results[0].doc_id, "doc-a");
+                                        phases.push("refined");
+                                        revoked.store(true, Ordering::SeqCst);
+                                    }
+                                    other => {
+                                        panic!("revoked candidates cannot be ranked: {other:?}");
+                                    }
+                                },
+                                if mode == "quality" {
+                                    SearchExecutionMode::QualityOnly
+                                } else {
+                                    SearchExecutionMode::Progressive
+                                },
+                                Some(&filter),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(
+                            error,
+                            SearchError::InvalidConfig { field, value, .. }
+                                if field == "search.filter" && value == "eligibility_changed"
+                        ));
+                        assert_eq!(
+                            phases,
+                            if mode == "progressive" {
+                                vec!["initial", "refined"]
+                            } else {
+                                vec!["initial"]
+                            },
+                            "{layout}/{mode}/{target}"
+                        );
+                        assert_eq!(text_calls.load(Ordering::SeqCst), 0);
+                        #[cfg(feature = "rerank")]
+                        assert!(reranker.submitted.lock().unwrap().is_empty());
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn async_filter_final_ranker_revalidates_success_skip_failure_and_cancellation() {
+        use std::sync::atomic::AtomicBool;
+
+        struct PolicyChangingReranker {
+            revoked: Arc<AtomicBool>,
+            change_policy: bool,
+            reply: &'static str,
+            calls: AtomicU64,
+        }
+
+        impl Reranker for PolicyChangingReranker {
+            fn rerank<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _query: &'a str,
+                docs: &'a [frankensearch_core::RerankDocument],
+            ) -> SearchFuture<'a, Vec<frankensearch_core::RerankScore>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.revoked.store(self.change_policy, Ordering::SeqCst);
+                    if self.reply == "cancelled" {
+                        return Err(SearchError::Cancelled {
+                            phase: "fixture.reranker".to_owned(),
+                            reason: "provider cancelled".to_owned(),
+                        });
+                    }
+                    if self.reply == "failed" {
+                        return Err(SearchError::RerankFailed {
+                            model: self.id().to_owned(),
+                            source: "fixture ranking failure".into(),
+                        });
+                    }
+                    Ok(docs
+                        .iter()
+                        .enumerate()
+                        .map(|(original_rank, doc)| frankensearch_core::RerankScore {
+                            doc_id: if self.reply == "malformed" {
+                                "foreign-document".to_owned()
+                            } else {
+                                doc.doc_id.clone()
+                            },
+                            score: if original_rank == 1 { 1.0 } else { 0.1 },
+                            original_rank,
+                            raw_logit: None,
+                        })
+                        .collect())
+                })
+            }
+
+            fn id(&self) -> &str {
+                "policy-changing-reranker"
+            }
+
+            fn model_name(&self) -> &str {
+                self.id()
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = build_promotion_index();
+            for reply in ["success", "failed", "malformed", "cancelled", "no-text", "late"] {
+                for change_policy in [false, true] {
+                    // doc-d is outside both the displayed prefix and the
+                    // cross-encoder window, but remains in the MMR pool.
+                    for target in ["doc-a", "doc-d"] {
+                        let revoked = Arc::new(AtomicBool::new(false));
+                        let late_revoked = AtomicBool::new(false);
+                        let filter =
+                            AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                                if reply == "late" {
+                                    // The middle check admits doc-a before doc-d
+                                    // revokes it. MMR then drops doc-a, so only
+                                    // checking displayed output would miss it.
+                                    if id == "doc-d" && revoked.load(Ordering::SeqCst) {
+                                        late_revoked.store(true, Ordering::SeqCst);
+                                    }
+                                    id != target || !late_revoked.load(Ordering::SeqCst)
+                                } else {
+                                    id != target || !revoked.load(Ordering::SeqCst)
+                                }
+                            });
+                        let reranker = Arc::new(PolicyChangingReranker {
+                            revoked: revoked.clone(),
+                            change_policy,
+                            reply,
+                            calls: AtomicU64::new(0),
+                        });
+                        let searcher = TwoTierSearcher::new(
+                            index.clone(),
+                            Arc::new(StubEmbedder::new("fast", 4)),
+                            TwoTierConfig {
+                                candidate_multiplier: 1,
+                                ..TwoTierConfig::default()
+                            },
+                        )
+                        .with_reranker(reranker.clone())
+                        .with_rerank_window(2)
+                        .unwrap()
+                        .with_mmr_config(MmrConfig {
+                            enabled: true,
+                            candidate_pool: 4,
+                            ..MmrConfig::default()
+                        });
+                        let text = |_: &str| {
+                            if reply == "no-text" {
+                                revoked.store(change_policy, Ordering::SeqCst);
+                                None
+                            } else {
+                                Some("document text".to_owned())
+                            }
+                        };
+                        let mut phases = Vec::new();
+                        let result = searcher
+                            .search_with_filter(
+                                &cx,
+                                "find relevant documents",
+                                1,
+                                Some(&filter),
+                                text,
+                                |phase| match phase {
+                                    SearchPhase::Initial { .. } => phases.push("initial"),
+                                    SearchPhase::Reranked { .. } => phases.push("reranked"),
+                                    other => panic!("unexpected phase: {other:?}"),
+                                },
+                            )
+                            .await;
+                        assert_eq!(
+                            reranker.calls.load(Ordering::SeqCst),
+                            u64::from(reply != "no-text")
+                        );
+                        if reply == "cancelled" {
+                            assert!(matches!(
+                                result,
+                                Err(SearchError::Cancelled { phase, .. })
+                                    if phase == "fixture.reranker"
+                            ));
+                            assert_eq!(phases, ["initial"]);
+                        } else if change_policy {
+                            assert!(matches!(
+                                result,
+                                Err(SearchError::InvalidConfig { field, value, .. })
+                                    if field == "search.filter" && value == "eligibility_changed"
+                            ));
+                            assert_eq!(phases, ["initial"]);
+                        } else {
+                            result.unwrap();
+                            assert_eq!(phases, ["initial", "reranked"]);
+                        }
+
+                        // Collectors must propagate the terminal refusal instead
+                        // of returning the previously accepted Initial phase.
+                        revoked.store(false, Ordering::SeqCst);
+                        late_revoked.store(false, Ordering::SeqCst);
+                        let collected = searcher
+                            .search_collect_with_text_and_filter(
+                                &cx,
+                                "find relevant documents",
+                                1,
+                                Some(&filter),
+                                text,
+                            )
+                            .await;
+                        if reply == "cancelled" {
+                            assert!(matches!(collected, Err(SearchError::Cancelled { .. })));
+                        } else if change_policy {
+                            assert!(matches!(
+                                collected,
+                                Err(SearchError::InvalidConfig { field, .. })
+                                    if field == "search.filter"
+                            ));
+                        } else {
+                            assert_eq!(collected.unwrap().0.len(), 1);
+                        }
+                    }
+                }
+            }
         });
     }
 

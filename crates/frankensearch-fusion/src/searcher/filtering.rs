@@ -126,6 +126,26 @@ impl<'a> RequestFilter<'a> {
         Ok(true)
     }
 
+    /// A final ranker may await user code or consume candidates that were not
+    /// displayed in the preceding phase. Recheck every retained identity using
+    /// the request's pinned metadata before work and before publication/fallback.
+    pub(super) fn validate_retained_ids(&self, cx: &Cx, ids: &[DocId]) -> SearchResult<()> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        for id in ids {
+            if !self.includes(cx, id)? {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.filter".to_owned(),
+                    value: "eligibility_changed".to_owned(),
+                    reason: "document eligibility changed before final ranking completed"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn attach_metadata(&self, results: &mut [ScoredResult]) {
         if self.is_active() {
             for result in results {
