@@ -352,13 +352,10 @@ fn finish_rerank(
         response => response,
     };
     rerank_admission_checkpoint(cx, "reranker_to_score_validation", admission)?;
-    let scores = match response {
-        Ok(scores) => scores,
-        Err(_) => {
-            // Provider errors may contain document text or arbitrary formatters.
-            tracing::warn!("reranker failed — keeping original scores");
-            return Ok(None);
-        }
+    let Ok(scores) = response else {
+        // Provider errors may contain document text or arbitrary formatters.
+        tracing::warn!("reranker failed — keeping original scores");
+        return Ok(None);
     };
     if let Err(error) = RerankScore::validate_response(cx, &prepared.documents, &scores) {
         if matches!(error, SearchError::Cancelled { .. }) {
