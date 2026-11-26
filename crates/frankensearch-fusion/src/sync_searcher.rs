@@ -42,6 +42,53 @@ use crate::rrf::{
 };
 use crate::searcher::promoted_quality_source;
 
+#[cfg(feature = "rerank")]
+use frankensearch_core::traits::SyncRerank;
+
+#[derive(Clone, Copy)]
+struct SyncSearchContext<'a> {
+    filter: Option<&'a dyn SearchFilter>,
+    cx: Option<&'a asupersync::Cx>,
+    rerank_window: Option<usize>,
+    #[cfg(feature = "rerank")]
+    rerank: Option<SyncRerankInput<'a>>,
+}
+
+#[cfg(feature = "rerank")]
+#[derive(Clone, Copy)]
+struct SyncRerankInput<'a> {
+    text: &'a str,
+    text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+}
+
+impl<'a> SyncSearchContext<'a> {
+    const fn new(filter: Option<&'a dyn SearchFilter>) -> Self {
+        Self {
+            filter,
+            cx: None,
+            rerank_window: None,
+            #[cfg(feature = "rerank")]
+            rerank: None,
+        }
+    }
+
+    fn checkpoint(self, phase: &str) -> SearchResult<()> {
+        if let Some(cx) = self.cx {
+            let checkpoint = cx.checkpoint();
+            if checkpoint.is_err() || cx.is_cancel_requested() {
+                return Err(SearchError::Cancelled {
+                    phase: phase.to_owned(),
+                    reason: cx.cancel_reason().map_or_else(
+                        || "synchronous search cancelled".to_owned(),
+                        |reason| reason.to_string(),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The per-tier query embeddings this search is authorized to read with
 /// (bd-sync-searcher-tiered-query-embeddings-dbp10).
 ///
@@ -416,6 +463,12 @@ pub struct SyncTwoTierSearcher {
     /// `&self`.
     nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
     mmr_config: MmrConfig,
+    #[cfg(feature = "rerank")]
+    reranker: Option<Arc<dyn SyncRerank>>,
+    #[cfg(feature = "rerank")]
+    rerank_window: usize,
+    #[cfg(feature = "rerank")]
+    rerank_combine: frankensearch_rerank::RerankCombine,
 }
 
 impl SyncTwoTierSearcher {
@@ -443,6 +496,12 @@ impl SyncTwoTierSearcher {
             nqc_dense_weight: NqcDenseWeight::new(),
             nqc_adaptive: Some(Mutex::new(AdaptiveNqcDenseWeight::production_default())),
             mmr_config: MmrConfig::default(),
+            #[cfg(feature = "rerank")]
+            reranker: None,
+            #[cfg(feature = "rerank")]
+            rerank_window: 100,
+            #[cfg(feature = "rerank")]
+            rerank_combine: frankensearch_rerank::RerankCombine::default(),
         }
     }
 
@@ -477,6 +536,55 @@ impl SyncTwoTierSearcher {
         self
     }
 
+    /// Attach a cross-encoder for the text-aware synchronous entry points.
+    ///
+    /// Inference runs inline on the caller's thread only when final ranking is
+    /// requested. Existing entry points without text keep their retrieval
+    /// budget and never invoke this model.
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn SyncRerank>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    /// Set the cross-encoder candidate window, including hidden candidates.
+    ///
+    /// The default is 100. The text-aware search retains at least this many
+    /// eligible candidates, subject to corpus size, and returns only the
+    /// requested page after final ranking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error unless the window is in 1..=1000.
+    #[cfg(feature = "rerank")]
+    pub fn with_rerank_window(mut self, window: usize) -> SearchResult<Self> {
+        if !(1..=1_000).contains(&window) {
+            return Err(SearchError::InvalidConfig {
+                field: "rerank.window".to_owned(),
+                value: window.to_string(),
+                reason: "rerank window must be between 1 and 1000".to_owned(),
+            });
+        }
+        self.rerank_window = window;
+        Ok(self)
+    }
+
+    /// Choose how cross-encoder scores combine with retrieval order.
+    ///
+    /// Defaults to pure cross-encoder ordering. Reciprocal-rank combination
+    /// preserves both signals and shares the asynchronous pipeline's complete
+    /// response admission and deterministic tie handling.
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub const fn with_rerank_combine(
+        mut self,
+        combine: frankensearch_rerank::RerankCombine,
+    ) -> Self {
+        self.rerank_combine = combine;
+        self
+    }
+
     /// Override exact-scan parallelism for fast and quality retrieval, including
     /// progressive refinement, filtered refills, and missing candidate evidence.
     #[must_use]
@@ -504,15 +612,17 @@ impl SyncTwoTierSearcher {
         self
     }
 
-    fn final_ranking_enabled(&self) -> bool {
-        self.mmr_config.enabled && self.mmr_config.candidate_pool > 1
+    fn final_ranking_enabled(&self, context: SyncSearchContext<'_>) -> bool {
+        context.rerank_window.is_some()
+            || (self.mmr_config.enabled && self.mmr_config.candidate_pool > 1)
     }
 
-    fn final_candidate_target(&self, k: usize) -> usize {
-        if self.final_ranking_enabled() {
-            k.max(self.mmr_config.candidate_pool)
+    fn final_candidate_target(&self, k: usize, context: SyncSearchContext<'_>) -> usize {
+        let target = k.max(context.rerank_window.unwrap_or(k));
+        if self.mmr_config.enabled && self.mmr_config.candidate_pool > 1 {
+            target.max(self.mmr_config.candidate_pool)
         } else {
-            k
+            target
         }
     }
 
@@ -521,8 +631,12 @@ impl SyncTwoTierSearcher {
         results: &mut Vec<ScoredResult>,
         k: usize,
         space: SyncMmrSpace,
+        context: SyncSearchContext<'_>,
     ) -> Option<SyncFinalRanking> {
-        if !self.final_ranking_enabled() || results.len() < 2 {
+        if !self.final_ranking_enabled(context)
+            || results.is_empty()
+            || (context.rerank_window.is_none() && results.len() < 2)
+        {
             return None;
         }
         let candidates = std::mem::take(results);
@@ -769,17 +883,95 @@ impl SyncTwoTierSearcher {
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
-        // `search_collect` discards phase payloads, so skip building them — that
-        // avoids cloning the full `Vec<ScoredResult>` (N owned doc_ids each) once
-        // per phase (Initial + Refined), pure waste at large `k` (limit_all).
-        let prepared = self.search_initial(query, k, filter, false)?;
+        self.search_collect_in_context(query, k, SyncSearchContext::new(filter))
+    }
+
+    /// Search and apply an optional synchronous cross-encoder to document text.
+    ///
+    /// The original text is used only by the cross-encoder; retrieval still
+    /// admits each precomputed query embedding against its retained tier.
+    /// Inference runs on the caller's thread without an async executor. The
+    /// caller's context checks cancellation at phase and inference boundaries;
+    /// it cannot preempt an already-running synchronous model.
+    ///
+    /// # Errors
+    ///
+    /// Returns the admission and retrieval errors of [`Self::search_collect`],
+    /// plus typed cancellation. Missing document text, ordinary provider
+    /// failures and malformed responses preserve the preceding eligible order.
+    #[cfg(feature = "rerank")]
+    pub fn search_collect_with_text(
+        &self,
+        cx: &asupersync::Cx,
+        text: &str,
+        query: &TieredQueryEmbeddings,
+        k: usize,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
+        self.search_collect_with_text_and_filter(cx, text, query, k, text_fn, None)
+    }
+
+    /// Search with text-aware final ranking and an optional document filter.
+    ///
+    /// Pinned metadata and filter admission match
+    /// [`Self::search_collect_with_filter`]. Every retained candidate, including
+    /// hidden candidates, is rechecked around text callbacks, model inference
+    /// and final publication. Revocation refuses the whole final stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::search_collect_with_text`], plus a typed
+    /// invalid `search.filter` configuration when retained eligibility changes.
+    #[cfg(feature = "rerank")]
+    pub fn search_collect_with_text_and_filter(
+        &self,
+        cx: &asupersync::Cx,
+        text: &str,
+        query: &TieredQueryEmbeddings,
+        k: usize,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
+        self.search_collect_in_context(query, k, self.text_context(cx, text, text_fn, filter))
+    }
+
+    #[cfg(feature = "rerank")]
+    fn text_context<'a>(
+        &self,
+        cx: &'a asupersync::Cx,
+        text: &'a str,
+        text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+        filter: Option<&'a dyn SearchFilter>,
+    ) -> SyncSearchContext<'a> {
+        SyncSearchContext {
+            filter,
+            cx: Some(cx),
+            rerank_window: self.reranker.as_ref().map(|_| self.rerank_window),
+            rerank: Some(SyncRerankInput { text, text_fn }),
+        }
+    }
+
+    fn search_collect_in_context(
+        &self,
+        query: &TieredQueryEmbeddings,
+        k: usize,
+        context: SyncSearchContext<'_>,
+    ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
+        // Collected searches do not clone intermediate phase payloads.
+        context.checkpoint("sync_search.initial")?;
+        let prepared = self.search_initial(query, k, context, false);
+        context.checkpoint("sync_search.initial")?;
+        let prepared = prepared?;
         let outcome = if let Some(refinement) = prepared.refinement {
-            self.search_refined(prepared.initial, refinement, filter, false)
-                .map_err(|failure| failure.error)?
+            let refined = self.search_refined(prepared.initial, refinement, context, false);
+            context.checkpoint("sync_search.refinement")?;
+            refined.map_err(|failure| failure.error)?
         } else {
             prepared.initial
         };
-        let outcome = self.search_final(outcome, filter, false)?;
+        let outcome = self.search_final(outcome, context, false);
+        context.checkpoint("sync_search.final")?;
+        let outcome = outcome?;
         Ok((outcome.final_results, outcome.metrics))
     }
 
@@ -826,7 +1018,49 @@ impl SyncTwoTierSearcher {
     ) -> SyncSearchIterator<'a> {
         SyncSearchIterator {
             searcher: self,
-            filter,
+            context: SyncSearchContext::new(filter),
+            state: SyncIteratorState::Initial { query, k },
+        }
+    }
+
+    /// Lazily search and rerank using the original query and document text.
+    ///
+    /// Text lookup and cross-encoder inference occur only when the caller
+    /// advances beyond the last retrieval phase. Dropping the iterator before
+    /// final ranking performs neither operation. The borrowed context supplies
+    /// cancellation checks without requiring an async executor.
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub fn search_iter_with_text<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
+        text: &'a str,
+        query: &'a TieredQueryEmbeddings,
+        k: usize,
+        text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> SyncSearchIterator<'a> {
+        self.search_iter_with_text_and_filter(cx, text, query, k, text_fn, None)
+    }
+
+    /// Lazily search with text-aware final ranking and pinned filter admission.
+    ///
+    /// A revoked retained candidate yields an empty terminal
+    /// `RefinementFailed`, including revocation by a text callback before the
+    /// document can reach inference. All work runs on the calling thread.
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub fn search_iter_with_text_and_filter<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
+        text: &'a str,
+        query: &'a TieredQueryEmbeddings,
+        k: usize,
+        text_fn: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+        filter: Option<&'a dyn SearchFilter>,
+    ) -> SyncSearchIterator<'a> {
+        SyncSearchIterator {
+            searcher: self,
+            context: self.text_context(cx, text, text_fn, filter),
             state: SyncIteratorState::Initial { query, k },
         }
     }
@@ -927,9 +1161,10 @@ impl SyncTwoTierSearcher {
         &self,
         query: &'query TieredQueryEmbeddings,
         k: usize,
-        filter: Option<&dyn SearchFilter>,
+        context: SyncSearchContext<'_>,
         want_phase: bool,
     ) -> SearchResult<SyncPreparedSearch<'query>> {
+        let filter = context.filter;
         // Identity first, before k == 0, before the zero-norm check, and
         // before any index is touched.
         let admitted = self.admit(query)?;
@@ -947,7 +1182,7 @@ impl SyncTwoTierSearcher {
                 hash_control,
             } => (fast, quality, hash_control),
             AdmittedSyncQuery::QualityOnly { quality } => {
-                return self.search_quality_only(quality, k, filter, want_phase);
+                return self.search_quality_only(quality, k, context, want_phase);
             }
         };
         let query_vec = fast_query.vector();
@@ -967,7 +1202,7 @@ impl SyncTwoTierSearcher {
                 refinement: None,
             });
         }
-        let target = self.final_candidate_target(k);
+        let target = self.final_candidate_target(k, context);
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
 
         let phase1_started = Instant::now();
@@ -1088,7 +1323,7 @@ impl SyncTwoTierSearcher {
         metrics.fast_embed_ms = 0.0;
 
         let final_ranking =
-            self.retain_final_candidates(&mut initial_results, k, SyncMmrSpace::Fast);
+            self.retain_final_candidates(&mut initial_results, k, SyncMmrSpace::Fast, context);
 
         let phase = want_phase.then(|| SearchPhase::Initial {
             results: initial_results.clone(),
@@ -1162,9 +1397,10 @@ impl SyncTwoTierSearcher {
         &self,
         query: &'query BoundQueryEmbedding,
         k: usize,
-        filter: Option<&dyn SearchFilter>,
+        context: SyncSearchContext<'_>,
         want_phase: bool,
     ) -> SearchResult<SyncPreparedSearch<'query>> {
+        let filter = context.filter;
         // Admission has already joined this query to the quality producer.
         // Nothing here consults fast identity, vectors, ordinals or ranking.
         let index = self
@@ -1189,7 +1425,7 @@ impl SyncTwoTierSearcher {
             });
         }
         let started = Instant::now();
-        let target = self.final_candidate_target(k);
+        let target = self.final_candidate_target(k, context);
         let fetch = candidate_count(target, 0, self.config.candidate_multiplier.max(1)).max(target);
         let mut lexical_context = SyncLexicalContext::new(self.lexical.clone(), filter.is_some())?;
         let lexical_started = Instant::now();
@@ -1252,7 +1488,7 @@ impl SyncTwoTierSearcher {
         let latency = started.elapsed();
         metrics.phase1_total_ms = ms(latency);
         let final_ranking =
-            self.retain_final_candidates(&mut results, k, SyncMmrSpace::QualityOnly);
+            self.retain_final_candidates(&mut results, k, SyncMmrSpace::QualityOnly, context);
         let phase = want_phase.then(|| SearchPhase::Initial {
             results: results.clone(),
             latency,
@@ -1364,9 +1600,10 @@ impl SyncTwoTierSearcher {
         &self,
         initial: SyncSearchOutcome,
         refinement: SyncRefinement<'_>,
-        filter: Option<&dyn SearchFilter>,
+        context: SyncSearchContext<'_>,
         want_phase: bool,
     ) -> Result<SyncSearchOutcome, Box<SyncRefinementFailure>> {
+        let filter = context.filter;
         let SyncSearchOutcome {
             final_results: initial_results,
             mut metrics,
@@ -1639,7 +1876,7 @@ impl SyncTwoTierSearcher {
         // promoted / demoted counts whenever `k < fetch` (bd-k3089).
         let rank_changes = compute_rank_changes(&fast_hits, &blended);
 
-        let target = self.final_candidate_target(k);
+        let target = self.final_candidate_target(k, context);
         let mut fusion_components = Vec::new();
         let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             let rrf_config = RrfConfig {
@@ -1755,8 +1992,12 @@ impl SyncTwoTierSearcher {
         metrics.rank_changes = rank_changes.clone();
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
-        let final_ranking =
-            self.retain_final_candidates(&mut refined_results, k, SyncMmrSpace::PreferQuality);
+        let final_ranking = self.retain_final_candidates(
+            &mut refined_results,
+            k,
+            SyncMmrSpace::PreferQuality,
+            context,
+        );
 
         let phase = want_phase.then(|| SearchPhase::Refined {
             results: refined_results.clone(),
@@ -1800,63 +2041,74 @@ impl SyncTwoTierSearcher {
     fn search_final(
         &self,
         outcome: SyncSearchOutcome,
-        filter: Option<&dyn SearchFilter>,
+        context: SyncSearchContext<'_>,
         want_phase: bool,
     ) -> SearchResult<SyncSearchOutcome> {
-        let Some(filter) = filter.filter(|_| outcome.final_ranking.is_some()) else {
-            return Ok(self.rank_final_candidates(outcome, want_phase));
-        };
-        let candidates = outcome
-            .final_ranking
-            .as_ref()
-            .map_or(outcome.final_results.as_slice(), |ranking| {
-                ranking.candidates.as_slice()
+        // Keep only identities and pinned observations. Text and inference
+        // callbacks may change policy while this final stage is running.
+        let retained: Option<SyncMetadata> = context
+            .filter
+            .and_then(|_| outcome.final_ranking.as_ref())
+            .map(|ranking| {
+                ranking
+                    .candidates
+                    .iter()
+                    .map(|hit| (hit.doc_id.clone(), hit.metadata.clone()))
+                    .collect()
             });
         let refusal = || SearchError::InvalidConfig {
             field: "search.filter".to_owned(),
             value: "eligibility_changed".to_owned(),
             reason: "document eligibility changed before final ranking completed".to_owned(),
         };
-        if candidates
-            .iter()
-            .any(|hit| !filter.matches(&hit.doc_id, hit.metadata.as_deref()))
-        {
-            return Err(refusal());
+        let admission = || {
+            context.checkpoint("sync_search.final_admission")?;
+            let eligible = match (context.filter, retained.as_ref()) {
+                (Some(filter), Some(retained)) => retained
+                    .iter()
+                    .all(|(id, metadata)| filter.matches(id, metadata.as_deref())),
+                _ => true,
+            };
+            context.checkpoint("sync_search.final_admission")?;
+            if eligible { Ok(()) } else { Err(refusal()) }
+        };
+        admission()?;
+        let ranked = self.rank_final_candidates(outcome, context, want_phase, &admission);
+        // A provider's typed cancellation is terminal even if it also revoked
+        // eligibility. Ordinary failures still require an eligible fallback.
+        if matches!(&ranked, Err(SearchError::Cancelled { .. })) {
+            return ranked;
         }
-        // The caller can change policy between iterator phases. Retain only
-        // identities and pinned metadata so both successful ranking and its
-        // fallback are checked without cloning vectors or complete results.
-        let retained: SyncMetadata = candidates
-            .iter()
-            .map(|hit| (hit.doc_id.clone(), hit.metadata.clone()))
-            .collect();
-        let outcome = self.rank_final_candidates(outcome, want_phase);
-        if retained
-            .iter()
-            .any(|(id, metadata)| !filter.matches(id, metadata.as_deref()))
-            || outcome.final_results.iter().any(|hit| {
-                !filter.matches(
+        admission()?;
+        let ranked = ranked?;
+        if let (Some(filter), Some(retained)) = (context.filter, retained.as_ref()) {
+            let eligible = ranked.final_results.iter().all(|hit| {
+                filter.matches(
                     &hit.doc_id,
                     retained
                         .get(&hit.doc_id)
-                        .and_then(Option::as_deref)
-                        .or(hit.metadata.as_deref()),
+                        .map_or(hit.metadata.as_deref(), Option::as_deref),
                 )
-            })
-        {
-            return Err(refusal());
+            });
+            context.checkpoint("sync_search.final_publish")?;
+            if !eligible {
+                return Err(refusal());
+            }
         }
-        Ok(outcome)
+        Ok(ranked)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn rank_final_candidates(
         &self,
         mut outcome: SyncSearchOutcome,
+        context: SyncSearchContext<'_>,
         want_phase: bool,
-    ) -> SyncSearchOutcome {
+        admission: &(dyn Fn() -> SearchResult<()> + Send + Sync),
+    ) -> SearchResult<SyncSearchOutcome> {
         outcome.phase = None;
         let Some(ranking) = outcome.final_ranking.take() else {
-            return outcome;
+            return Ok(outcome);
         };
         let started = Instant::now();
         let SyncFinalRanking {
@@ -1864,45 +2116,88 @@ impl SyncTwoTierSearcher {
             k,
             space,
         } = ranking;
-        let pool = candidates.len().min(self.mmr_config.candidate_pool);
-        let embeddings = match self.mmr_embeddings(&candidates[..pool], space) {
-            Ok(Some(embeddings)) => embeddings,
-            Ok(None) => return outcome,
-            Err(error) => {
-                outcome.metrics.rerank_ms = ms(started.elapsed());
-                tracing::warn!(
-                    error_code = error.diagnostic_code(),
-                    "synchronous diversity ranking failed"
-                );
-                // Preserve the last valid phase. A final ranking failure is
-                // not another quality-refinement outcome.
-                return outcome;
+        let mut ranker_id = None;
+        #[cfg(feature = "rerank")]
+        if let (Some(reranker), Some(input), Some(cx), Some(window)) = (
+            self.reranker.as_deref(),
+            context.rerank,
+            context.cx,
+            context.rerank_window,
+        ) {
+            ranker_id =
+                frankensearch_rerank::pipeline::rerank_step_sync_with_combine_and_admission(
+                    cx,
+                    reranker,
+                    input.text,
+                    &mut candidates,
+                    input.text_fn,
+                    window,
+                    1,
+                    self.rerank_combine,
+                    admission,
+                )?;
+            outcome.metrics.rerank_ms = ms(started.elapsed());
+        }
+        // This also protects the MMR-only route and refuses an invalid fallback
+        // after a skipped cross-encoder response.
+        admission()?;
+
+        if self.mmr_config.enabled && self.mmr_config.candidate_pool > 1 && candidates.len() > 1 {
+            let pool = candidates.len().min(self.mmr_config.candidate_pool);
+            let embeddings = match self.mmr_embeddings(&candidates[..pool], space) {
+                Ok(embeddings) => embeddings,
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                Err(error) => {
+                    outcome.metrics.rerank_ms = ms(started.elapsed());
+                    tracing::warn!(
+                        error_code = error.diagnostic_code(),
+                        "synchronous diversity ranking failed"
+                    );
+                    None
+                }
+            };
+            context.checkpoint("sync_search.mmr")?;
+            if let Some(embeddings) = embeddings {
+                let scores = candidates[..pool]
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, result)| {
+                        if ranker_id.is_some() {
+                            // Preserve the admitted combination order. Retrieval
+                            // scores undo promotions; raw model scores undo RRF.
+                            f64::from(u32::try_from(pool - rank).unwrap_or(u32::MAX))
+                        } else {
+                            f64::from(result.score)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let refs = embeddings.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let selected = k.min(pool);
+                let order = mmr_rerank(&scores, &refs, selected, &self.mmr_config);
+                if order.len() == selected {
+                    // Only the bounded prefix participates in diversity.
+                    let tail = candidates.split_off(pool);
+                    let mut slots = candidates.into_iter().map(Some).collect::<Vec<_>>();
+                    let mut results = Vec::with_capacity(k.min(selected + tail.len()));
+                    for index in order {
+                        if let Some(result) = slots.get_mut(index).and_then(Option::take) {
+                            results.push(result);
+                        }
+                    }
+                    results.extend(tail.into_iter().take(k.saturating_sub(selected)));
+                    candidates = results;
+                    ranker_id.get_or_insert_with(|| "mmr".to_owned());
+                }
             }
-        };
-        let scores = candidates[..pool]
-            .iter()
-            .map(|result| f64::from(result.score))
-            .collect::<Vec<_>>();
-        let refs = embeddings.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let selected = k.min(pool);
-        let order = mmr_rerank(&scores, &refs, selected, &self.mmr_config);
-        if order.len() != selected {
-            return outcome;
         }
 
-        // Only the bounded prefix participates in diversity. Preserve the
-        // relevance-ranked tail when the caller requests more than that pool.
-        let tail = candidates.split_off(pool);
-        let mut slots = candidates.into_iter().map(Some).collect::<Vec<_>>();
-        let mut results = Vec::with_capacity(k.min(selected + tail.len()));
-        for index in order {
-            if let Some(result) = slots.get_mut(index).and_then(Option::take) {
-                results.push(result);
-            }
-        }
-        results.extend(tail.into_iter().take(k.saturating_sub(selected)));
+        admission()?;
+        let Some(ranker_id) = ranker_id else {
+            return Ok(outcome);
+        };
+        candidates.truncate(k);
         if self.config.explain {
-            for (rank, result) in results.iter_mut().enumerate() {
+            for (rank, result) in candidates.iter_mut().enumerate() {
                 if let Some(explanation) = &mut result.explanation
                     && let Some(movement) = &mut explanation.rank_movement
                 {
@@ -1928,23 +2223,23 @@ impl SyncTwoTierSearcher {
         let latency = started.elapsed();
         outcome.metrics.rerank_ms = ms(latency);
         outcome.phase = want_phase.then(|| SearchPhase::Reranked {
-            results: results.clone(),
+            results: candidates.clone(),
             latency,
             metrics: PhaseMetrics {
-                embedder_id: "mmr".to_owned(),
+                embedder_id: ranker_id,
                 vectors_searched: if matches!(space, SyncMmrSpace::PreferQuality) {
                     outcome.metrics.phase2_vectors_searched
                 } else {
                     outcome.metrics.phase1_vectors_searched
                 },
                 lexical_candidates: outcome.metrics.lexical_candidates,
-                fused_count: results.len(),
+                fused_count: candidates.len(),
                 skip_reason: outcome.metrics.skip_reason.clone(),
                 hash_control_candidates: outcome.metrics.hash_control_candidates,
             },
         });
-        outcome.final_results = results;
-        outcome
+        outcome.final_results = candidates;
+        Ok(outcome)
     }
 
     fn search_fast_hits(
@@ -2187,7 +2482,9 @@ enum SyncIteratorState<'query> {
 /// A quality-only request directly retrieves quality on the first `next()` and
 /// yields Initial with quality provenance. No fast tier is read.
 /// With MMR enabled, one further `next()` may emit Reranked after the last
-/// successful retrieval. Dropping before that call performs no diversity work.
+/// successful retrieval. Text-aware entry points run a configured synchronous
+/// cross-encoder at that same final boundary, before optional MMR. Dropping
+/// before that call performs no document text lookup, inference or diversity work.
 /// The searcher, bound queries and filter remain borrowed until the iterator is
 /// dropped, keeping both phases on the same retained in-memory index. Filters
 /// should keep their selection policy stable across those phases.
@@ -2197,7 +2494,7 @@ enum SyncIteratorState<'query> {
 /// between phases. The iterator is exhausted after a terminal phase or refusal.
 pub struct SyncSearchIterator<'a> {
     searcher: &'a SyncTwoTierSearcher,
-    filter: Option<&'a dyn SearchFilter>,
+    context: SyncSearchContext<'a>,
     state: SyncIteratorState<'a>,
 }
 
@@ -2212,7 +2509,7 @@ impl std::fmt::Debug for SyncSearchIterator<'_> {
         formatter
             .debug_struct("SyncSearchIterator")
             .field("state", &state)
-            .field("filtered", &self.filter.is_some())
+            .field("filtered", &self.context.filter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -2221,11 +2518,22 @@ impl Iterator for SyncSearchIterator<'_> {
     type Item = SearchPhase;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if matches!(self.state, SyncIteratorState::Done) {
+            return None;
+        }
+        if let Err(error) = self.context.checkpoint("sync_search.iterator") {
+            self.state = SyncIteratorState::Done;
+            return Some(SearchPhase::RefinementFailed {
+                initial_results: Vec::new(),
+                error,
+                latency: Duration::ZERO,
+            });
+        }
         // Consume the pending state before doing work. Errors and terminal
         // phases cannot replay a retrieval on a subsequent call.
-        match std::mem::replace(&mut self.state, SyncIteratorState::Done) {
+        let phase = match std::mem::replace(&mut self.state, SyncIteratorState::Done) {
             SyncIteratorState::Initial { query, k } => {
-                match self.searcher.search_initial(query, k, self.filter, true) {
+                match self.searcher.search_initial(query, k, self.context, true) {
                     Ok(mut prepared) => {
                         let phase = prepared.initial.phase.take();
                         if let Some(refinement) = prepared.refinement {
@@ -2250,7 +2558,7 @@ impl Iterator for SyncSearchIterator<'_> {
                 match self.searcher.search_refined(
                     pending.initial,
                     pending.refinement,
-                    self.filter,
+                    self.context,
                     true,
                 ) {
                     Ok(mut outcome) => {
@@ -2269,7 +2577,7 @@ impl Iterator for SyncSearchIterator<'_> {
             }
             SyncIteratorState::Rank(pending) => {
                 let started = Instant::now();
-                match self.searcher.search_final(*pending, self.filter, true) {
+                match self.searcher.search_final(*pending, self.context, true) {
                     Ok(outcome) => outcome.phase,
                     Err(error) => Some(SearchPhase::RefinementFailed {
                         initial_results: Vec::new(),
@@ -2279,11 +2587,29 @@ impl Iterator for SyncSearchIterator<'_> {
                 }
             }
             SyncIteratorState::Done => None,
+        };
+        if matches!(
+            &phase,
+            Some(SearchPhase::RefinementFailed {
+                error: SearchError::Cancelled { .. },
+                ..
+            })
+        ) {
+            return phase;
         }
+        if let Err(error) = self.context.checkpoint("sync_search.iterator_publish") {
+            self.state = SyncIteratorState::Done;
+            return Some(SearchPhase::RefinementFailed {
+                initial_results: Vec::new(),
+                error,
+                latency: Duration::ZERO,
+            });
+        }
+        phase
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let ranking = usize::from(self.searcher.final_ranking_enabled());
+        let ranking = usize::from(self.searcher.final_ranking_enabled(self.context));
         match self.state {
             SyncIteratorState::Initial { k: 0, .. } => (0, Some(1)),
             SyncIteratorState::Initial { query, .. } if query.fast().is_none() => {
@@ -8733,6 +9059,697 @@ mod tests {
                     other => panic!("unexpected phase: {other:?}"),
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    mod cross_encoder {
+        use super::*;
+        use frankensearch_core::traits::{RerankDocument, RerankScore};
+        use frankensearch_rerank::RerankCombine;
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Clone, Copy)]
+        enum Reply {
+            Valid,
+            Error,
+            Malformed,
+            Cancelled,
+        }
+
+        struct Probe {
+            reply: Reply,
+            calls: AtomicUsize,
+            inputs: Mutex<Vec<Vec<DocId>>>,
+            caller: std::thread::ThreadId,
+            on_response: Option<Arc<dyn Fn() + Send + Sync>>,
+        }
+
+        impl Probe {
+            fn new(reply: Reply) -> Self {
+                Self {
+                    reply,
+                    calls: AtomicUsize::new(0),
+                    inputs: Mutex::new(Vec::new()),
+                    caller: std::thread::current().id(),
+                    on_response: None,
+                }
+            }
+        }
+
+        impl SyncRerank for Probe {
+            fn rerank_sync(
+                &self,
+                query: &str,
+                documents: &[RerankDocument],
+            ) -> SearchResult<Vec<RerankScore>> {
+                assert_eq!(std::thread::current().id(), self.caller);
+                assert_eq!(query, "query text");
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inputs.lock().unwrap().push(
+                    documents
+                        .iter()
+                        .map(|doc| DocId::from(doc.doc_id.as_str()))
+                        .collect(),
+                );
+                for document in documents {
+                    assert_eq!(document.text, format!("text-{}", document.doc_id));
+                }
+                if let Some(on_response) = &self.on_response {
+                    on_response();
+                }
+                match self.reply {
+                    Reply::Error => {
+                        return Err(SearchError::RerankFailed {
+                            model: "sync-probe".to_owned(),
+                            source: "ordinary synchronous failure".into(),
+                        });
+                    }
+                    Reply::Cancelled => {
+                        return Err(SearchError::Cancelled {
+                            phase: "fixture.sync_reranker".to_owned(),
+                            reason: "provider stopped".to_owned(),
+                        });
+                    }
+                    Reply::Valid | Reply::Malformed => {}
+                }
+                let mut scores = documents
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, document)| RerankScore {
+                        doc_id: document.doc_id.clone(),
+                        score: match document.doc_id.as_str() {
+                            "c" => 0.9,
+                            "a" => 0.7,
+                            _ => 0.1,
+                        },
+                        original_rank,
+                        raw_logit: None,
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(self.reply, Reply::Malformed)
+                    && let Some(score) = scores.first_mut()
+                {
+                    score.doc_id = "foreign-document".to_owned();
+                }
+                scores.reverse();
+                Ok(scores)
+            }
+
+            fn id(&self) -> &'static str {
+                "sync-probe"
+            }
+
+            fn model_name(&self) -> &'static str {
+                "sync-probe"
+            }
+        }
+
+        fn fixture(
+            mode: &str,
+            attested: bool,
+        ) -> (
+            tempfile::TempDir,
+            Arc<InMemoryTwoTierIndex>,
+            TieredQueryEmbeddings,
+        ) {
+            let directory = temp_dir("sync-cross-encoder");
+            let (index, fast, quality) = sync_mmr_fixture(directory.path(), attested, true);
+            let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap();
+            let quality = BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap();
+            let query = match mode {
+                "fast" => TieredQueryEmbeddings::fast_only(fast),
+                "quality" => TieredQueryEmbeddings::quality_only(quality),
+                _ => TieredQueryEmbeddings::progressive(fast, quality),
+            };
+            (directory, index, query)
+        }
+
+        fn config() -> TwoTierConfig {
+            TwoTierConfig {
+                candidate_multiplier: 1,
+                quality_weight: 0.0,
+                explain: true,
+                ..TwoTierConfig::default()
+            }
+        }
+
+        fn configured(index: Arc<InMemoryTwoTierIndex>, probe: Arc<Probe>) -> SyncTwoTierSearcher {
+            SyncTwoTierSearcher::new(index, config())
+                .with_reranker(probe)
+                .with_rerank_window(3)
+                .unwrap()
+        }
+
+        fn retrieval(phases: &mut SyncSearchIterator<'_>, mode: &str) -> Vec<ScoredResult> {
+            let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
+                panic!("text-aware search must first publish retrieval");
+            };
+            if mode == "progressive" {
+                let Some(SearchPhase::Refined { results, .. }) = phases.next() else {
+                    panic!("quality retrieval must precede cross-encoder inference");
+                };
+                results
+            } else {
+                results
+            }
+        }
+
+        fn snapshot(results: &[ScoredResult]) -> serde_json::Value {
+            serde_json::to_value(results).unwrap()
+        }
+
+        #[test]
+        fn sync_cross_encoder_is_lazy_and_promotes_hidden_candidates_in_every_topology() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for attested in [false, true] {
+                    for mode in ["fast", "quality", "progressive"] {
+                        let (_directory, index, query) = fixture(mode, attested);
+                        let probe = Arc::new(Probe::new(Reply::Valid));
+                        let searcher = configured(index, probe.clone());
+                        let lookups = AtomicUsize::new(0);
+                        let text = |id: &str| {
+                            lookups.fetch_add(1, Ordering::Relaxed);
+                            Some(format!("text-{id}"))
+                        };
+                        drop(searcher.search_iter_with_text(&cx, "query text", &query, 1, &text));
+                        assert_eq!(lookups.load(Ordering::Relaxed), 0);
+                        let mut stopped =
+                            searcher.search_iter_with_text(&cx, "query text", &query, 1, &text);
+                        let initial = retrieval(&mut stopped, mode);
+                        assert_eq!(initial[0].doc_id, "a");
+                        assert_eq!(stopped.size_hint(), (0, Some(1)));
+                        drop(stopped);
+                        assert_eq!(lookups.load(Ordering::Relaxed), 0);
+                        assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
+
+                        let mut phases =
+                            searcher.search_iter_with_text(&cx, "query text", &query, 1, &text);
+                        assert_eq!(retrieval(&mut phases, mode)[0].doc_id, "a");
+                        let Some(SearchPhase::Reranked {
+                            results, metrics, ..
+                        }) = phases.next()
+                        else {
+                            panic!("a valid cross-encoder must publish its own final phase");
+                        };
+                        assert_eq!(results.len(), 1);
+                        assert_eq!(results[0].doc_id, "c");
+                        assert_eq!(results[0].source, ScoreSource::Reranked);
+                        assert_eq!(results[0].rerank_score, Some(0.9));
+                        assert_eq!(metrics.embedder_id, "sync-probe");
+                        assert_eq!(lookups.load(Ordering::Relaxed), 3);
+                        assert_eq!(probe.inputs.lock().unwrap()[0], ["a", "b", "c"]);
+                        assert!(phases.next().is_none());
+                        assert!(phases.next().is_none());
+
+                        let (collected, _) = searcher
+                            .search_collect_with_text(&cx, "query text", &query, 1, &text)
+                            .unwrap();
+                        assert_eq!(snapshot(&collected), snapshot(&results));
+                        assert_eq!(probe.calls.load(Ordering::Relaxed), 2);
+                        assert_eq!(lookups.load(Ordering::Relaxed), 6);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_cross_encoder_combination_order_survives_mmr() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for mode in ["fast", "quality", "progressive"] {
+                    let (_directory, index, query) = fixture(mode, true);
+                    for combine in [
+                        RerankCombine::PureReorder,
+                        RerankCombine::RrfCombine { k: 60.0 },
+                    ] {
+                        for mmr in [false, true] {
+                            let probe = Arc::new(Probe::new(Reply::Valid));
+                            let searcher = configured(Arc::clone(&index), probe)
+                                .with_rerank_combine(combine)
+                                .with_mmr_config(MmrConfig {
+                                    enabled: mmr,
+                                    lambda: 1.0,
+                                    candidate_pool: 3,
+                                });
+                            let text = |id: &str| Some(format!("text-{id}"));
+                            let (results, _) = searcher
+                                .search_collect_with_text(&cx, "query text", &query, 3, &text)
+                                .unwrap();
+                            let expected = if matches!(combine, RerankCombine::PureReorder) {
+                                ["c", "a", "b"]
+                            } else {
+                                ["a", "c", "b"]
+                            };
+                            assert_eq!(
+                                results
+                                    .iter()
+                                    .map(|hit| hit.doc_id.as_str())
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            assert!(results.iter().all(|hit| hit.rerank_score.is_some()));
+                            if mode == "progressive" {
+                                for (rank, hit) in results.iter().enumerate() {
+                                    assert_eq!(
+                                        hit.explanation
+                                            .as_ref()
+                                            .unwrap()
+                                            .rank_movement
+                                            .as_ref()
+                                            .unwrap()
+                                            .refined_rank,
+                                        rank
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_cross_encoder_skips_preserve_results_and_compact_text_can_promote() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for mode in ["fast", "quality", "progressive"] {
+                    let (_directory, index, query) = fixture(mode, true);
+                    for case in ["missing", "provider_error", "malformed", "single_text"] {
+                        let reply = match case {
+                            "provider_error" => Reply::Error,
+                            "malformed" => Reply::Malformed,
+                            _ => Reply::Valid,
+                        };
+                        let probe = Arc::new(Probe::new(reply));
+                        let searcher = configured(Arc::clone(&index), probe.clone());
+                        let text = |id: &str| {
+                            if case == "missing" || (case == "single_text" && id != "c") {
+                                None
+                            } else {
+                                Some(format!("text-{id}"))
+                            }
+                        };
+                        let mut phases =
+                            searcher.search_iter_with_text(&cx, "query text", &query, 1, &text);
+                        let previous = retrieval(&mut phases, mode);
+                        let expected = if case == "single_text" {
+                            let Some(SearchPhase::Reranked { results, .. }) = phases.next() else {
+                                panic!("one available hidden document can be reranked");
+                            };
+                            assert_eq!(results[0].doc_id, "c");
+                            assert_eq!(probe.inputs.lock().unwrap()[0], ["c"]);
+                            results
+                        } else {
+                            assert!(phases.next().is_none(), "skips do not fabricate a phase");
+                            previous
+                        };
+                        assert!(phases.next().is_none());
+                        let (collected, _) = searcher
+                            .search_collect_with_text(&cx, "query text", &query, 1, &text)
+                            .unwrap();
+                        assert_eq!(snapshot(&collected), snapshot(&expected));
+                        assert_eq!(
+                            probe.calls.load(Ordering::Relaxed),
+                            if case == "missing" { 0 } else { 2 }
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_cross_encoder_old_apis_bounds_and_admission_keep_their_contracts() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_directory, index, query) = fixture("fast", true);
+                let probe = Arc::new(Probe::new(Reply::Valid));
+                let searcher = configured(Arc::clone(&index), probe.clone());
+                let baseline = SyncTwoTierSearcher::new(Arc::clone(&index), config());
+                let (expected, _) = baseline.search_collect(&query, 1).unwrap();
+                let (old_api, metrics) = searcher.search_collect(&query, 1).unwrap();
+                assert_eq!(snapshot(&old_api), snapshot(&expected));
+                assert_eq!(metrics.rerank_ms, 0.0);
+                assert!(matches!(
+                    searcher
+                        .search_iter(&query, 1)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    [SearchPhase::Initial { .. }]
+                ));
+                assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
+                let unreachable_text = |_: &str| -> Option<String> {
+                    panic!("no model, zero k or refused identity must not request text")
+                };
+                let (without_model, _) = baseline
+                    .search_collect_with_text(&cx, "query text", &query, 1, &unreachable_text)
+                    .unwrap();
+                assert_eq!(snapshot(&without_model), snapshot(&expected));
+                let (empty, _) = searcher
+                    .search_collect_with_text(&cx, "query text", &query, 0, &unreachable_text)
+                    .unwrap();
+                assert!(empty.is_empty());
+                assert!(
+                    searcher
+                        .search_iter_with_text(&cx, "query text", &query, 0, &unreachable_text)
+                        .next()
+                        .is_none()
+                );
+                for window in [0, 1_001] {
+                    assert!(matches!(
+                        SyncTwoTierSearcher::new(Arc::clone(&index), config())
+                            .with_rerank_window(window),
+                        Err(SearchError::InvalidConfig { ref field, .. })
+                            if field == "rerank.window"
+                    ));
+                }
+                let mut foreign = query.fast().unwrap().identity().clone();
+                "foreign-producer".clone_into(&mut foreign.producer.backend);
+                let foreign = TieredQueryEmbeddings::fast_only(
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], foreign).unwrap(),
+                );
+                for k in [0, 1] {
+                    assert!(matches!(
+                        searcher.search_collect_with_text(
+                            &cx, "query text", &foreign, k, &unreachable_text,
+                        ),
+                        Err(SearchError::InvalidConfig { ref field, .. })
+                            if field == "search_activation.fast.producer_conformance"
+                    ));
+                    let mut refused = searcher.search_iter_with_text(
+                        &cx,
+                        "query text",
+                        &foreign,
+                        k,
+                        &unreachable_text,
+                    );
+                    assert!(matches!(
+                        refused.next(),
+                        Some(SearchPhase::RefinementFailed {
+                            initial_results,
+                            error: SearchError::InvalidConfig { .. },
+                            ..
+                        }) if initial_results.is_empty()
+                    ));
+                    assert!(refused.next().is_none());
+                }
+                assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
+            });
+        }
+
+        struct Policy(Arc<AtomicBool>);
+
+        impl SearchFilter for Policy {
+            fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool {
+                id != "c" || self.0.load(Ordering::Relaxed)
+            }
+
+            fn name(&self) -> &'static str {
+                "sync-cross-encoder-policy"
+            }
+        }
+
+        fn assert_terminal_error(error: &SearchError, cancelled: bool) {
+            if cancelled {
+                assert!(matches!(
+                    error,
+                    SearchError::Cancelled { phase, .. } if phase == "fixture.sync_reranker"
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "search.filter" && value == "eligibility_changed"
+                ));
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn sync_cross_encoder_rechecks_hidden_candidates_at_every_callback_boundary() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for mode in ["fast", "quality", "progressive"] {
+                    let (_directory, index, query) = fixture(mode, true);
+                    for event in [
+                        "between",
+                        "first_text",
+                        "last_text",
+                        "response",
+                        "provider_error",
+                        "malformed",
+                        "provider_cancelled",
+                    ] {
+                        for missing_text in [false, true] {
+                            if missing_text && !matches!(event, "first_text" | "last_text") {
+                                continue;
+                            }
+                            let eligible = Arc::new(AtomicBool::new(true));
+                            let filter = Policy(Arc::clone(&eligible));
+                            let reply = match event {
+                                "provider_error" => Reply::Error,
+                                "malformed" => Reply::Malformed,
+                                "provider_cancelled" => Reply::Cancelled,
+                                _ => Reply::Valid,
+                            };
+                            let mut probe = Probe::new(reply);
+                            let during_response = matches!(
+                                event,
+                                "response" | "provider_error" | "malformed" | "provider_cancelled"
+                            );
+                            if during_response {
+                                let eligible = Arc::clone(&eligible);
+                                probe.on_response = Some(Arc::new(move || {
+                                    eligible.store(false, Ordering::Relaxed);
+                                }));
+                            }
+                            let probe = Arc::new(probe);
+                            let searcher = configured(Arc::clone(&index), probe.clone());
+                            let lookups = AtomicUsize::new(0);
+                            let text = |id: &str| {
+                                let lookup = lookups.fetch_add(1, Ordering::Relaxed) + 1;
+                                let revoke = (event == "first_text" && lookup == 1)
+                                    || (event == "last_text" && lookup == 3);
+                                if revoke {
+                                    eligible.store(false, Ordering::Relaxed);
+                                }
+                                if revoke && missing_text {
+                                    None
+                                } else {
+                                    Some(format!("text-{id}"))
+                                }
+                            };
+                            let mut phases = searcher.search_iter_with_text_and_filter(
+                                &cx,
+                                "query text",
+                                &query,
+                                1,
+                                &text,
+                                Some(&filter),
+                            );
+                            assert_eq!(retrieval(&mut phases, mode)[0].doc_id, "a");
+                            if event == "between" {
+                                eligible.store(false, Ordering::Relaxed);
+                            }
+                            let Some(SearchPhase::RefinementFailed {
+                                initial_results,
+                                error,
+                                ..
+                            }) = phases.next()
+                            else {
+                                panic!("revocation must terminate without a stale fallback");
+                            };
+                            assert!(initial_results.is_empty());
+                            assert_terminal_error(&error, event == "provider_cancelled");
+                            let expected_lookups = match event {
+                                "between" => 0,
+                                "first_text" => 1,
+                                _ => 3,
+                            };
+                            assert_eq!(lookups.load(Ordering::Relaxed), expected_lookups);
+                            assert_eq!(
+                                probe.calls.load(Ordering::Relaxed),
+                                usize::from(during_response)
+                            );
+                            assert!(phases.next().is_none());
+                            drop(phases);
+
+                            if event != "between" {
+                                eligible.store(true, Ordering::Relaxed);
+                                lookups.store(0, Ordering::Relaxed);
+                                probe.calls.store(0, Ordering::Relaxed);
+                                let error = searcher
+                                    .search_collect_with_text_and_filter(
+                                        &cx,
+                                        "query text",
+                                        &query,
+                                        1,
+                                        &text,
+                                        Some(&filter),
+                                    )
+                                    .unwrap_err();
+                                assert_terminal_error(&error, event == "provider_cancelled");
+                                assert_eq!(lookups.load(Ordering::Relaxed), expected_lookups);
+                                assert_eq!(
+                                    probe.calls.load(Ordering::Relaxed),
+                                    usize::from(during_response)
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_cross_encoder_cancellation_is_terminal_for_iterators_and_collectors() {
+            for route in ["iterator", "collect"] {
+                for event in [
+                    "before",
+                    "pending",
+                    "text",
+                    "response",
+                    "response_error",
+                    "provider",
+                ] {
+                    if route == "collect" && event == "pending" {
+                        continue;
+                    }
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let (_directory, index, query) = fixture("fast", true);
+                        let reply = match event {
+                            "response_error" => Reply::Error,
+                            "provider" => Reply::Cancelled,
+                            _ => Reply::Valid,
+                        };
+                        let mut probe = Probe::new(reply);
+                        if matches!(event, "response" | "response_error") {
+                            let cancelled = cx.clone();
+                            probe.on_response = Some(Arc::new(move || {
+                                cancelled.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("synchronous response cancelled"),
+                                );
+                            }));
+                        }
+                        let probe = Arc::new(probe);
+                        let searcher = configured(index, probe.clone());
+                        let lookups = AtomicUsize::new(0);
+                        let text = |id: &str| {
+                            lookups.fetch_add(1, Ordering::Relaxed);
+                            if event == "text" {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("synchronous text cancelled"),
+                                );
+                            }
+                            Some(format!("text-{id}"))
+                        };
+                        if event == "before" {
+                            cx.cancel_with(asupersync::CancelKind::User, Some("before retrieval"));
+                        }
+                        let error = if route == "collect" {
+                            searcher
+                                .search_collect_with_text(&cx, "query text", &query, 1, &text)
+                                .unwrap_err()
+                        } else {
+                            let mut phases =
+                                searcher.search_iter_with_text(&cx, "query text", &query, 1, &text);
+                            if event != "before" {
+                                let _ = retrieval(&mut phases, "fast");
+                            }
+                            if event == "pending" {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("before final ranking"),
+                                );
+                            }
+                            let Some(SearchPhase::RefinementFailed {
+                                initial_results,
+                                error,
+                                ..
+                            }) = phases.next()
+                            else {
+                                panic!("cancellation must not publish a successful ranking");
+                            };
+                            assert!(initial_results.is_empty());
+                            assert!(phases.next().is_none());
+                            error
+                        };
+                        assert!(matches!(error, SearchError::Cancelled { .. }));
+                        assert_eq!(
+                            probe.calls.load(Ordering::Relaxed),
+                            usize::from(matches!(
+                                event,
+                                "response" | "response_error" | "provider"
+                            ))
+                        );
+                        assert_eq!(
+                            lookups.load(Ordering::Relaxed),
+                            match event {
+                                "before" | "pending" => 0,
+                                "text" => 1,
+                                _ => 3,
+                            }
+                        );
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn sync_cross_encoder_ranks_a_singleton_with_pinned_metadata() {
+            struct MetadataFilter;
+
+            impl SearchFilter for MetadataFilter {
+                fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+                    metadata
+                        .and_then(|value| value.get("allowed"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                }
+
+                fn name(&self) -> &'static str {
+                    "require-pinned-metadata"
+                }
+            }
+
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let directory = temp_dir("sync-rerank-singleton");
+                let (fast, identity) = attested_tier(
+                    directory.path(),
+                    "fast.fsvi",
+                    "singleton-fast",
+                    1,
+                    &[("a", &[1.0, 0.0])],
+                );
+                let index = Arc::new(InMemoryTwoTierIndex::new(fast, None).unwrap());
+                let query = TieredQueryEmbeddings::fast_only(
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], identity).unwrap(),
+                );
+                let metadata = Arc::new(serde_json::json!({"allowed": true, "revision": 7}));
+                let mut hit = lexical_result("a", 1.0);
+                hit.metadata = Some(Arc::clone(&metadata));
+                let probe = Arc::new(Probe::new(Reply::Valid));
+                let searcher = configured(index, probe.clone())
+                    .with_lexical(Arc::new(StaticLexical { hits: vec![hit] }));
+                let text = |id: &str| Some(format!("text-{id}"));
+                let (results, _) = searcher
+                    .search_collect_with_text_and_filter(
+                        &cx,
+                        "query text",
+                        &query,
+                        1,
+                        &text,
+                        Some(&MetadataFilter),
+                    )
+                    .unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "a");
+                assert_eq!(results[0].source, ScoreSource::Reranked);
+                assert_eq!(results[0].rerank_score, Some(0.7));
+                assert!(Arc::ptr_eq(
+                    results[0].metadata.as_ref().unwrap(),
+                    &metadata
+                ));
+                assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+            });
         }
     }
 
