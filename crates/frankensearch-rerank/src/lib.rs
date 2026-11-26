@@ -6,6 +6,12 @@
 //! `[0, 1]`. An optional `FastEmbed` backend is available behind
 //! `fastembed-reranker`.
 //!
+//! [`rerank_step_sync_with_combine_and_admission`] runs the same pipeline with a
+//! [`frankensearch_core::traits::SyncRerank`] model on the caller's thread. Its
+//! explicit capability context checks cancellation without an async executor.
+//! Both execution modes share text compaction, complete-response validation,
+//! score explanations and pure-reorder or reciprocal-rank combination.
+//!
 //! ```text
 //! (query, document) → tokenize → frankentorch forward → logit → sigmoid → score ∈ [0, 1]
 //! ```
@@ -17,7 +23,8 @@ pub mod fastembed_reranker;
 
 pub use pipeline::{
     DEFAULT_MIN_CANDIDATES, DEFAULT_RRF_COMBINE_K, DEFAULT_TOP_K_RERANK, RerankCombine,
-    rerank_step, rerank_step_with_combine,
+    rerank_step, rerank_step_sync_with_combine_and_admission, rerank_step_with_combine,
+    rerank_step_with_combine_and_admission,
 };
 
 #[cfg(feature = "fastembed-reranker")]

@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
-use frankensearch_core::traits::{RerankDocument, RerankScore, Reranker};
+use frankensearch_core::traits::{RerankDocument, RerankScore, Reranker, SyncRerank};
 use frankensearch_core::types::{ScoreSource, ScoredResult};
 
 /// Default maximum number of candidates to rerank per query.
@@ -175,7 +175,6 @@ pub async fn rerank_step_with_combine(
     num_candidates = candidates.len(),
     top_k = top_k_rerank,
 ))]
-#[allow(clippy::too_many_lines)]
 pub async fn rerank_step_with_combine_and_admission(
     cx: &Cx,
     reranker: &dyn Reranker,
@@ -187,32 +186,123 @@ pub async fn rerank_step_with_combine_and_admission(
     combine: RerankCombine,
     admission: impl Fn() -> SearchResult<()> + Send + Sync,
 ) -> SearchResult<()> {
-    rerank_admission_checkpoint(cx, "reranker_entry", &admission)?;
+    let Some(prepared) = prepare_rerank(
+        cx,
+        candidates,
+        &text_fn,
+        top_k_rerank,
+        min_candidates,
+        &admission,
+    )? else {
+        return Ok(());
+    };
+    rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
+    let response =
+        frankensearch_core::with_cancellation(cx, "reranker_to_score_validation", async {
+            reranker.rerank(cx, query, &prepared.documents).await
+        })
+        .await;
+    finish_rerank(
+        cx,
+        candidates,
+        &prepared,
+        response,
+        combine,
+        &admission,
+        || reranker.id().to_owned(),
+    )
+    .map(|_| ())
+}
+
+/// Run a synchronous cross-encoder with the same admission and combine rules
+/// as [`rerank_step_with_combine_and_admission`].
+///
+/// Work executes on the caller's thread without an executor or async runtime.
+/// The caller supplies `cx` for cancellation checks around text, inference and
+/// admission callbacks; an already-running synchronous model is not preempted.
+/// Ordinary provider failures, unavailable text and malformed responses leave
+/// candidates unchanged and return `Ok(None)`. A complete admitted response
+/// updates the window and returns the model identifier used in explanations.
+///
+/// # Errors
+///
+/// Returns cancellation or an error returned by `admission`. Cancellation has
+/// priority over ordinary provider errors and admission refusal. No error is
+/// returned after candidate mutation begins.
+#[instrument(skip_all, fields(
+    query_len = query.len(),
+    num_candidates = candidates.len(),
+    top_k = top_k_rerank,
+))]
+pub fn rerank_step_sync_with_combine_and_admission(
+    cx: &Cx,
+    reranker: &dyn SyncRerank,
+    query: &str,
+    candidates: &mut [ScoredResult],
+    text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
+    top_k_rerank: usize,
+    min_candidates: usize,
+    combine: RerankCombine,
+    admission: impl Fn() -> SearchResult<()> + Send + Sync,
+) -> SearchResult<Option<String>> {
+    let Some(prepared) = prepare_rerank(
+        cx,
+        candidates,
+        &text_fn,
+        top_k_rerank,
+        min_candidates,
+        &admission,
+    )? else {
+        return Ok(None);
+    };
+    rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
+    let response = reranker.rerank_sync(query, &prepared.documents);
+    finish_rerank(
+        cx,
+        candidates,
+        &prepared,
+        response,
+        combine,
+        &admission,
+        || reranker.id().to_owned(),
+    )
+}
+
+struct PreparedRerank {
+    documents: Vec<RerankDocument>,
+    included_indices: Option<Vec<usize>>,
+    count: usize,
+}
+
+fn prepare_rerank(
+    cx: &Cx,
+    candidates: &[ScoredResult],
+    text_fn: &impl Fn(&str) -> Option<String>,
+    top_k_rerank: usize,
+    min_candidates: usize,
+    admission: &impl Fn() -> SearchResult<()>,
+) -> SearchResult<Option<PreparedRerank>> {
+    rerank_admission_checkpoint(cx, "reranker_entry", admission)?;
     if candidates.len() < min_candidates {
         tracing::debug!(
             count = candidates.len(),
             min = min_candidates,
             "skipping rerank: too few candidates"
         );
-        return Ok(());
+        return Ok(None);
     }
-
-    let rerank_count = candidates.len().min(top_k_rerank);
-    if rerank_count == 0 {
-        return Ok(());
+    let count = candidates.len().min(top_k_rerank);
+    if count == 0 {
+        return Ok(None);
     }
-
-    // Build RerankDocument pairs for candidates that have retrievable text.
-    // Track which original indices were included (some may be skipped if text_fn returns None).
-    let mut rerank_docs = Vec::with_capacity(rerank_count);
+    let mut documents = Vec::with_capacity(count);
     let mut included_indices: Option<Vec<usize>> = None;
-
-    for (i, candidate) in candidates.iter().take(rerank_count).enumerate() {
-        rerank_admission_checkpoint(cx, "reranker_before_text", &admission)?;
+    for (i, candidate) in candidates.iter().take(count).enumerate() {
+        rerank_admission_checkpoint(cx, "reranker_before_text", admission)?;
         let text = text_fn(&candidate.doc_id);
-        rerank_admission_checkpoint(cx, "reranker_after_text", &admission)?;
+        rerank_admission_checkpoint(cx, "reranker_after_text", admission)?;
         if let Some(text) = text {
-            rerank_docs.push(RerankDocument {
+            documents.push(RerankDocument {
                 doc_id: candidate.doc_id.to_string(),
                 text,
             });
@@ -220,70 +310,72 @@ pub async fn rerank_step_with_combine_and_admission(
                 indices.push(i);
             }
         } else if included_indices.is_none() {
-            let mut indices = Vec::with_capacity(rerank_count);
+            let mut indices = Vec::with_capacity(count);
             indices.extend(0..i);
             included_indices = Some(indices);
         }
     }
-
-    if rerank_docs.is_empty() || rerank_docs.len() < min_candidates {
+    if documents.is_empty() || documents.len() < min_candidates {
         tracing::debug!(
-            with_text = rerank_docs.len(),
+            with_text = documents.len(),
             min = min_candidates,
             "skipping rerank: too few candidates with available text"
         );
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(PreparedRerank {
+        documents,
+        included_indices,
+        count,
+    }))
+}
 
-    // Cancellation outranks BOTH successful output and an ordinary provider
-    // error. Do not return a graceful skip before observing the invocation.
-    rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
-    let response =
-        frankensearch_core::with_cancellation(cx, "reranker_to_score_validation", async {
-            reranker.rerank(cx, query, &rerank_docs).await
-        })
-        .await;
+/// Both execution modes use this complete-response admission and mutation
+/// boundary, so text compaction, explanations and combination cannot drift.
+#[allow(clippy::too_many_lines)]
+fn finish_rerank(
+    cx: &Cx,
+    candidates: &mut [ScoredResult],
+    prepared: &PreparedRerank,
+    response: SearchResult<Vec<RerankScore>>,
+    combine: RerankCombine,
+    admission: &impl Fn() -> SearchResult<()>,
+    model: impl FnOnce() -> String,
+) -> SearchResult<Option<String>> {
     rerank_checkpoint(cx, "reranker_to_score_validation")?;
     let response = match response {
         Err(error @ SearchError::Cancelled { .. }) => return Err(error),
         response => response,
     };
-    rerank_admission_checkpoint(cx, "reranker_to_score_validation", &admission)?;
+    rerank_admission_checkpoint(cx, "reranker_to_score_validation", admission)?;
     let scores = match response {
         Ok(scores) => scores,
         Err(_) => {
-            // The exception can contain query/document text or an arbitrary
-            // formatter. Logging it is not required to retain valid results.
+            // Provider errors may contain document text or arbitrary formatters.
             tracing::warn!("reranker failed — keeping original scores");
-            return Ok(());
+            return Ok(None);
         }
     };
-
-    // Admission is shared with fsfs, whose output and cache path must enforce
-    // the same complete permutation before publishing a reordered window.
-    if let Err(error) = RerankScore::validate_response(cx, &rerank_docs, &scores) {
+    if let Err(error) = RerankScore::validate_response(cx, &prepared.documents, &scores) {
         if matches!(error, SearchError::Cancelled { .. }) {
             return Err(error);
         }
         tracing::warn!(error = %error, "reranker returned an invalid response — skipping rerank");
-        return Ok(());
+        return Ok(None);
     }
 
-    // Resolve the last provider callback before the commit checkpoint. Nothing
-    // below invokes the provider or can return cancellation after mutating data.
-    let model = reranker.id().to_owned();
-    rerank_admission_checkpoint(cx, "reranker_commit", &admission)?;
-    clear_rerank_scores(candidates, rerank_count);
-
-    // Apply rerank scores to the original candidates using `original_rank`.
-    // This keeps scores aligned with the correct doc_id even after the reranker sorts its output.
+    // Resolve the final provider callback before the commit checkpoint. No
+    // callback or cancellation return occurs after the first candidate write.
+    let model = model();
+    rerank_admission_checkpoint(cx, "reranker_commit", admission)?;
+    clear_rerank_scores(candidates, prepared.count);
     for score in scores {
-        let candidate_idx = included_indices
+        let candidate_idx = prepared
+            .included_indices
             .as_ref()
             .map_or(score.original_rank, |indices| indices[score.original_rank]);
         candidates[candidate_idx].rerank_score = Some(score.score);
         candidates[candidate_idx].source = ScoreSource::Reranked;
-
         if let Some(explanation) = &mut candidates[candidate_idx].explanation {
             explanation.final_score = f64::from(score.score);
             explanation.components.push(ScoreComponent {
@@ -299,28 +391,20 @@ pub async fn rerank_step_with_combine_and_admission(
             });
         }
     }
-
-    // Re-order the reranked portion per the chosen combine strategy. Non-reranked
-    // candidates (beyond top_k_rerank) keep their original order in both cases.
     match combine {
-        // Pure reorder: sort by rerank_score descending (NaN-safe). Legacy default.
         RerankCombine::PureReorder => {
-            candidates[..rerank_count].sort_by(compare_by_rerank_score);
+            candidates[..prepared.count].sort_by(compare_by_rerank_score);
         }
-        // RRF-combine: rank-fuse the pre-rerank order with the rerank order so the
-        // retrieval score vetoes deep false positives the reranker would promote.
         RerankCombine::RrfCombine { k } => {
-            apply_rrf_combine(&mut candidates[..rerank_count], k);
+            apply_rrf_combine(&mut candidates[..prepared.count], k);
         }
     }
-
     tracing::debug!(
-        reranked = rerank_docs.len(),
+        reranked = prepared.documents.len(),
         model = %model,
         "rerank step complete"
     );
-
-    Ok(())
+    Ok(Some(model))
 }
 
 fn rerank_admission_checkpoint(
@@ -1873,6 +1957,104 @@ mod tests {
             }
         }
 
+        struct SyncProbe {
+            probe: Probe,
+            cx: Cx,
+        }
+
+        impl SyncProbe {
+            fn new(reply: Reply, cx: &Cx) -> Self {
+                Self {
+                    probe: Probe::new(reply),
+                    cx: cx.clone(),
+                }
+            }
+        }
+
+        impl frankensearch_core::traits::SyncRerank for SyncProbe {
+            #[allow(clippy::cast_precision_loss)]
+            fn rerank_sync(
+                &self,
+                _query: &str,
+                documents: &[RerankDocument],
+            ) -> SearchResult<Vec<RerankScore>> {
+                self.probe.calls.fetch_add(1, AtomicOrdering::Relaxed);
+                let _guard = CallGuard(&self.probe.drops);
+                assert!(!matches!(self.probe.reply, Reply::Pending));
+                if let Some(eligible) = &self.probe.revoke_on_response {
+                    eligible.store(false, AtomicOrdering::Relaxed);
+                }
+                if matches!(self.probe.reply, Reply::ProviderCancelled) {
+                    return Err(SearchError::Cancelled {
+                        phase: "fixture.provider".to_owned(),
+                        reason: "provider stopped".to_owned(),
+                    });
+                }
+                if matches!(self.probe.reply, Reply::Error) {
+                    return Err(SearchError::RerankFailed {
+                        model: "probe".to_owned(),
+                        source: "ordinary provider error".into(),
+                    });
+                }
+                let mut scores: Vec<_> = documents
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, doc)| RerankScore {
+                        doc_id: doc.doc_id.clone(),
+                        score: (original_rank + 1) as f32 / (documents.len() + 1) as f32,
+                        original_rank,
+                        raw_logit: Some(original_rank as f32 - 2.0),
+                    })
+                    .collect();
+                scores.reverse();
+                if scores.is_empty() {
+                    return Ok(scores);
+                }
+                let last = scores.len() - 1;
+                match self.probe.reply {
+                    Reply::Short => {
+                        let _ = scores.pop();
+                    }
+                    Reply::Long => scores.push(RerankScore {
+                        doc_id: scores[0].doc_id.clone(),
+                        score: scores[0].score,
+                        original_rank: scores[0].original_rank,
+                        raw_logit: scores[0].raw_logit,
+                    }),
+                    Reply::Duplicate => {
+                        scores[last].doc_id = scores[0].doc_id.clone();
+                        scores[last].original_rank = scores[0].original_rank;
+                    }
+                    Reply::InvalidRank => scores[last].original_rank = usize::MAX,
+                    Reply::WrongId => scores[last].doc_id = "foreign-document".to_owned(),
+                    Reply::InvalidScore(value) => scores[last].score = value,
+                    Reply::InvalidLogit(value) => scores[last].raw_logit = Some(value),
+                    Reply::CancelSuccess | Reply::CancelError => {
+                        self.cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("response cancelled"),
+                        );
+                        if matches!(self.probe.reply, Reply::CancelError) {
+                            return Err(SearchError::RerankFailed {
+                                model: "probe".to_owned(),
+                                source: "ordinary provider error after cancellation".into(),
+                            });
+                        }
+                    }
+                    Reply::Valid | Reply::Error | Reply::ProviderCancelled | Reply::Pending => {}
+                }
+                Ok(scores)
+            }
+
+            fn id(&self) -> &str {
+                Reranker::id(&self.probe)
+            }
+
+            fn model_name(&self) -> &str {
+                Reranker::model_name(&self.probe)
+            }
+        }
+
         fn candidates() -> Vec<ScoredResult> {
             let mut candidates = make_candidates(7);
             for (i, candidate) in candidates.iter_mut().enumerate() {
@@ -1949,6 +2131,253 @@ mod tests {
                 k: DEFAULT_RRF_COMBINE_K,
             },
         ];
+
+        #[test]
+        fn sync_pipeline_matches_async_for_full_and_compacted_responses() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    for partial in [false, true] {
+                        for reply in [
+                            Reply::Valid,
+                            Reply::Error,
+                            Reply::Short,
+                            Reply::Long,
+                            Reply::Duplicate,
+                            Reply::InvalidRank,
+                            Reply::WrongId,
+                            Reply::InvalidScore(f32::NAN),
+                            Reply::InvalidScore(f32::INFINITY),
+                            Reply::InvalidScore(f32::NEG_INFINITY),
+                            Reply::InvalidLogit(f32::NAN),
+                            Reply::InvalidLogit(f32::INFINITY),
+                            Reply::InvalidLogit(f32::NEG_INFINITY),
+                        ] {
+                            let before = candidates();
+                            let mut asynchronous = before.clone();
+                            let mut synchronous = before.clone();
+                            let async_provider = Probe::new(reply);
+                            let sync_provider = SyncProbe::new(reply, &cx);
+                            let text = |id: &str| {
+                                if partial {
+                                    text_for_doc_partial(id)
+                                } else {
+                                    text_for_doc(id)
+                                }
+                            };
+                            rerank_step_with_combine(
+                                &cx,
+                                &async_provider,
+                                "query",
+                                &mut asynchronous,
+                                &text,
+                                6,
+                                2,
+                                combine,
+                            )
+                            .await
+                            .unwrap();
+                            let applied = rerank_step_sync_with_combine_and_admission(
+                                &cx,
+                                &sync_provider,
+                                "query",
+                                &mut synchronous,
+                                &text,
+                                6,
+                                2,
+                                combine,
+                                || Ok(()),
+                            )
+                            .unwrap();
+                            assert_unchanged(&synchronous, &asynchronous);
+                            assert_unchanged(&synchronous[6..], &before[6..]);
+                            if matches!(reply, Reply::Valid) {
+                                assert_eq!(applied.as_deref(), Some("admission-probe"));
+                            } else {
+                                assert!(applied.is_none());
+                                assert_unchanged(&synchronous, &before);
+                            }
+                            assert_eq!(async_provider.calls.load(AtomicOrdering::Relaxed), 1);
+                            assert_eq!(sync_provider.probe.calls.load(AtomicOrdering::Relaxed), 1);
+                            assert_eq!(sync_provider.probe.drops.load(AtomicOrdering::Relaxed), 1);
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_text_revocation_stops_before_later_lookups_or_inference() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    for missing in [false, true] {
+                        for revoke_at in [0, 5] {
+                            let provider = SyncProbe::new(Reply::Valid, &cx);
+                            let mut values = candidates();
+                            let before = values.clone();
+                            let lookups = AtomicUsize::new(0);
+                            let eligible = AtomicBool::new(true);
+                            let error = rerank_step_sync_with_combine_and_admission(
+                                &cx,
+                                &provider,
+                                "query",
+                                &mut values,
+                                |id| {
+                                    if lookups.fetch_add(1, AtomicOrdering::Relaxed) == revoke_at {
+                                        eligible.store(false, AtomicOrdering::Relaxed);
+                                    }
+                                    if missing { None } else { text_for_doc(id) }
+                                },
+                                6,
+                                1,
+                                combine,
+                                || admit_while_eligible(&eligible),
+                            )
+                            .unwrap_err();
+                            assert_admission_rejected(error);
+                            assert_unchanged(&values, &before);
+                            assert_eq!(lookups.load(AtomicOrdering::Relaxed), revoke_at + 1);
+                            assert_eq!(provider.probe.calls.load(AtomicOrdering::Relaxed), 0);
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn sync_provider_revocation_and_cancellation_preserve_candidate_state() {
+            for combine in STRATEGIES {
+                for reply in [
+                    Reply::Valid,
+                    Reply::Error,
+                    Reply::WrongId,
+                    Reply::CancelSuccess,
+                    Reply::CancelError,
+                    Reply::ProviderCancelled,
+                ] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let eligible = Arc::new(AtomicBool::new(true));
+                        let mut provider = SyncProbe::new(reply, &cx);
+                        provider.probe.revoke_on_response = Some(Arc::clone(&eligible));
+                        let mut values = candidates();
+                        let before = values.clone();
+                        let error = rerank_step_sync_with_combine_and_admission(
+                            &cx,
+                            &provider,
+                            "query",
+                            &mut values,
+                            text_for_doc,
+                            6,
+                            1,
+                            combine,
+                            || admit_while_eligible(&eligible),
+                        )
+                        .unwrap_err();
+                        match reply {
+                            Reply::ProviderCancelled => assert!(matches!(
+                                error,
+                                SearchError::Cancelled { phase, reason }
+                                    if phase == "fixture.provider" && reason == "provider stopped"
+                            )),
+                            Reply::CancelSuccess | Reply::CancelError => assert!(matches!(
+                                error,
+                                SearchError::Cancelled { phase, .. }
+                                    if phase == "reranker_to_score_validation"
+                            )),
+                            _ => assert_admission_rejected(error),
+                        }
+                        assert!(!eligible.load(AtomicOrdering::Relaxed));
+                        assert_unchanged(&values, &before);
+                        assert_eq!(provider.probe.calls.load(AtomicOrdering::Relaxed), 1);
+                        assert_eq!(provider.probe.drops.load(AtomicOrdering::Relaxed), 1);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn sync_admission_cancellation_precedes_errors_and_noop_shortcuts() {
+            for reject in [false, true] {
+                for (count, top_k, minimum) in [(0, 10, 0), (7, 0, 0), (7, 7, 100), (7, 7, 1)] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let provider = SyncProbe::new(Reply::Valid, &cx);
+                        let mut values = candidates();
+                        values.truncate(count);
+                        let before = values.clone();
+                        let lookups = AtomicUsize::new(0);
+                        let eligible = AtomicBool::new(!reject);
+                        let error = rerank_step_sync_with_combine_and_admission(
+                            &cx,
+                            &provider,
+                            "query",
+                            &mut values,
+                            |id| {
+                                lookups.fetch_add(1, AtomicOrdering::Relaxed);
+                                text_for_doc(id)
+                            },
+                            top_k,
+                            minimum,
+                            RerankCombine::PureReorder,
+                            || {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("admission cancelled"),
+                                );
+                                admit_while_eligible(&eligible)
+                            },
+                        )
+                        .unwrap_err();
+                        assert!(matches!(
+                            error,
+                            SearchError::Cancelled { phase, .. } if phase == "reranker_entry"
+                        ));
+                        assert_unchanged(&values, &before);
+                        assert_eq!(lookups.load(AtomicOrdering::Relaxed), 0);
+                        assert_eq!(provider.probe.calls.load(AtomicOrdering::Relaxed), 0);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn sync_model_label_revocation_is_observed_before_commit() {
+            for combine in STRATEGIES {
+                for cancel in [false, true] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let eligible = Arc::new(AtomicBool::new(true));
+                        let mut provider = SyncProbe::new(Reply::Valid, &cx);
+                        provider.probe.revoke_on_id = Some(Arc::clone(&eligible));
+                        if cancel {
+                            provider.probe.cancel_on_id = Some(cx.clone());
+                        }
+                        let mut values = candidates();
+                        let before = values.clone();
+                        let error = rerank_step_sync_with_combine_and_admission(
+                            &cx,
+                            &provider,
+                            "query",
+                            &mut values,
+                            text_for_doc,
+                            6,
+                            1,
+                            combine,
+                            || admit_while_eligible(&eligible),
+                        )
+                        .unwrap_err();
+                        if cancel {
+                            assert!(matches!(
+                                error,
+                                SearchError::Cancelled { phase, .. } if phase == "reranker_commit"
+                            ));
+                        } else {
+                            assert_admission_rejected(error);
+                        }
+                        assert!(!eligible.load(AtomicOrdering::Relaxed));
+                        assert_unchanged(&values, &before);
+                        assert_eq!(provider.probe.calls.load(AtomicOrdering::Relaxed), 1);
+                    });
+                }
+            }
+        }
 
         #[test]
         fn rejected_requests_skip_text_and_inference_even_for_noops() {
