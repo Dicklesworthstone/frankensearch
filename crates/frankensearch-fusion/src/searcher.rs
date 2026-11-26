@@ -3505,13 +3505,18 @@ impl TwoTierSearcher {
                 };
                 #[cfg(feature = "graph")]
                 if let Some(graph) = self.document_graph.as_deref() {
+                    // Keep revocations across graph refills, just as refinement
+                    // does across semantic arms. Otherwise an unstable predicate
+                    // can repeatedly admit and revoke the same candidate.
+                    let mut fast_revoked = AHashSet::new();
+                    let mut graph_revoked = AHashSet::new();
                     while let Some(candidates) = graph_candidates.as_mut() {
                         if !request_filter.is_active() {
                             break;
                         }
                         let reconciliation_start = Instant::now();
                         let fast_replaced = request_filter
-                            .reconcile_vectors(
+                            .reconcile_vectors_with_history(
                                 cx,
                                 lexical_source,
                                 LexicalRevalidation {
@@ -3527,6 +3532,7 @@ impl TwoTierSearcher {
                                 normalized_exclusions,
                                 text_fn,
                                 vector_exclusion_source(self.fast_embedder.as_ref()),
+                                &mut fast_revoked,
                                 |limit| retrieve_fast(limit).map(|(hits, _)| hits),
                             )
                             .await?;
@@ -3541,7 +3547,13 @@ impl TwoTierSearcher {
                             reconciliation_start.elapsed().as_secs_f64() * 1000.0;
                         // Changed semantic seeds require a fresh graph rank;
                         // changed graph membership requires its eligible tail.
-                        if !fast_replaced && !request_filter.retain_scored(cx, candidates)? {
+                        // Observe graph revocations even when the seeds changed.
+                        let graph_membership_changed = request_filter.retain_scored_with_history(
+                            cx,
+                            candidates,
+                            &mut graph_revoked,
+                        )?;
+                        if !fast_replaced && !graph_membership_changed {
                             break;
                         }
                         graph_candidates = request_filter
@@ -15573,6 +15585,66 @@ mod tests {
             );
             assert!(results.iter().any(|hit| hit.doc_id == "doc-0"));
             assert!(results.iter().any(|hit| hit.doc_id == tail));
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn async_filter_graph_initial_rejects_repeated_graph_revocation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let mut graph = DocumentGraph::new();
+            graph.add_edge(
+                "doc-0",
+                "graph-flapping",
+                frankensearch_core::EdgeType::Reference,
+                1.0,
+            );
+            graph.add_edge(
+                "graph-flapping",
+                "graph-flapping",
+                frankensearch_core::EdgeType::Reference,
+                1.0,
+            );
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    fast_only: true,
+                    graph_ranking_enabled: true,
+                    graph_ranking_weight: 1.0,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_document_graph(Arc::new(graph));
+
+            let observations = AtomicU64::new(0);
+            let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                if id != "graph-flapping" {
+                    return true;
+                }
+                let observation = observations.fetch_add(1, Ordering::Relaxed);
+                // The old loop must fail promptly instead of hanging the suite.
+                assert!(
+                    observation < 8,
+                    "repeated graph revocation must terminate before another refill",
+                );
+                observation.is_multiple_of(2)
+            });
+            let mut phases = 0;
+            let error = searcher
+                .search_with_filter(&cx, "graph", 2, Some(&filter), |_| None, |_| phases += 1)
+                .await
+                .expect_err("repeated graph revocation must refuse the request");
+
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "search.filter" && value == "unstable_predicate"
+            ));
+            assert_eq!(observations.load(Ordering::Relaxed), 4);
+            assert_eq!(phases, 0);
         });
     }
 
