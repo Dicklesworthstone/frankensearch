@@ -2434,7 +2434,7 @@ mod tests {
                                 &sync_provider,
                                 "query",
                                 &mut synchronous,
-                                &text,
+                                text,
                                 6,
                                 2,
                                 combine,
