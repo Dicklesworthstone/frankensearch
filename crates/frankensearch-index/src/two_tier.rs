@@ -4335,7 +4335,9 @@ mod tests {
         let query = [1.0, 0.0, 0.0, 0.0];
         let hits = index.search_fast(&query, 4).expect("fast MRL results");
         assert_eq!(
-            hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+            hits.iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b", "new", "c"]
         );
         let classified = index

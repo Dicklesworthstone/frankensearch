@@ -8821,7 +8821,11 @@ mod tests {
         };
         let boundary = parser.parse(&nested(CASS_MAX_QUERY_GROUP_DEPTH), &filters);
         assert!(!boundary.query.is_empty(), "the depth boundary stays valid");
-        assert!(boundary.diagnostics.is_empty(), "{:?}", boundary.diagnostics);
+        assert!(
+            boundary.diagnostics.is_empty(),
+            "{:?}",
+            boundary.diagnostics
+        );
 
         let excessive = nested(CASS_MAX_QUERY_GROUP_DEPTH + 1);
         for raw in [

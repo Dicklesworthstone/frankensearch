@@ -1864,7 +1864,10 @@ mod tests {
                     };
                     let error =
                         result.expect_err("a cache refresh cannot change producer contracts");
-                    assert!(is_replace_rejection(&error), "{tier}/{component}: {error:?}");
+                    assert!(
+                        is_replace_rejection(&error),
+                        "{tier}/{component}: {error:?}"
+                    );
                     assert!(!error.to_string().contains("private-contract-canary"));
                     assert!(Arc::ptr_eq(&retained, &cache.current()));
                     assert_eq!(

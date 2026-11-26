@@ -2498,7 +2498,10 @@ impl SyncLexicalContext {
             context.checkpoint("sync_search.refinement_admission")?;
             let eligible = filter.matches(
                 id,
-                self.metadata.get(id).and_then(Option::as_deref).or(metadata),
+                self.metadata
+                    .get(id)
+                    .and_then(Option::as_deref)
+                    .or(metadata),
             );
             context.checkpoint("sync_search.refinement_admission")?;
             if !eligible {

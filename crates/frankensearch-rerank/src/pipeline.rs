@@ -843,7 +843,11 @@ mod tests {
                     .rev()
                     .map(|(original_rank, document)| RerankScore {
                         doc_id: document.doc_id.clone(),
-                        score: if document.doc_id == "winner" { 0.9 } else { 0.5 },
+                        score: if document.doc_id == "winner" {
+                            0.9
+                        } else {
+                            0.5
+                        },
                         original_rank,
                         raw_logit: None,
                     })
@@ -862,7 +866,13 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let provider = SyncRerankerAdapter(SparseReranker);
             let ids = [
-                "z-missing", "a-missing", "z-tied", "a-tied", "low", "winner", "tail",
+                "z-missing",
+                "a-missing",
+                "z-tied",
+                "a-tied",
+                "low",
+                "winner",
+                "tail",
             ];
             // Freeze the independent two-list RRF outcomes. Missing text must
             // not supply a second vote that defeats the scored hidden winner.
@@ -872,19 +882,37 @@ mod tests {
                 (
                     &["winner"],
                     &[
-                        "winner", "z-missing", "a-missing", "z-tied", "a-tied", "low", "tail",
+                        "winner",
+                        "z-missing",
+                        "a-missing",
+                        "z-tied",
+                        "a-tied",
+                        "low",
+                        "tail",
                     ],
                 ),
                 (
                     &["z-tied", "a-tied"],
                     &[
-                        "a-tied", "z-tied", "z-missing", "a-missing", "low", "winner", "tail",
+                        "a-tied",
+                        "z-tied",
+                        "z-missing",
+                        "a-missing",
+                        "low",
+                        "winner",
+                        "tail",
                     ],
                 ),
                 (
                     &["z-tied", "a-tied", "winner"],
                     &[
-                        "a-tied", "z-tied", "winner", "z-missing", "a-missing", "low", "tail",
+                        "a-tied",
+                        "z-tied",
+                        "winner",
+                        "z-missing",
+                        "a-missing",
+                        "low",
+                        "tail",
                     ],
                 ),
             ];
@@ -986,12 +1014,29 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let provider = SyncRerankerAdapter(DeepWinner);
-            let ids = ["z-retrieval", "y-second", "x-third", "w-fourth", "v-deep", "tail"];
+            let ids = [
+                "z-retrieval",
+                "y-second",
+                "x-third",
+                "w-fourth",
+                "v-deep",
+                "tail",
+            ];
             let default_order = [
-                "z-retrieval", "y-second", "v-deep", "x-third", "w-fourth", "tail",
+                "z-retrieval",
+                "y-second",
+                "v-deep",
+                "x-third",
+                "w-fourth",
+                "tail",
             ];
             let sharp_order = [
-                "z-retrieval", "v-deep", "y-second", "x-third", "w-fourth", "tail",
+                "z-retrieval",
+                "v-deep",
+                "y-second",
+                "x-third",
+                "w-fourth",
+                "tail",
             ];
             // These distinct orders also detect accidental k=1 fallback and
             // all-zero keys, which would instead sort by document ID.

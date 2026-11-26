@@ -1809,11 +1809,15 @@ mod tests {
                     .mrl_search_with_stats(&query, limit, &config, None)
                     .expect("MRL results");
                 assert_eq!(
-                    hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                    hits.iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
                     ["a", "b", "c", "d"]
                 );
                 assert_eq!(
-                    hits.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>(),
+                    hits.iter()
+                        .map(|hit| hit.score.to_bits())
+                        .collect::<Vec<_>>(),
                     [1.0_f32, 0.75, 0.5, -0.25].map(f32::to_bits)
                 );
                 assert_eq!(stats.candidates_rescored, 4);
@@ -1857,11 +1861,15 @@ mod tests {
             .mrl_search_with_stats(&[1.0, 0.0, 0.0, 0.0], 4, &config, Some(&filter))
             .expect("filtered MRL results");
         assert_eq!(
-            hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+            hits.iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
             ["first", "new", "third", "replaced"]
         );
         assert_eq!(
-            hits.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>(),
+            hits.iter()
+                .map(|hit| hit.score.to_bits())
+                .collect::<Vec<_>>(),
             [0.5_f32, 0.375, 0.25, 0.125].map(f32::to_bits)
         );
         assert_eq!(stats.candidates_rescored, 4);
