@@ -3547,7 +3547,11 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
             .into_iter()
             .map(|hit| hit.doc_id.to_string())
             .collect();
-        Ok(Self::coverage_from_candidates(Some(tier), &served, returned))
+        Ok(Self::coverage_from_candidates(
+            Some(tier),
+            &served,
+            returned,
+        ))
     }
 
     fn coverage_from_candidates(
@@ -9718,16 +9722,16 @@ mod tests {
         assert_eq!(coverage.quality, witnessed(0));
 
         let shared = IncludeDocIdsFilter::new(["top"]);
-        let (union, coverage) = activation.search_union_filtered(2, &shared, params).unwrap();
+        let (union, coverage) = activation
+            .search_union_filtered(2, &shared, params)
+            .unwrap();
         assert_eq!(union.len(), 1);
         assert_eq!(union[0].doc_id, "top");
         assert_eq!(coverage.fast, witnessed(1));
         assert_eq!(coverage.quality, witnessed(1));
 
-        let quality_only = TieredQueryEmbeddings::quality_only(bound_query(
-            &quality_identity,
-            &[1.0, 0.0, 0.0],
-        ));
+        let quality_only =
+            TieredQueryEmbeddings::quality_only(bound_query(&quality_identity, &[1.0, 0.0, 0.0]));
         let single = index
             .activate_owner_backed_search(&cx, &quality_only)
             .unwrap();

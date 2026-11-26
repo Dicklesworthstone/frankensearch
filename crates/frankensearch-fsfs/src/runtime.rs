@@ -6618,34 +6618,15 @@ fn sha256_digest_hex(bytes: impl AsRef<[u8]>) -> String {
     hex
 }
 
-fn create_secure_update_temp_dir() -> SearchResult<PathBuf> {
-    let base = std::env::temp_dir();
-    for attempt in 0..32_u8 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let candidate = base.join(format!(
-            "fsfs-update-{}-{nanos}-{attempt}",
-            std::process::id()
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(error) => {
-                if error.kind() == ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(SearchError::SubsystemError {
-                    subsystem: "fsfs.update.tempdir",
-                    source: Box::new(error),
-                });
-            }
-        }
+fn update_staging_directory(parent: &Path) -> SearchResult<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("fsfs-update-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
     }
-    Err(SearchError::InvalidConfig {
-        field: "update.tempdir".into(),
-        value: base.display().to_string(),
-        reason: "failed to allocate a unique temporary directory".into(),
-    })
+    Ok(builder.tempdir_in(parent)?)
 }
 
 fn archive_entry_path_is_safe(entry: &str) -> bool {
@@ -7142,7 +7123,7 @@ pub fn create_backup(current_exe: &Path) -> SearchResult<BackupEntry> {
         let _ = fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
     }
 
-    let sha256 = compute_sha256_of_file(&dest).unwrap_or_default();
+    let sha256 = compute_sha256_of_file(&dest)?;
 
     let entry = BackupEntry {
         version: version.to_owned(),
@@ -7175,6 +7156,68 @@ fn prune_backups(manifest: &mut RollbackManifest, backup_directory: &Path) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Verify the actual staged bytes before replacing the executable. The stage
+/// is on the installation filesystem, so a failed copy, version probe, or
+/// rename leaves the running installation available at its original path.
+fn install_verified_executable(
+    source: &Path,
+    destination: &Path,
+    version: &str,
+    expected_sha256: Option<&str>,
+) -> SearchResult<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "update.destination".into(),
+            value: destination.display().to_string(),
+            reason: "the installation path must have a parent directory".into(),
+        })?;
+    let stage = update_staging_directory(parent)?;
+    let binary = stage.path().join(if cfg!(windows) { "fsfs.exe" } else { "fsfs" });
+    fs::copy(source, &binary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+    }
+    if let Some(expected) = expected_sha256 {
+        let actual = compute_sha256_of_file(&binary)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(SearchError::InvalidConfig {
+                field: "backup.checksum".into(),
+                value: actual,
+                reason: format!("backup checksum mismatch: expected {expected}"),
+            });
+        }
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&binary)?
+        .sync_all()?;
+    let probe = spawn_verifying_executable(&binary, &["version"])?;
+    let output = std::str::from_utf8(&probe.stdout).unwrap_or("").trim_end();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    if !probe.status.success()
+        || (output != format!("fsfs {version}")
+            && output != format!("fsfs {version} (frankensearch {version})"))
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "update.verify".into(),
+            value: version.to_owned(),
+            reason: "staged executable did not report the requested fsfs version".into(),
+        });
+    }
+    fs::rename(&binary, destination)?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| SearchError::SubsystemError {
+            subsystem: "fsfs.update.published_directory_sync",
+            source: Box::new(error),
+        })?;
+    Ok(())
 }
 
 /// Restore a backup. If `target_version` is `None`, restores the most recent backup.
@@ -7237,34 +7280,17 @@ pub fn restore_backup(target_version: Option<&str>) -> SearchResult<BackupEntry>
         });
     }
 
-    // Verify checksum if available.
-    if !entry.sha256.is_empty() {
-        let actual = compute_sha256_of_file(&backup_path)?;
-        if !actual.eq_ignore_ascii_case(&entry.sha256) {
-            return Err(SearchError::InvalidConfig {
-                field: "backup.checksum".into(),
-                value: actual,
-                reason: format!("backup checksum mismatch: expected {}", entry.sha256),
-            });
-        }
-    }
-
-    // Replace current binary with backup.
     let current_exe = std::env::current_exe().map_err(|e| SearchError::SubsystemError {
         subsystem: "fsfs.backup.current_exe",
         source: Box::new(e),
     })?;
 
-    fs::copy(&backup_path, &current_exe).map_err(|e| SearchError::SubsystemError {
-        subsystem: "fsfs.backup.restore",
-        source: Box::new(e),
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755));
-    }
+    install_verified_executable(
+        &backup_path,
+        &current_exe,
+        &entry.version,
+        (!entry.sha256.is_empty()).then_some(entry.sha256.as_str()),
+    )?;
 
     Ok(entry.clone())
 }
@@ -8750,7 +8776,8 @@ impl FsfsRuntime {
         let checksum_url = release_checksum_url(&tag);
         let is_zip = triple.contains("windows");
 
-        let temp_dir = create_secure_update_temp_dir()?;
+        let download_stage = update_staging_directory(&std::env::temp_dir())?;
+        let temp_dir = download_stage.path();
 
         let archive_path = temp_dir.join(&asset_filename);
         let checksum_path = temp_dir.join("SHA256SUMS");
@@ -8852,7 +8879,10 @@ impl FsfsRuntime {
         }
 
         // Find the extracted binary (search up to 2 levels deep).
-        let new_binary = find_extracted_binary(&extract_dir, "fsfs")?;
+        let new_binary = find_extracted_binary(
+            &extract_dir,
+            if cfg!(windows) { "fsfs.exe" } else { "fsfs" },
+        )?;
 
         // Locate the currently-running binary.
         let current_exe = std::env::current_exe().map_err(|e| SearchError::SubsystemError {
@@ -8873,56 +8903,7 @@ impl FsfsRuntime {
             }
         }
 
-        // Also keep a transient .old for immediate rollback if install fails.
-        let transient_backup = current_exe.with_extension("old");
-        if current_exe.exists() {
-            let _ = fs::rename(&current_exe, &transient_backup);
-        }
-
-        if let Err(e) = fs::copy(&new_binary, &current_exe) {
-            // Attempt to restore from transient backup on failure.
-            if transient_backup.exists() {
-                let _ = fs::rename(&transient_backup, &current_exe);
-            }
-            return Err(SearchError::SubsystemError {
-                subsystem: "fsfs.update.install",
-                source: Box::new(e),
-            });
-        }
-
-        // Set executable permission on the new binary.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            let _ = fs::set_permissions(&current_exe, perms);
-        }
-
-        // Verify the new binary runs (ETXTBSY-tolerant: see the helper).
-        let verify = spawn_verifying_executable(&current_exe, &["version"]);
-        match verify {
-            Ok(out) if out.status.success() => {
-                let version_out = String::from_utf8_lossy(&out.stdout);
-                notes.push(format!("verified new binary: {}", version_out.trim()));
-                // Remove transient backup on success.
-                let _ = fs::remove_file(&transient_backup);
-            }
-            _ => {
-                // Rollback: restore from transient backup.
-                if transient_backup.exists() {
-                    let _ = fs::rename(&transient_backup, &current_exe);
-                    notes.push("verification failed; rolled back to previous version".into());
-                    return Err(SearchError::InvalidConfig {
-                        field: "update.verify".into(),
-                        value: current_exe.display().to_string(),
-                        reason: "new binary failed verification; rolled back".into(),
-                    });
-                }
-            }
-        }
-
-        // Cleanup temp files.
-        let _ = fs::remove_dir_all(&temp_dir);
+        install_verified_executable(&new_binary, &current_exe, &tag, None)?;
 
         notes.push(format!("updated: v{current} -> v{latest}"));
 
@@ -8972,19 +8953,10 @@ impl FsfsRuntime {
         }
         let entry = restore_backup(version)?;
 
-        let mut notes = Vec::new();
-        notes.push(format!("restored v{} from backup", entry.version));
-
-        // Verify the restored binary.
-        if let Ok(current_exe) = std::env::current_exe() {
-            let verify = spawn_verifying_executable(&current_exe, &["version"]);
-            if let Ok(out) = verify
-                && out.status.success()
-            {
-                let version_out = String::from_utf8_lossy(&out.stdout);
-                notes.push(format!("verified: {}", version_out.trim()));
-            }
-        }
+        let notes = vec![format!(
+            "restored verified fsfs v{} from backup",
+            entry.version
+        )];
 
         let payload = FsfsUpdatePayload {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -45598,6 +45570,40 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "busy-ok");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn executable_publication_checks_staged_bytes_before_replacing_the_incumbent() {
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("fsfs");
+        let candidate = directory.path().join("candidate");
+        fs::write(&destination, b"incumbent").unwrap();
+        let mut incumbent = fs::File::open(&destination).unwrap();
+        let install = |digest| {
+            super::install_verified_executable(&candidate, &destination, "v2.0.0-rc.1", digest)
+        };
+        for script in [
+            "#!/bin/sh\necho 'fsfs 2.0.0'\n",
+            "#!/bin/sh\necho 'fsfs 2.0.0-rc.1 (frankensearch 1.9.0)'\n",
+            "#!/bin/sh\necho 'fsfs 2.0.0-rc.1'\nexit 1\n",
+        ] {
+            fs::write(&candidate, script).unwrap();
+            assert!(install(None).is_err());
+            assert_eq!(fs::read(&destination).unwrap(), b"incumbent");
+        }
+        let correct = "#!/bin/sh\ntest \"$1\" = version || exit 1\necho 'fsfs 2.0.0-rc.1 (frankensearch 2.0.0-rc.1)'\n";
+        fs::write(&candidate, correct).unwrap();
+        assert!(install(Some("wrong digest")).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"incumbent");
+        let digest = super::compute_sha256_of_file(&candidate).unwrap();
+        install(Some(&digest)).unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), correct);
+        let mut old_bytes = String::new();
+        incumbent.read_to_string(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, "incumbent");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn spawn_verifying_executable_reports_a_writer_that_never_closes() {
@@ -75944,15 +75950,20 @@ mod tests {
     }
 
     #[test]
-    fn create_secure_update_temp_dir_produces_unique_dirs() {
-        let dir1 = super::create_secure_update_temp_dir().unwrap();
-        let dir2 = super::create_secure_update_temp_dir().unwrap();
-        assert_ne!(dir1, dir2, "temp dirs should be unique");
-        assert!(dir1.exists());
-        assert!(dir2.exists());
-        assert!(dir1.to_string_lossy().contains("fsfs-update-"));
-        assert!(dir2.to_string_lossy().contains("fsfs-update-"));
-        let _ = fs::remove_dir_all(&dir1);
-        let _ = fs::remove_dir_all(&dir2);
+    fn update_staging_directories_are_unique_and_cleaned_up() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = super::update_staging_directory(parent.path()).unwrap();
+        let second = super::update_staging_directory(parent.path()).unwrap();
+        let path = first.path().to_owned();
+        assert_ne!(path, second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+        fs::write(path.join("archive"), b"partially downloaded archive").unwrap();
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().exists());
     }
 }
