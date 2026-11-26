@@ -25638,11 +25638,23 @@ mod tests {
 
             assert_eq!(
                 snapshot
-                    .materialize_stored_value(u16::MAX, first_docid)
+                    .stored_field_value(u16::MAX, first_docid)
                     .expect("read absent stored field"),
                 None,
                 "an absent stored value must remain absent"
             );
+            assert_eq!(
+                segment.stored_meta_lookup_cache_counts(),
+                (2, 1),
+                "an undeclared field must not consult the stored-value plan"
+            );
+            assert_eq!(
+                snapshot
+                    .stored_field_value(CONTENT_FIELD, first_docid)
+                    .expect("read a declared stored field"),
+                Some(b"needle first payload".to_vec())
+            );
+            assert_eq!(segment.stored_meta_lookup_cache_counts(), (3, 1));
             assert!(
                 index
                     .delete_document(&cx, "stored-second")
@@ -25663,6 +25675,17 @@ mod tests {
                 tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
                 (3, 1),
                 "tombstone-only rebinds share the one plan only for the exact immutable backing"
+            );
+            assert_eq!(
+                tombstoned
+                    .stored_field_value(CONTENT_FIELD, first_docid)
+                    .expect("read the surviving winner after rebinding"),
+                Some(b"needle first payload".to_vec())
+            );
+            assert_eq!(
+                tombstoned.keeper.segments()[0].stored_meta_lookup_cache_counts(),
+                (4, 1),
+                "a surviving winner must reuse the plan through the tombstone-only rebind"
             );
         });
     }
