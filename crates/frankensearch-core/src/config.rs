@@ -162,7 +162,8 @@ pub struct TwoTierConfig {
     /// Default: 0 (use full dimensions).
     pub mrl_search_dims: usize,
 
-    /// Number of top-k candidates to re-score at full dimensionality after MRL scan.
+    /// Initial number of candidates to re-score at full dimensionality after MRL scan.
+    /// Raised to at least the requested result limit; 0 uses three times that limit.
     /// Default: 30.
     pub mrl_rescore_top_k: usize,
 }

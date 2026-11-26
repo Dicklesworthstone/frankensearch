@@ -4299,6 +4299,64 @@ mod tests {
     }
 
     #[test]
+    fn fast_mrl_rescore_budget_does_not_cap_requested_results() {
+        let dir = temp_index_dir("mrl-rescore-budget");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[
+                ("a", &[1.0, 0.0, 0.0, 0.0]),
+                ("replaced", &[0.75, 0.0, 0.0, 0.0]),
+                ("b", &[0.5, 0.0, 0.0, 0.0]),
+                ("c", &[0.25, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write fast index");
+        let mut writer = VectorIndex::open_writer(&fast_path).expect("open writer");
+        writer
+            .append("replaced", &[-0.25, 0.0, 0.0, 0.0])
+            .expect("replace through WAL");
+        writer
+            .append("new", &[0.375, 0.0, 0.0, 0.0])
+            .expect("append through WAL");
+        drop(writer);
+        let config = TwoTierConfig {
+            mrl_search_dims: 2,
+            mrl_rescore_top_k: 1,
+            hnsw_threshold: usize::MAX,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open(&dir, config).expect("open two-tier MRL index");
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let hits = index.search_fast(&query, 4).expect("fast MRL results");
+        assert_eq!(
+            hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "new", "c"]
+        );
+        let classified = index
+            .search_fast_classified(&query, 5)
+            .expect("classified fast MRL results");
+        assert_eq!(
+            classified
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "new", "c", "replaced"]
+        );
+        assert_eq!(
+            classified
+                .hits
+                .iter()
+                .map(|hit| hit.score.to_bits())
+                .collect::<Vec<_>>(),
+            [1.0_f32, 0.5, 0.375, 0.25, -0.25].map(f32::to_bits)
+        );
+        assert_eq!(classified.zero_signal, None);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn fast_candidate_evidence_is_complete_admitted_and_cancellable() {
         let dir = temp_index_dir("fast-candidate-evidence");

@@ -71,7 +71,8 @@ pub struct MrlConfig {
     /// Initial number of top candidates to re-score with full dimensions.
     /// An unusable stored winner can trigger a wider scan to find a valid replacement.
     ///
-    /// Set to 0 to use `3 * limit`.
+    /// Set to 0 to use `3 * limit`. An explicit budget is raised to at least
+    /// the requested limit so it cannot silently cap the result count.
     /// Default: 0 (auto = 3x limit).
     pub rescore_top_k: usize,
 }
@@ -110,6 +111,8 @@ impl MrlConfig {
     const fn effective_rescore_top_k(&self, limit: usize) -> usize {
         if self.rescore_top_k == 0 {
             limit.saturating_mul(3)
+        } else if self.rescore_top_k < limit {
+            limit
         } else {
             self.rescore_top_k
         }
@@ -323,7 +326,7 @@ impl VectorIndex {
             ..MrlSearchStats::default()
         };
         let classified = classified_candidates(
-            limit.min(rescore_top_k),
+            limit,
             row_count,
             |candidate_limit| {
                 let (hits, rescored) = self.mrl_ranked_candidates(
@@ -1776,6 +1779,94 @@ mod tests {
 
         assert!(hits.iter().all(|h| h.doc_id != "doc-wal-skip"));
         assert!(hits.iter().any(|h| h.doc_id == "doc-wal-keep"));
+    }
+
+    #[test]
+    fn explicit_rescore_budget_preserves_requested_result_count() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("rescore-budget-result-count");
+            let mut writer =
+                VectorIndex::create_with_revision(&path, "test", "mrl-test", 4, quantization)
+                    .expect("writer");
+            for (id, score) in [("a", 1.0), ("b", 0.75), ("c", 0.5), ("d", -0.25)] {
+                writer
+                    .write_record(id, &[score, 0.0, 0.0, 0.0])
+                    .expect("record");
+            }
+            writer.finish().expect("finish");
+            let index = VectorIndex::open_read_only(&path).expect("open");
+            let query = [1.0, 0.0, 0.0, 0.0];
+
+            for (rescore_top_k, limit) in
+                [(1, 4), (1, usize::MAX), (0, usize::MAX), (usize::MAX, 4)]
+            {
+                let config = MrlConfig {
+                    search_dims: 2,
+                    rescore_dims: 0,
+                    rescore_top_k,
+                };
+                let (hits, stats) = index
+                    .mrl_search_with_stats(&query, limit, &config, None)
+                    .expect("MRL results");
+                assert_eq!(
+                    hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                    ["a", "b", "c", "d"]
+                );
+                assert_eq!(
+                    hits.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>(),
+                    [1.0_f32, 0.75, 0.5, -0.25].map(f32::to_bits)
+                );
+                assert_eq!(stats.candidates_rescored, 4);
+                assert_eq!(stats.records_scanned, 4);
+                assert_eq!(stats.zero_signal, None);
+                assert!(!stats.fell_back_to_full);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_rescore_budget_preserves_filtered_wal_results() {
+        let path = temp_index_path("rescore-budget-filtered-wal");
+        write_index(
+            &path,
+            &[
+                ("excluded", vec![1.0, 0.0, 0.0, 0.0]),
+                ("replaced", vec![0.75, 0.0, 0.0, 0.0]),
+                ("first", vec![0.5, 0.0, 0.0, 0.0]),
+                ("third", vec![0.25, 0.0, 0.0, 0.0]),
+                ("negative", vec![-0.25, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("index");
+        let mut writer = VectorIndex::open_writer(&path).expect("open writer");
+        writer
+            .append("replaced", &[0.125, 0.0, 0.0, 0.0])
+            .expect("replace through WAL");
+        writer
+            .append("new", &[0.375, 0.0, 0.0, 0.0])
+            .expect("append through WAL");
+        drop(writer);
+        let index = VectorIndex::open_read_only(&path).expect("reopen with WAL");
+        let config = MrlConfig {
+            search_dims: 2,
+            rescore_dims: 0,
+            rescore_top_k: 1,
+        };
+        let filter = PredicateFilter::new("exclude-leading-doc", |id| id != "excluded");
+        let (hits, stats) = index
+            .mrl_search_with_stats(&[1.0, 0.0, 0.0, 0.0], 4, &config, Some(&filter))
+            .expect("filtered MRL results");
+        assert_eq!(
+            hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+            ["first", "new", "third", "replaced"]
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.score.to_bits()).collect::<Vec<_>>(),
+            [0.5_f32, 0.375, 0.25, 0.125].map(f32::to_bits)
+        );
+        assert_eq!(stats.candidates_rescored, 4);
+        assert_eq!(stats.zero_signal, None);
+        assert!(!stats.fell_back_to_full);
     }
 
     #[test]
