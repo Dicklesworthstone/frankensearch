@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::IncludeDocIdsFilter;
+use frankensearch_core::filter::{IncludeDocIdsFilter, SearchFilter};
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{
     BoundQueryEmbedding, Cx, RetrievalTopology, SearchCoverageV1, SearchError, SearchResult,
@@ -2047,8 +2047,8 @@ impl TwoTierIndex {
     ) -> SearchResult<Vec<VectorHit>> {
         tier_checkpoint(cx, "fast_candidate_evidence")?;
         let index = self.fast_tier();
-        if let Some(pair) = self.fast_source.admitted_pair() {
-            activate_tier(cx, Some(pair), query, "fast", None)?;
+        let admitted = if let Some(pair) = self.fast_source.admitted_pair() {
+            Some(activate_tier(cx, Some(pair), query, "fast", None)?)
         } else if index.embedder_revision() != query.identity_fingerprint() {
             return Err(SearchError::InvalidConfig {
                 field: "search_activation.fast.producer_revision".to_owned(),
@@ -2056,21 +2056,26 @@ impl TwoTierIndex {
                 reason: "candidate evidence requires the fast query's complete producer identity"
                     .to_owned(),
             });
-        }
+        } else {
+            None
+        };
         let filter = IncludeDocIdsFilter::new(doc_ids);
         // The candidate cutoff is in physical rows. Score every admitted copy
         // of these IDs so duplicate rows cannot hide a different requested ID.
         // The gather allocates for matched rows, never the corpus-wide bound.
         let limit = index.record_count().saturating_add(index.wal_entries.len());
-        Ok(index
-            .search_top_k_classified_cancellable(
+        let params = params.unwrap_or_default();
+        let result = match admitted {
+            Some(tier) => tier.search_top_k_filtered(limit, &filter, params)?,
+            None => index.search_top_k_classified_cancellable(
                 cx,
                 query.vector(),
                 limit,
                 Some(&filter),
-                params.unwrap_or_default(),
-            )?
-            .hits)
+                params,
+            )?,
+        };
+        Ok(result.hits)
     }
 
     /// Compute quality-tier scores for fast-index document positions.
@@ -3223,6 +3228,32 @@ impl ActivatedTier<'_, '_> {
         Ok(self.search_exact_classified(k, Some(params))?.hits)
     }
 
+    /// Exact filtered top-k from this tier's admitted vector owner.
+    ///
+    /// Applies the request's filter during candidate selection, so a matching
+    /// document remains reachable even when every unfiltered winner is excluded.
+    /// An enabled native graph does not limit the filtered candidate pool.
+    /// Empty results distinguish an exhausted filter from a zero query or an
+    /// index with no usable vectors. Filters receive document IDs with no stored metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error or cooperative cancellation without a partial page.
+    pub fn search_top_k_filtered(
+        &self,
+        k: usize,
+        filter: &dyn SearchFilter,
+        params: SearchParams,
+    ) -> SearchResult<ClassifiedHits> {
+        self.owner.index.search_top_k_classified_cancellable(
+            &self.cx,
+            self.query.vector(),
+            k,
+            Some(filter),
+            params,
+        )
+    }
+
     fn search_exact_classified(
         &self,
         k: usize,
@@ -3516,15 +3547,26 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
             .into_iter()
             .map(|hit| hit.doc_id.to_string())
             .collect();
+        Ok(Self::coverage_from_candidates(Some(tier), &served, returned))
+    }
+
+    fn coverage_from_candidates(
+        tier: Option<&ActivatedTier<'index, 'query>>,
+        served: &BTreeSet<String>,
+        returned: &[VectorHit],
+    ) -> TierQueryCoverageV1 {
+        let Some(tier) = tier else {
+            return TierQueryCoverageV1::NotRequested;
+        };
         let contributed = returned
             .iter()
             .filter(|hit| served.contains(hit.doc_id.as_str()))
             .count();
-        Ok(TierQueryCoverageV1::Witnessed {
+        TierQueryCoverageV1::Witnessed {
             generation_sequence: tier.generation_sequence(),
             live_count: tier.live_count(),
             contributed_candidates: contributed as u64,
-        })
+        }
     }
 
     /// Independent per-tier retrieval unioned by canonical document identity
@@ -3540,13 +3582,52 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     ///
     /// Propagates typed decode failures from either tier.
     pub fn search_union(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.search_union_by(k, |_, tier| tier.search_candidates(k))
+    }
+
+    /// Search every activated owner under the same document filter, then return
+    /// the ranked union and each tier's contribution to that page. Each tier
+    /// independently applies the predicate before its exact top-k cutoff.
+    ///
+    /// Coverage counts the actual filtered candidates by canonical ID. A shared
+    /// winner can contribute to both tiers. A tier that lost every place in the
+    /// final page contributes zero. Computing coverage does not repeat the scan
+    /// or invoke the filter again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates cancellation or an exact scan error without a partial page.
+    pub fn search_union_filtered(
+        &self,
+        k: usize,
+        filter: &dyn SearchFilter,
+        params: SearchParams,
+    ) -> SearchResult<(Vec<VectorHit>, SearchCoverageV1)> {
+        let mut served = [BTreeSet::new(), BTreeSet::new()];
+        let union = self.search_union_by(k, |slot, tier| {
+            let candidates = tier.search_top_k_filtered(k, filter, params)?;
+            served[slot].extend(candidates.hits.iter().map(|hit| hit.doc_id.to_string()));
+            Ok(candidates)
+        })?;
+        let fast = Self::coverage_from_candidates(self.fast.as_ref(), &served[0], &union);
+        let quality = Self::coverage_from_candidates(self.quality.as_ref(), &served[1], &union);
+        self.checkpoint()?;
+        Ok((union, SearchCoverageV1::new(self.topology, fast, quality)))
+    }
+
+    fn search_union_by(
+        &self,
+        k: usize,
+        mut retrieve: impl FnMut(usize, &ActivatedTier<'_, '_>) -> SearchResult<ClassifiedHits>,
+    ) -> SearchResult<Vec<VectorHit>> {
         self.checkpoint()?;
         let mut merged: BTreeMap<String, VectorHit> = BTreeMap::new();
-        for tier in [self.fast.as_ref(), self.quality.as_ref()]
+        for (slot, tier) in [self.fast.as_ref(), self.quality.as_ref()]
             .into_iter()
-            .flatten()
+            .enumerate()
         {
-            for hit in tier.search_candidates(k)?.hits {
+            let Some(tier) = tier else { continue };
+            for hit in retrieve(slot, tier)?.hits {
                 tier_checkpoint(&tier.cx, "search_activation.union")?;
                 merged
                     .entry(hit.doc_id.to_string())
@@ -9500,6 +9581,115 @@ mod tests {
         "native-f32-values".clone_into(&mut query_identity.storage.endianness);
         BoundQueryEmbedding::new(vector.to_vec(), query_identity)
             .expect("bind a query embedding in the fixture's space")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn activated_filtered_exact_reaches_eligible_rows_outside_both_candidate_pools() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let quality_path = directory.path().join("quality.fsvi");
+        let (fast, fast_identity) = fsvi_v2_binding("filtered-fast", 2, 1);
+        let (quality, quality_identity) = fsvi_v2_binding("filtered-quality", 3, 1);
+        write_v2_tier(
+            &fast_path,
+            &fast,
+            &[("top", &[1.0, 0.0]), ("fast-only", &[-1.0, 0.0])],
+        );
+        write_v2_tier(
+            &quality_path,
+            &quality,
+            &[
+                ("top", &[1.0, 0.0, 0.0]),
+                ("quality-only", &[-1.0, 0.0, 0.0]),
+            ],
+        );
+        let paths = TwoTierIndexPaths::new(fast_path).with_quality_index(quality_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast,
+            Some(&quality),
+        )
+        .unwrap();
+        let cx = Cx::for_testing();
+        index
+            .enable_native_fast_hnsw(&cx, HnswParams::default(), 3)
+            .unwrap();
+        index
+            .enable_native_quality_hnsw(&cx, HnswParams::default(), 7)
+            .unwrap();
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0]),
+            bound_query(&quality_identity, &[1.0, 0.0, 0.0]),
+        );
+        let activation = index
+            .activate_owner_backed_search(&cx, &embeddings)
+            .unwrap();
+        let eligible = IncludeDocIdsFilter::new(["fast-only", "quality-only"]);
+        let absent = IncludeDocIdsFilter::new(["absent"]);
+        let params = SearchParams::default();
+        assert_eq!(activation.search_union(1).unwrap()[0].doc_id, "top");
+        for (tier, expected) in [
+            (activation.fast().unwrap(), "fast-only"),
+            (activation.quality().unwrap(), "quality-only"),
+        ] {
+            let classified = tier.search_top_k_filtered(1, &eligible, params).unwrap();
+            assert_eq!(classified.hits.len(), 1);
+            assert_eq!(classified.hits[0].doc_id.as_str(), expected);
+            assert_eq!(classified.zero_signal, None);
+            let empty = tier.search_top_k_filtered(1, &absent, params).unwrap();
+            assert!(empty.hits.is_empty());
+            assert_eq!(
+                empty.zero_signal,
+                Some(ZeroSignalReason::FilterEliminatedAll)
+            );
+        }
+        let witnessed = |count| TierQueryCoverageV1::Witnessed {
+            generation_sequence: 1,
+            live_count: 2,
+            contributed_candidates: count,
+        };
+        let (union, coverage) = activation
+            .search_union_filtered(1, &eligible, params)
+            .unwrap();
+        // The eligible hits tie; canonical ID wins across independent owners.
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].doc_id, "fast-only");
+        assert_eq!(coverage.fast, witnessed(1));
+        assert_eq!(coverage.quality, witnessed(0));
+
+        let shared = IncludeDocIdsFilter::new(["top"]);
+        let (union, coverage) = activation.search_union_filtered(2, &shared, params).unwrap();
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].doc_id, "top");
+        assert_eq!(coverage.fast, witnessed(1));
+        assert_eq!(coverage.quality, witnessed(1));
+
+        let quality_only = TieredQueryEmbeddings::quality_only(bound_query(
+            &quality_identity,
+            &[1.0, 0.0, 0.0],
+        ));
+        let single = index
+            .activate_owner_backed_search(&cx, &quality_only)
+            .unwrap();
+        let (union, coverage) = single.search_union_filtered(1, &eligible, params).unwrap();
+        assert_eq!(union[0].doc_id, "quality-only");
+        assert_eq!(coverage.fast, TierQueryCoverageV1::NotRequested);
+        assert_eq!(coverage.quality, witnessed(1));
+
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            activation.search_union_filtered(0, &eligible, params),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            activation
+                .fast()
+                .unwrap()
+                .search_top_k_filtered(0, &eligible, params),
+            Err(SearchError::Cancelled { .. })
+        ));
     }
 
     #[test]
