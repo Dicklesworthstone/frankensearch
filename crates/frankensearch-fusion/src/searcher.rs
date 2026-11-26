@@ -2361,7 +2361,9 @@ impl TwoTierSearcher {
                 request_filter.validate_retained_ids(cx, &final_candidate_ids)?;
                 #[cfg(feature = "rerank")]
                 let (final_candidates, ranker_id) = self
-                    .run_cross_encoder(cx, semantic_query, final_candidates, &text_fn)
+                    .run_cross_encoder(cx, semantic_query, final_candidates, &text_fn, || {
+                        request_filter.validate_retained_ids(cx, &final_candidate_ids)
+                    })
                     .await?;
                 #[cfg(not(feature = "rerank"))]
                 let ranker_id = None;
@@ -4869,12 +4871,13 @@ impl TwoTierSearcher {
         query: &str,
         mut results: Vec<ScoredResult>,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        admit: impl Fn() -> SearchResult<()> + Send + Sync,
     ) -> SearchResult<(Vec<ScoredResult>, Option<String>)> {
         let mut ranker_id = None;
         if let Some(ref reranker) = self.reranker {
             let rerank_budget = self.rerank_window.min(results.len());
             if rerank_budget > 0 {
-                frankensearch_rerank::pipeline::rerank_step_with_combine(
+                frankensearch_rerank::pipeline::rerank_step_with_combine_and_admission(
                     cx,
                     reranker.as_ref(),
                     query,
@@ -4883,6 +4886,7 @@ impl TwoTierSearcher {
                     rerank_budget,
                     1,
                     self.rerank_combine,
+                    admit,
                 )
                 .await?;
                 if results[..rerank_budget]
@@ -22076,10 +22080,9 @@ mod tests {
                 for mode in ["fast", "progressive", "quality"] {
                     for target in ["doc-a", "doc-b"] {
                         let revoked = AtomicBool::new(false);
-                        let filter =
-                            AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
-                                id != target || !revoked.load(Ordering::SeqCst)
-                            });
+                        let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                            id != target || !revoked.load(Ordering::SeqCst)
+                        });
                         let mut searcher = TwoTierSearcher::new(
                             index.clone(),
                             Arc::new(query_admission_embedder("fast")),
@@ -22232,27 +22235,35 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_dir, index) = build_promotion_index();
-            for reply in ["success", "failed", "malformed", "cancelled", "no-text", "late"] {
+            for reply in [
+                "success",
+                "failed",
+                "malformed",
+                "cancelled",
+                "no-text",
+                "late",
+                "text-first",
+                "text-last",
+            ] {
                 for change_policy in [false, true] {
                     // doc-d is outside both the displayed prefix and the
                     // cross-encoder window, but remains in the MMR pool.
-                    for target in ["doc-a", "doc-d"] {
+                    for target in ["doc-a", "doc-b", "doc-d"] {
                         let revoked = Arc::new(AtomicBool::new(false));
                         let late_revoked = AtomicBool::new(false);
-                        let filter =
-                            AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
-                                if reply == "late" {
-                                    // The middle check admits doc-a before doc-d
-                                    // revokes it. MMR then drops doc-a, so only
-                                    // checking displayed output would miss it.
-                                    if id == "doc-d" && revoked.load(Ordering::SeqCst) {
-                                        late_revoked.store(true, Ordering::SeqCst);
-                                    }
-                                    id != target || !late_revoked.load(Ordering::SeqCst)
-                                } else {
-                                    id != target || !revoked.load(Ordering::SeqCst)
+                        let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                            if reply == "late" {
+                                // A later candidate revokes an earlier
+                                // admission, including a candidate that
+                                // need not appear in the eventual output.
+                                if id == "doc-d" && revoked.load(Ordering::SeqCst) {
+                                    late_revoked.store(true, Ordering::SeqCst);
                                 }
-                            });
+                                id != target || !late_revoked.load(Ordering::SeqCst)
+                            } else {
+                                id != target || !revoked.load(Ordering::SeqCst)
+                            }
+                        });
                         let reranker = Arc::new(PolicyChangingReranker {
                             revoked: revoked.clone(),
                             change_policy,
@@ -22275,7 +22286,15 @@ mod tests {
                             candidate_pool: 4,
                             ..MmrConfig::default()
                         });
+                        let text_calls = AtomicU64::new(0);
                         let text = |_: &str| {
+                            let call = text_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            if change_policy
+                                && ((reply == "text-first" && call == 1)
+                                    || (reply == "text-last" && call == 2))
+                            {
+                                revoked.store(true, Ordering::SeqCst);
+                            }
                             if reply == "no-text" {
                                 revoked.store(change_policy, Ordering::SeqCst);
                                 None
@@ -22298,10 +22317,17 @@ mod tests {
                                 },
                             )
                             .await;
-                        assert_eq!(
-                            reranker.calls.load(Ordering::SeqCst),
-                            u64::from(reply != "no-text")
-                        );
+                        let text_revocation =
+                            change_policy && matches!(reply, "text-first" | "text-last");
+                        let expected_calls = u64::from(reply != "no-text" && !text_revocation);
+                        assert_eq!(reranker.calls.load(Ordering::SeqCst), expected_calls);
+                        let expected_text_calls =
+                            if change_policy && matches!(reply, "no-text" | "text-first") {
+                                1
+                            } else {
+                                2
+                            };
+                        assert_eq!(text_calls.load(Ordering::SeqCst), expected_text_calls);
                         if reply == "cancelled" {
                             assert!(matches!(
                                 result,
@@ -22325,6 +22351,7 @@ mod tests {
                         // of returning the previously accepted Initial phase.
                         revoked.store(false, Ordering::SeqCst);
                         late_revoked.store(false, Ordering::SeqCst);
+                        text_calls.store(0, Ordering::SeqCst);
                         let collected = searcher
                             .search_collect_with_text_and_filter(
                                 &cx,
@@ -22345,6 +22372,8 @@ mod tests {
                         } else {
                             assert_eq!(collected.unwrap().0.len(), 1);
                         }
+                        assert_eq!(reranker.calls.load(Ordering::SeqCst), expected_calls * 2);
+                        assert_eq!(text_calls.load(Ordering::SeqCst), expected_text_calls);
                     }
                 }
             }

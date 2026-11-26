@@ -1806,10 +1806,12 @@ impl SyncTwoTierSearcher {
         let Some(filter) = filter.filter(|_| outcome.final_ranking.is_some()) else {
             return Ok(self.rank_final_candidates(outcome, want_phase));
         };
-        let candidates = outcome.final_ranking.as_ref().map_or(
-            outcome.final_results.as_slice(),
-            |ranking| ranking.candidates.as_slice(),
-        );
+        let candidates = outcome
+            .final_ranking
+            .as_ref()
+            .map_or(outcome.final_results.as_slice(), |ranking| {
+                ranking.candidates.as_slice()
+            });
         let refusal = || SearchError::InvalidConfig {
             field: "search.filter".to_owned(),
             value: "eligibility_changed".to_owned(),
@@ -3492,7 +3494,7 @@ mod tests {
                 self.0.lock().unwrap().as_deref() != Some(id)
             }
 
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "phase-filter"
             }
         }
@@ -3501,11 +3503,9 @@ mod tests {
             for mode in ["fast", "quality", "progressive"] {
                 for revoked in [None, Some("shown"), Some("hidden")] {
                     let directory = temp_dir("mmr-phase-filter");
-                    let (index, fast, quality) =
-                        sync_mmr_fixture(directory.path(), attested, true);
+                    let (index, fast, quality) = sync_mmr_fixture(directory.path(), attested, true);
                     let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], fast).unwrap();
-                    let quality =
-                        BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap();
+                    let quality = BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], quality).unwrap();
                     let query = match mode {
                         "fast" => TieredQueryEmbeddings::fast_only(fast),
                         "quality" => TieredQueryEmbeddings::quality_only(quality),
@@ -3521,8 +3521,7 @@ mod tests {
                     )
                     .with_mmr_config(sync_mmr_config());
                     let filter = PhaseFilter(Mutex::new(None));
-                    let mut phases =
-                        searcher.search_iter_with_filter(&query, 1, Some(&filter));
+                    let mut phases = searcher.search_iter_with_filter(&query, 1, Some(&filter));
                     let Some(SearchPhase::Initial { results, .. }) = phases.next() else {
                         panic!("retrieval must precede optional diversity ranking");
                     };
@@ -3602,7 +3601,7 @@ mod tests {
                 id != "a" || !self.revoked.load(Ordering::Relaxed)
             }
 
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "late-final-revocation"
             }
         }
@@ -6949,7 +6948,7 @@ mod tests {
                 })
             }
 
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "changed-metadata-policy"
             }
         }

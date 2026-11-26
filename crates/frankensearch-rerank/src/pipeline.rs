@@ -2,7 +2,9 @@
 //!
 //! The [`rerank_step`] function reranks a set of `ScoredResult` candidates using a
 //! [`Reranker`] implementation. It looks up document text via a caller-provided closure,
-//! gracefully skips reranking on any failure, and supports cancellation via `&Cx`.
+//! gracefully skips ordinary provider failures, and supports cancellation via `&Cx`.
+//! [`rerank_step_with_combine_and_admission`] also checks request eligibility before
+//! exposing text to inference and before committing the resulting order.
 
 use std::cmp::Ordering;
 
@@ -126,12 +128,6 @@ pub async fn rerank_step(
 ///
 /// Returns `SearchError::Cancelled` if the operation was cancelled via `cx`.
 /// All other reranker errors are caught and logged, returning `Ok(())`.
-#[instrument(skip_all, fields(
-    query_len = query.len(),
-    num_candidates = candidates.len(),
-    top_k = top_k_rerank,
-))]
-#[allow(clippy::too_many_lines)]
 pub async fn rerank_step_with_combine(
     cx: &Cx,
     reranker: &dyn Reranker,
@@ -142,7 +138,56 @@ pub async fn rerank_step_with_combine(
     min_candidates: usize,
     combine: RerankCombine,
 ) -> SearchResult<()> {
-    rerank_checkpoint(cx, "reranker_entry")?;
+    rerank_step_with_combine_and_admission(
+        cx,
+        reranker,
+        query,
+        candidates,
+        text_fn,
+        top_k_rerank,
+        min_candidates,
+        combine,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Rerank candidates with a request-specific eligibility check at callback boundaries.
+///
+/// This follows [`rerank_step_with_combine`], but also calls `admission` at entry,
+/// before and after each text lookup, before and after inference, and immediately
+/// before committing scores and order. This lets callers reject an eligibility
+/// change caused by a text or provider callback before further text is exposed or
+/// results are changed. A missing text or ordinary provider error cannot turn a
+/// rejected request into a graceful skip.
+///
+/// Cancellation is checked before and after `admission`. A provider's explicit
+/// cancellation also takes precedence over admission failure. All checks precede
+/// the synchronous mutation boundary; a failure leaves candidates unchanged.
+///
+/// # Errors
+///
+/// Returns cancellation or an error returned by `admission`. Admission errors are
+/// propagated unchanged, while ordinary provider errors retain the graceful-skip
+/// behavior of [`rerank_step_with_combine`].
+#[instrument(name = "rerank_step_with_combine", skip_all, fields(
+    query_len = query.len(),
+    num_candidates = candidates.len(),
+    top_k = top_k_rerank,
+))]
+#[allow(clippy::too_many_lines)]
+pub async fn rerank_step_with_combine_and_admission(
+    cx: &Cx,
+    reranker: &dyn Reranker,
+    query: &str,
+    candidates: &mut [ScoredResult],
+    text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
+    top_k_rerank: usize,
+    min_candidates: usize,
+    combine: RerankCombine,
+    admission: impl Fn() -> SearchResult<()> + Send + Sync,
+) -> SearchResult<()> {
+    rerank_admission_checkpoint(cx, "reranker_entry", &admission)?;
     if candidates.len() < min_candidates {
         tracing::debug!(
             count = candidates.len(),
@@ -163,9 +208,9 @@ pub async fn rerank_step_with_combine(
     let mut included_indices: Option<Vec<usize>> = None;
 
     for (i, candidate) in candidates.iter().take(rerank_count).enumerate() {
-        rerank_checkpoint(cx, "reranker_before_text")?;
+        rerank_admission_checkpoint(cx, "reranker_before_text", &admission)?;
         let text = text_fn(&candidate.doc_id);
-        rerank_checkpoint(cx, "reranker_after_text")?;
+        rerank_admission_checkpoint(cx, "reranker_after_text", &admission)?;
         if let Some(text) = text {
             rerank_docs.push(RerankDocument {
                 doc_id: candidate.doc_id.to_string(),
@@ -192,19 +237,20 @@ pub async fn rerank_step_with_combine(
 
     // Cancellation outranks BOTH successful output and an ordinary provider
     // error. Do not return a graceful skip before observing the invocation.
-    rerank_checkpoint(cx, "reranker_before_inference")?;
+    rerank_admission_checkpoint(cx, "reranker_before_inference", &admission)?;
     let response =
         frankensearch_core::with_cancellation(cx, "reranker_to_score_validation", async {
             reranker.rerank(cx, query, &rerank_docs).await
         })
         .await;
     rerank_checkpoint(cx, "reranker_to_score_validation")?;
+    let response = match response {
+        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+        response => response,
+    };
+    rerank_admission_checkpoint(cx, "reranker_to_score_validation", &admission)?;
     let scores = match response {
         Ok(scores) => scores,
-        Err(SearchError::Cancelled { phase, reason }) => {
-            // Cancellation propagates up — this is not a graceful skip.
-            return Err(SearchError::Cancelled { phase, reason });
-        }
         Err(_) => {
             // The exception can contain query/document text or an arbitrary
             // formatter. Logging it is not required to retain valid results.
@@ -226,7 +272,7 @@ pub async fn rerank_step_with_combine(
     // Resolve the last provider callback before the commit checkpoint. Nothing
     // below invokes the provider or can return cancellation after mutating data.
     let model = reranker.id().to_owned();
-    rerank_checkpoint(cx, "reranker_commit")?;
+    rerank_admission_checkpoint(cx, "reranker_commit", &admission)?;
     clear_rerank_scores(candidates, rerank_count);
 
     // Apply rerank scores to the original candidates using `original_rank`.
@@ -275,6 +321,17 @@ pub async fn rerank_step_with_combine(
     );
 
     Ok(())
+}
+
+fn rerank_admission_checkpoint(
+    cx: &Cx,
+    phase: &str,
+    admission: &impl Fn() -> SearchResult<()>,
+) -> SearchResult<()> {
+    rerank_checkpoint(cx, phase)?;
+    let result = admission();
+    rerank_checkpoint(cx, phase)?;
+    result
 }
 
 fn rerank_checkpoint(cx: &Cx, phase: &str) -> SearchResult<()> {
@@ -1670,12 +1727,13 @@ mod tests {
         use super::*;
         use std::future::Future;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
         use std::task::{Context, Poll, Waker};
 
         #[derive(Clone, Copy, Debug)]
         enum Reply {
             Valid,
+            Error,
             Short,
             Long,
             Duplicate,
@@ -1694,6 +1752,8 @@ mod tests {
             calls: AtomicUsize,
             drops: AtomicUsize,
             cancel_on_id: Option<Cx>,
+            revoke_on_response: Option<Arc<AtomicBool>>,
+            revoke_on_id: Option<Arc<AtomicBool>>,
         }
 
         impl Probe {
@@ -1703,6 +1763,8 @@ mod tests {
                     calls: AtomicUsize::new(0),
                     drops: AtomicUsize::new(0),
                     cancel_on_id: None,
+                    revoke_on_response: None,
+                    revoke_on_id: None,
                 }
             }
         }
@@ -1729,10 +1791,19 @@ mod tests {
                     if matches!(self.reply, Reply::Pending) {
                         return std::future::pending().await;
                     }
+                    if let Some(eligible) = &self.revoke_on_response {
+                        eligible.store(false, AtomicOrdering::Relaxed);
+                    }
                     if matches!(self.reply, Reply::ProviderCancelled) {
                         return Err(SearchError::Cancelled {
                             phase: "fixture.provider".to_owned(),
                             reason: "provider stopped".to_owned(),
+                        });
+                    }
+                    if matches!(self.reply, Reply::Error) {
+                        return Err(SearchError::RerankFailed {
+                            model: "probe".to_owned(),
+                            source: "ordinary provider error".into(),
                         });
                     }
                     let mut scores: Vec<_> = documents
@@ -1780,7 +1851,8 @@ mod tests {
                                 });
                             }
                         }
-                        Reply::Valid | Reply::ProviderCancelled | Reply::Pending => {}
+                        Reply::Valid | Reply::Error | Reply::ProviderCancelled | Reply::Pending => {
+                        }
                     }
                     Ok(scores)
                 })
@@ -1789,6 +1861,9 @@ mod tests {
             fn id(&self) -> &str {
                 if let Some(cx) = &self.cancel_on_id {
                     cx.cancel_with(asupersync::CancelKind::User, Some("model label cancelled"));
+                }
+                if let Some(eligible) = &self.revoke_on_id {
+                    eligible.store(false, AtomicOrdering::Relaxed);
                 }
                 "admission-probe"
             }
@@ -1846,12 +1921,230 @@ mod tests {
             }
         }
 
+        fn admit_while_eligible(eligible: &AtomicBool) -> SearchResult<()> {
+            if eligible.load(AtomicOrdering::Relaxed) {
+                Ok(())
+            } else {
+                Err(SearchError::InvalidConfig {
+                    field: "search.filter".to_owned(),
+                    value: "eligibility_changed".to_owned(),
+                    reason: "request eligibility was revoked".to_owned(),
+                })
+            }
+        }
+
+        fn assert_admission_rejected(error: SearchError) {
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, reason }
+                    if field == "search.filter"
+                        && value == "eligibility_changed"
+                        && reason == "request eligibility was revoked"
+            ));
+        }
+
         const STRATEGIES: [RerankCombine; 2] = [
             RerankCombine::PureReorder,
             RerankCombine::RrfCombine {
                 k: DEFAULT_RRF_COMBINE_K,
             },
         ];
+
+        #[test]
+        fn rejected_requests_skip_text_and_inference_even_for_noops() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for (count, top_k, minimum) in [(0, 10, 0), (7, 0, 0), (7, 7, 100), (7, 7, 1)] {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    values.truncate(count);
+                    let before = values.clone();
+                    let lookups = AtomicUsize::new(0);
+                    let eligible = AtomicBool::new(false);
+                    let error = rerank_step_with_combine_and_admission(
+                        &cx,
+                        &provider,
+                        "query",
+                        &mut values,
+                        |id| {
+                            lookups.fetch_add(1, AtomicOrdering::Relaxed);
+                            text_for_doc(id)
+                        },
+                        top_k,
+                        minimum,
+                        RerankCombine::PureReorder,
+                        || admit_while_eligible(&eligible),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_admission_rejected(error);
+                    assert_unchanged(&values, &before);
+                    assert_eq!(lookups.load(AtomicOrdering::Relaxed), 0);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                }
+            });
+        }
+
+        #[test]
+        fn text_lookup_revocation_stops_before_later_lookups_or_inference() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    for missing in [false, true] {
+                        for revoke_at in [0, 5] {
+                            let provider = Probe::new(Reply::Valid);
+                            let mut values = candidates();
+                            let before = values.clone();
+                            let lookups = AtomicUsize::new(0);
+                            let eligible = AtomicBool::new(true);
+                            let error = rerank_step_with_combine_and_admission(
+                                &cx,
+                                &provider,
+                                "query",
+                                &mut values,
+                                |id| {
+                                    if lookups.fetch_add(1, AtomicOrdering::Relaxed) == revoke_at {
+                                        eligible.store(false, AtomicOrdering::Relaxed);
+                                    }
+                                    if missing { None } else { text_for_doc(id) }
+                                },
+                                6,
+                                1,
+                                combine,
+                                || admit_while_eligible(&eligible),
+                            )
+                            .await
+                            .unwrap_err();
+                            assert_admission_rejected(error);
+                            assert_unchanged(&values, &before);
+                            assert_eq!(lookups.load(AtomicOrdering::Relaxed), revoke_at + 1);
+                            assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn provider_revocation_rejects_success_and_graceful_skip_but_preserves_cancellation() {
+            for combine in STRATEGIES {
+                for reply in [
+                    Reply::Valid,
+                    Reply::Error,
+                    Reply::WrongId,
+                    Reply::CancelSuccess,
+                    Reply::CancelError,
+                    Reply::ProviderCancelled,
+                ] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let eligible = Arc::new(AtomicBool::new(true));
+                        let mut provider = Probe::new(reply);
+                        provider.revoke_on_response = Some(Arc::clone(&eligible));
+                        let mut values = candidates();
+                        let before = values.clone();
+                        let error = rerank_step_with_combine_and_admission(
+                            &cx,
+                            &provider,
+                            "query",
+                            &mut values,
+                            text_for_doc,
+                            6,
+                            1,
+                            combine,
+                            || admit_while_eligible(&eligible),
+                        )
+                        .await
+                        .unwrap_err();
+                        match reply {
+                            Reply::ProviderCancelled => assert!(matches!(
+                                error,
+                                SearchError::Cancelled { phase, reason }
+                                    if phase == "fixture.provider" && reason == "provider stopped"
+                            )),
+                            Reply::CancelSuccess | Reply::CancelError => assert!(matches!(
+                                error,
+                                SearchError::Cancelled { phase, .. }
+                                    if phase == "reranker_to_score_validation"
+                            )),
+                            _ => assert_admission_rejected(error),
+                        }
+                        assert!(!eligible.load(AtomicOrdering::Relaxed));
+                        assert_unchanged(&values, &before);
+                        assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+                        assert_eq!(provider.drops.load(AtomicOrdering::Relaxed), 1);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn cancellation_from_admission_wins_over_its_return_value() {
+            for reject in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    let before = values.clone();
+                    let lookups = AtomicUsize::new(0);
+                    let eligible = AtomicBool::new(!reject);
+                    let error = rerank_step_with_combine_and_admission(
+                        &cx,
+                        &provider,
+                        "query",
+                        &mut values,
+                        |id| {
+                            lookups.fetch_add(1, AtomicOrdering::Relaxed);
+                            text_for_doc(id)
+                        },
+                        6,
+                        1,
+                        RerankCombine::PureReorder,
+                        || {
+                            cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("admission cancelled"),
+                            );
+                            admit_while_eligible(&eligible)
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        SearchError::Cancelled { phase, .. } if phase == "reranker_entry"
+                    ));
+                    assert_unchanged(&values, &before);
+                    assert_eq!(lookups.load(AtomicOrdering::Relaxed), 0);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                });
+            }
+        }
+
+        #[test]
+        fn eligibility_revoked_by_model_label_is_observed_before_commit() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    let eligible = Arc::new(AtomicBool::new(true));
+                    let mut provider = Probe::new(Reply::Valid);
+                    provider.revoke_on_id = Some(Arc::clone(&eligible));
+                    let mut values = candidates();
+                    let before = values.clone();
+                    let error = rerank_step_with_combine_and_admission(
+                        &cx,
+                        &provider,
+                        "query",
+                        &mut values,
+                        text_for_doc,
+                        6,
+                        1,
+                        combine,
+                        || admit_while_eligible(&eligible),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_admission_rejected(error);
+                    assert_unchanged(&values, &before);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+                }
+            });
+        }
 
         #[test]
         fn malformed_responses_leave_full_and_compacted_windows_unchanged() {

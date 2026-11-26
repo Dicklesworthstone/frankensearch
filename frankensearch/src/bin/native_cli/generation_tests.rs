@@ -8709,7 +8709,10 @@ mod progressive_authority {
                             assert!(rejected.is_empty());
                             assert!(!undo.receipt.exists());
                             assert_eq!(calls(&fast, &quality), before_rollback);
-                            assert_eq!(fs::read(selected.root.join("AUTHORITY")).unwrap(), authority);
+                            assert_eq!(
+                                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                                authority
+                            );
                             assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock);
                         }
 
@@ -8739,7 +8742,9 @@ mod progressive_authority {
                         );
                         assert_eq!(
                             serde_json::to_value(
-                                restored_reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap()
+                                restored_reader
+                                    .source_documents(&cx, MAX_INPUT_BYTES)
+                                    .unwrap()
                             )
                             .unwrap(),
                             serde_json::to_value(&source).unwrap()
