@@ -51,6 +51,7 @@ pub enum RerankCombine {
     /// Candidates without available text retain only their retrieval contribution.
     RrfCombine {
         /// RRF constant; see [`DEFAULT_RRF_COMBINE_K`].
+        /// Non-finite values use that default; finite values below 1 use 1.
         k: f32,
     },
 }
@@ -473,7 +474,11 @@ fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
     if n < 2 {
         return;
     }
-    let kf = f64::from(k.max(1.0));
+    let kf = f64::from(if k.is_finite() {
+        k.max(1.0)
+    } else {
+        DEFAULT_RRF_COMBINE_K
+    });
 
     // One order vector carries both stages: first sort it by rerank score to
     // assign rerank ranks, then overwrite each entry with its fused key and sort
@@ -942,6 +947,111 @@ mod tests {
                         available.contains(&hit.doc_id.as_str()),
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rrf_combine_non_finite_k_uses_default_in_sync_and_async() {
+        use frankensearch_core::traits::SyncRerankerAdapter;
+
+        struct DeepWinner;
+
+        impl SyncRerank for DeepWinner {
+            fn rerank_sync(
+                &self,
+                _query: &str,
+                documents: &[RerankDocument],
+            ) -> SearchResult<Vec<RerankScore>> {
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(original_rank, document)| RerankScore {
+                        doc_id: document.doc_id.clone(),
+                        score: [0.4, 0.3, 0.2, 0.1, 0.9][original_rank],
+                        original_rank,
+                        raw_logit: None,
+                    })
+                    .collect())
+            }
+
+            fn id(&self) -> &str {
+                "deep-winner"
+            }
+
+            fn model_name(&self) -> &str {
+                "deep-winner"
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = SyncRerankerAdapter(DeepWinner);
+            let ids = ["z-retrieval", "y-second", "x-third", "w-fourth", "v-deep", "tail"];
+            let default_order = [
+                "z-retrieval", "y-second", "v-deep", "x-third", "w-fourth", "tail",
+            ];
+            let sharp_order = [
+                "z-retrieval", "v-deep", "y-second", "x-third", "w-fourth", "tail",
+            ];
+            // These distinct orders also detect accidental k=1 fallback and
+            // all-zero keys, which would instead sort by document ID.
+            for (k, expected) in [
+                (f32::NAN, default_order),
+                (f32::INFINITY, default_order),
+                (f32::NEG_INFINITY, default_order),
+                (DEFAULT_RRF_COMBINE_K, default_order),
+                (1.0, sharp_order),
+                (0.0, sharp_order),
+                (-1.0, sharp_order),
+            ] {
+                let mut before = make_candidates(ids.len());
+                for (candidate, id) in before.iter_mut().zip(ids) {
+                    candidate.doc_id = id.into();
+                }
+                before[5].rerank_score = Some(444.0);
+                let mut asynchronous = before.clone();
+                let mut synchronous = before.clone();
+                rerank_step_with_combine(
+                    &cx,
+                    &provider,
+                    "query",
+                    &mut asynchronous,
+                    text_for_doc,
+                    5,
+                    1,
+                    RerankCombine::RrfCombine { k },
+                )
+                .await
+                .unwrap();
+                rerank_step_sync_with_combine_and_admission(
+                    &cx,
+                    &provider.0,
+                    "query",
+                    &mut synchronous,
+                    text_for_doc,
+                    5,
+                    1,
+                    RerankCombine::RrfCombine { k },
+                    || Ok(()),
+                )
+                .unwrap();
+                assert_eq!(
+                    asynchronous
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                );
+                assert_eq!(
+                    serde_json::to_value(&synchronous).unwrap(),
+                    serde_json::to_value(&asynchronous).unwrap(),
+                );
+                assert_eq!(
+                    serde_json::to_value(&asynchronous[5]).unwrap(),
+                    serde_json::to_value(&before[5]).unwrap(),
+                    "the tail outside the rerank window is unchanged",
+                );
             }
         });
     }
