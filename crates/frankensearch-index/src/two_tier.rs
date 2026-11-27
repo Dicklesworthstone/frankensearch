@@ -11677,6 +11677,7 @@ mod tests {
             .unwrap();
         assert_eq!(native_candidates.hits, approximate);
         assert_eq!(exact_candidates.hits, exact);
+        assert_eq!(activated.topology(), RetrievalTopology::HashControl);
         // Coverage remains available after releasing the reader. A candidate
         // outside the native window and a repeated ID cannot inflate it.
         drop(index);
@@ -11685,7 +11686,7 @@ mod tests {
             assert_eq!(
                 window.into_coverage(&retained),
                 SearchCoverageV1::new(
-                    RetrievalTopology::QualityOnly,
+                    RetrievalTopology::HashControl,
                     TierQueryCoverageV1::NotRequested,
                     TierQueryCoverageV1::Witnessed {
                         generation_sequence: 72,
