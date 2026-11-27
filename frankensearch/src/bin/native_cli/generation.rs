@@ -151,12 +151,13 @@ does not turn a completed final page into a timeout. A warm request's timeout_ms
 can shorten the server's --timeout-ms ceiling. A timed-out query leaves the\n\
 retained authority and warm models available for subsequent requests.\n\
 --full-query uses the ordinary CLI's validated fusion, candidate and graph-beam\n\
-settings for full mode. Reranking requires an explicit local --reranker-dir;\n\
+settings for full and explicit partial mode. Reranking requires a local --reranker-dir;\n\
 its window defaults to 50 (1..1000). Only final eligible candidate source is\n\
 read, bounded by --max-source-bytes, from the same retained authority. Streaming\n\
 delivers Initial, Refined and, when performed, Reranked; buffered search requires\n\
 every configured stage to succeed. The original timeout also covers reranking.\n\
-Full-query tuning requires a complete full generation. Reranking also supports\n\
+Partial tuning searches the complete fast tier and only the covered quality rows.\n\
+Reranking also supports\n\
 fast-only and quality-only requests: streaming emits Initial or Quality, then\n\
 Reranked when a nonempty eligible window is scored. Only the chosen embedding\n\
 producer is queried; its scores and row ownership survive final ranking.\n\
@@ -452,6 +453,10 @@ enum QueryMode {
 }
 
 impl QueryMode {
+    const fn is_progressive(self) -> bool {
+        matches!(self, Self::Full | Self::Partial)
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Fast => "fast",
@@ -943,10 +948,12 @@ impl Options {
             return Err(bad("--rerank-window requires --reranker-dir"));
         }
         if command == Command::Search
-            && options.mode.is_some_and(|mode| mode != QueryMode::Full)
+            && options.mode.is_some_and(|mode| !mode.is_progressive())
             && options.full_query.is_some()
         {
-            return Err(bad("full-query tuning requires --mode full"));
+            return Err(bad(
+                "full-query tuning requires --mode full or --mode partial",
+            ));
         }
         match command {
             Command::Index => {
@@ -1194,10 +1201,25 @@ fn annotate_snapshot_retrieval(
 // Query modes are a CLI policy; receipt validation and retained admission are
 // shared with facade consumers such as fsfs.
 trait ReceiptQueryMode {
+    fn warm_model_mode(&self, lexical_only: bool) -> QueryMode;
     fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode>;
 }
 
 impl ReceiptQueryMode for Receipt {
+    // A warm partial selection retains both producers for explicit refinement
+    // while continuing to serve fast queries by default.
+    fn warm_model_mode(&self, lexical_only: bool) -> QueryMode {
+        if lexical_only {
+            return QueryMode::Lexical;
+        }
+        match self.topology() {
+            NativeGenerationTopology::FastOnly => QueryMode::Fast,
+            NativeGenerationTopology::QualityOnly => QueryMode::Quality,
+            NativeGenerationTopology::FullProgressive => QueryMode::Full,
+            NativeGenerationTopology::PartialQuality { .. } => QueryMode::Partial,
+        }
+    }
+
     fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode> {
         let default = match self.topology() {
             NativeGenerationTopology::FastOnly => QueryMode::Fast,
@@ -4058,6 +4080,11 @@ impl AuthoritySession {
         };
         response["query_modes"] = serde_json::json!(modes);
         response["default_mode"] = serde_json::json!(default_mode);
+        // A granted policy stays available across model activation, but a
+        // successor with only one vector tier cannot execute two-tier tuning.
+        let two_tier = semantic && self.receipt.quality_identity.is_some();
+        response["query_tuning_enabled"] =
+            serde_json::json!(two_tier && self.query_policy.query_overrides_enabled());
         response["progressive_available"] = serde_json::json!(
             semantic
                 && (self.receipt.quality_identity.is_some() || self.query_policy.rerank.is_some())
@@ -4588,8 +4615,6 @@ async fn serve_session(
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["maximum_timeout_ms"] = serde_json::json!(session.query_policy.maximum_ms());
     ready["query_cache_entries"] = serde_json::json!(session.query_cache.entries());
-    ready["query_tuning_enabled"] =
-        serde_json::json!(session.query_policy.query_overrides_enabled());
     ready["rerank_window"] = serde_json::json!(
         session
             .query_policy
@@ -4597,7 +4622,8 @@ async fn serve_session(
             .as_ref()
             .map(|rerank| rerank.window)
     );
-    query_controls::annotate(&session.query_policy, QueryMode::Full, &mut ready);
+    let policy_mode = session.receipt.warm_model_mode(session.models.is_lexical());
+    query_controls::annotate(&session.query_policy, policy_mode, &mut ready);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
     emit(output, &ready)?;
@@ -4800,14 +4826,8 @@ async fn serve(
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
     let receipt = Receipt::read(&options.receipt)?;
-    query_controls::validate_startup(
-        options,
-        if options.lexical_only {
-            QueryMode::Lexical
-        } else {
-            receipt.query_mode(None)?
-        },
-    )?;
+    let model_mode = receipt.warm_model_mode(options.lexical_only);
+    query_controls::validate_startup(options, model_mode)?;
     options.quality.validate_usage(
         receipt.tier == EmbedderTierTag::Quality || receipt.quality_identity.is_some(),
     )?;
@@ -4828,11 +4848,6 @@ async fn serve(
     let loaded = if options.lexical_only {
         AuthorityModels::Lexical
     } else {
-        let model_mode = if receipt.quality_documents.is_some() {
-            QueryMode::Partial
-        } else {
-            receipt.query_mode(None)?
-        };
         load_authority_models(cx, options, model_mode, pool)?.into()
     };
     let mut session = AuthoritySession::new(

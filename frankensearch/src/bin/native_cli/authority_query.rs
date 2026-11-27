@@ -31,9 +31,9 @@ pub(super) struct SearchEnvelope {
 }
 
 pub(super) fn validate_startup(options: &Options, mode: QueryMode) -> Result<()> {
-    if options.full_query.is_some() && mode != QueryMode::Full {
+    if options.full_query.is_some() && !mode.is_progressive() {
         return Err(bad(
-            "full-query tuning requires a complete full generation in full mode",
+            "full-query tuning requires two-tier search in full or partial mode",
         ));
     }
     if options.reranker_dir.is_some() && mode == QueryMode::Lexical {
@@ -266,7 +266,7 @@ pub(super) fn configure_reranker<'a>(
 }
 
 pub(super) fn annotate(policy: &query::Policy, mode: QueryMode, response: &mut serde_json::Value) {
-    if mode == QueryMode::Full {
+    if mode.is_progressive() {
         policy.annotate_full_query(crate::Mode::Full, response);
     }
     if mode != QueryMode::Lexical
@@ -287,8 +287,14 @@ pub(super) async fn execute(
     let mode = session
         .models
         .query_mode(&session.receipt, message.request.mode)?;
-    if mode != QueryMode::Full {
-        return Err(serve_refused("query_tuning_requires_full_mode"));
+    if !mode.is_progressive() {
+        return Err(serve_refused(
+            if session.receipt.quality_documents.is_some() {
+                "query_tuning_requires_partial_mode"
+            } else {
+                "query_tuning_requires_full_mode"
+            },
+        ));
     }
     let policy = session
         .query_policy

@@ -498,6 +498,11 @@ fn query_control_options_and_request_envelopes_are_explicit_bounded_and_strict()
         assert!(selected.reranker_dir.is_some());
         query_controls::validate_startup(&selected, selected.mode.unwrap()).unwrap();
     }
+    let partial = parsed(&["--mode", "partial", "--full-query", TUNED])
+        .unwrap()
+        .unwrap();
+    query_controls::validate_startup(&partial, QueryMode::Partial).unwrap();
+    assert!(query_controls::validate_startup(&partial, QueryMode::Fast).is_err());
     for mut arguments in [
         index_arguments(),
         rebuild_arguments(),
@@ -544,6 +549,113 @@ fn query_control_options_and_request_envelopes_are_explicit_bounded_and_strict()
         serde_json::from_str::<AuthorityRequest>(r#"{"op":"search","request":{"query":"needle"}}"#)
             .is_err()
     );
+}
+
+#[test]
+fn partial_query_tuning_changes_fusion_and_preserves_actual_quality_evidence() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let (built, _) = publish_partial_cli(&cx, &parent, &fast, &quality, ann).await;
+            let mut options = partial_search_options(&built.receipt, Some(QueryMode::Partial));
+            let mut responses = Vec::new();
+            for tuning in [None, Some(TUNED)] {
+                options.full_query = tuning.map(|json| query::FullQuery::parse(json).unwrap());
+                let mut output = Vec::new();
+                search_with_loader(&cx, &options, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                responses.push(frames(&output));
+            }
+            assert_eq!(responses[0].len(), 2);
+            assert_eq!(responses[1].len(), 2);
+            for (baseline, tuned) in responses[0].iter().zip(&responses[1]) {
+                assert_eq!(tuned["phase"], baseline["phase"]);
+                assert_eq!(tuned["mode"], "partial");
+                assert_eq!(tuned["quality_coverage"]["quality_documents"], 1);
+                assert_eq!(tuned["full_query"]["candidate_multiplier"], 2);
+                assert!(baseline.get("full_query").is_none());
+                let hits = tuned["results"].as_array().unwrap();
+                assert_eq!(hits.len(), 3);
+                assert!(
+                    hits[0]["score"].as_f64().unwrap()
+                        > baseline["results"][0]["score"].as_f64().unwrap()
+                );
+                for hit in hits {
+                    assert!(hit["fast_score"].is_number());
+                    assert_eq!(
+                        hit["quality_score"].is_number(),
+                        tuned["phase"] == "refined" && hit["doc_id"] == "quality"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn partial_request_overrides_preserve_scope_limits_and_default_fast_mode() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let parent = private_parent();
+        let fast = provider(false);
+        let quality = provider(true);
+        let (_, receipt) = publish_partial_cli(&cx, &parent, &fast, &quality, true).await;
+        let root = admit_root(&receipt.root).unwrap();
+        let snapshot = receipt
+            .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+            .unwrap();
+        let mut session = AuthoritySession::new(
+            &cx,
+            root,
+            receipt,
+            snapshot,
+            models(&fast, &quality),
+            (3, DEFAULT_IMAGE_BYTES),
+            false,
+        )
+        .unwrap();
+        session.query_policy.full_query = Some(query::FullQuery::parse(GRANTED).unwrap());
+        let message = serde_json::json!({
+            "op":"search","request":{"query":"retry","mode":"partial",
+                "filter":{"ids":["fast-only"]}},"full_query":{"candidate_multiplier":1}
+        });
+        let mut excessive = message.clone();
+        excessive["full_query"]["candidate_multiplier"] = serde_json::json!(5);
+        let mut implicit = message.clone();
+        implicit["request"].as_object_mut().unwrap().remove("mode");
+        let output = exchange(
+            &cx,
+            &mut session,
+            &[
+                excessive,
+                implicit,
+                message,
+                serde_json::json!({"query":"retry"}),
+            ],
+        )
+        .await;
+        assert_eq!(output.len(), 5);
+        assert_eq!(output[0]["default_mode"], "fast");
+        assert_eq!(output[1]["code"], "query_tuning_refused");
+        assert_eq!(output[2]["code"], "query_tuning_requires_partial_mode");
+        assert_eq!(output[3]["mode"], "partial");
+        assert_eq!(output[3]["full_query"]["candidate_multiplier"], 1);
+        assert_eq!(output[3]["full_query"]["quality_ef"], 16);
+        assert_eq!(output[3]["scope"]["eligible_documents"], 1);
+        let hits = output[3]["results"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["doc_id"], "fast-only");
+        assert!(hits[0]["quality_score"].is_null());
+        assert_eq!(output[4]["mode"], "fast");
+        assert!(output[4].get("full_query").is_none());
+    });
 }
 
 #[test]

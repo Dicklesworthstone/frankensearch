@@ -9434,6 +9434,9 @@ mod progressive_authority {
                         .unwrap()
                         .with_updates(2, MAX_INPUT_BYTES)
                         .unwrap();
+                        session.query_policy.full_query = Some(
+                            query::FullQuery::parse(r#"{"request_overrides":true}"#).unwrap(),
+                        );
                         let raw = session.models.models().unwrap().clone();
                         let cached = session.query_models().models().unwrap().clone();
                         let primed = exchange(
@@ -9443,6 +9446,7 @@ mod progressive_authority {
                         )
                         .await;
                         assert_eq!(primed[0]["coverage_transition_enabled"], true);
+                        assert_eq!(primed[0]["query_tuning_enabled"], true);
                         assert_eq!(primed[2]["phase"], "refined");
                         let before = calls(&fast, &quality);
                         let next_path = parent.join(format!("successor-{label}.json"));
@@ -9511,6 +9515,10 @@ mod progressive_authority {
                         assert_eq!(response[1]["serving"], "activated");
                         assert_eq!(session.snapshot.topology(), topology);
                         assert_eq!(session.receipt.topology(), topology);
+                        assert_eq!(
+                            response[1]["query_tuning_enabled"],
+                            keep.contains(&"quality")
+                        );
                         assert_eq!(
                             response[1]["query_modes"],
                             if label == "full" {
