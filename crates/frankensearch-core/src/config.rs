@@ -524,9 +524,9 @@ pub struct TwoTierMetrics {
     /// the candidates actually returned (bd-ctzo C4).
     ///
     /// `None` means this path emitted no owner-backed candidate receipt, as with
-    /// legacy retrieval, explicit exact overrides, or a zero-signal short circuit.
-    /// Native fast retrieval can report coverage without running quality. An
-    /// absent receipt is deliberately NOT a zero-coverage receipt: an unwitnessed
+    /// legacy retrieval or a zero-signal short circuit. Activated fast retrieval
+    /// can report coverage independently of quality, including explicit exact scans.
+    /// An absent receipt is deliberately NOT a zero-coverage receipt: an unwitnessed
     /// search and a search that covered nothing are different facts, and
     /// [`crate::TierQueryCoverageV1`] has no variant that conflates them.
     /// `serde(default)` keeps older payloads readable.

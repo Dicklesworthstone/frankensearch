@@ -36,7 +36,7 @@ use frankensearch_core::explanation::{
 };
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::generation::{
-    EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1, ProducerCompatibilityErrorV1,
+    EmbedderTierTag, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1, ProducerCompatibilityErrorV1,
     QuantizationFormat,
 };
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
@@ -3026,21 +3026,25 @@ impl TwoTierSearcher {
         metrics.lexical_candidates = lexical_results.as_ref().map_or(0, Vec::len);
 
         let search_start = Instant::now();
-        let retrieve = |limit| {
+        let mut quality_window = None;
+        let mut retrieve = |limit| {
             cancellation_checkpoint(cx, "quality_initial_to_search")?;
-            let classified = activated.as_ref().map_or_else(
-                || {
-                    self.index.search_quality_classified_with_producer(
-                        cx,
-                        bound,
-                        limit,
-                        self.search_params,
-                    )
-                },
-                |activated| {
-                    activated.search_quality_classified_with_params(limit, self.search_params)
-                },
-            )?;
+            let classified = if let Some(activated) = activated.as_ref() {
+                let (classified, window) = activated.search_with_candidate_window(
+                    EmbedderTierTag::Quality,
+                    limit,
+                    self.search_params,
+                )?;
+                quality_window = Some(window);
+                classified
+            } else {
+                self.index.search_quality_classified_with_producer(
+                    cx,
+                    bound,
+                    limit,
+                    self.search_params,
+                )?
+            };
             cancellation_checkpoint(cx, "quality_initial_search_to_filter")?;
             Ok(classified)
         };
@@ -3088,9 +3092,9 @@ impl TwoTierSearcher {
         } else {
             classified.zero_signal
         };
-        if let Some(activated) = activated.as_ref() {
-            metrics.coverage =
-                Some(activated.coverage_with_params(&hits, retrieval_limit, self.search_params)?);
+        if let Some(window) = quality_window {
+            cancellation_checkpoint(cx, "quality_initial_search_to_coverage")?;
+            metrics.coverage = Some(window.into_coverage(&hits));
         }
         metrics.semantic_candidates = hits.len();
         metrics.phase1_vectors_searched = if bound.vector().iter().all(|value| *value == 0.0) {
@@ -3524,20 +3528,24 @@ impl TwoTierSearcher {
                 let activated_fast = owner_activation
                     .as_ref()
                     .filter(|_| self.uses_activated_fast_retrieval());
-                let retrieve_fast = |limit| -> SearchResult<_> {
-                    let classified = activated_fast.map_or_else(
-                        || {
-                            self.index.search_fast_classified_cancellable(
-                                cx,
-                                &query_vec,
-                                limit,
-                                self.search_params,
-                            )
-                        },
-                        |activated| {
-                            activated.search_fast_classified_with_params(limit, self.search_params)
-                        },
-                    )?;
+                let mut fast_window = None;
+                let mut retrieve_fast = |limit| -> SearchResult<_> {
+                    let classified = if let Some(activated) = activated_fast {
+                        let (classified, window) = activated.search_with_candidate_window(
+                            EmbedderTierTag::Fast,
+                            limit,
+                            self.search_params,
+                        )?;
+                        fast_window = Some(window);
+                        classified
+                    } else {
+                        self.index.search_fast_classified_cancellable(
+                            cx,
+                            &query_vec,
+                            limit,
+                            self.search_params,
+                        )?
+                    };
                     cancellation_checkpoint(cx, "fast_search_to_filter")?;
                     Ok((classified.hits, classified.zero_signal))
                 };
@@ -3703,17 +3711,13 @@ impl TwoTierSearcher {
                 // metadata for a retained fast hit. Count and attest the
                 // eligible pool only after those observations are reconciled.
                 if index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
-                    && let Some(activated) = activated_fast
+                    && let Some(window) = fast_window
                 {
                     let coverage_start = Instant::now();
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
-                    metrics.coverage = Some(activated.coverage_with_params(
-                        &fast_hits,
-                        fast_retrieval_limit,
-                        self.search_params,
-                    )?);
+                    metrics.coverage = Some(window.into_coverage(&fast_hits));
                     cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
-                    // Include coverage replay without charging graph ranking
+                    // Include coverage assembly without charging graph ranking
                     // to the vector-search timer.
                     metrics.vector_search_ms += coverage_start.elapsed().as_secs_f64() * 1000.0;
                 }
@@ -4387,10 +4391,15 @@ impl TwoTierSearcher {
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
                 let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
                 cancellation_checkpoint(cx, "quality_activation_to_search")?;
-                let retrieve = |limit| {
-                    activated
-                        .search_quality_classified_with_params(limit, self.search_params)
-                        .map(|classified| classified.hits)
+                let mut quality_window = None;
+                let mut retrieve = |limit| {
+                    let (classified, window) = activated.search_with_candidate_window(
+                        EmbedderTierTag::Quality,
+                        limit,
+                        self.search_params,
+                    )?;
+                    quality_window = Some(window);
+                    Ok(classified.hits)
                 };
                 let hits = retrieve(quality_budget)?;
                 let (mut hits, mut retrieval_limit) = request_filter
@@ -4403,7 +4412,7 @@ impl TwoTierSearcher {
                         exclusions,
                         text_fn,
                         "semantic_quality",
-                        retrieve,
+                        &mut retrieve,
                     )
                     .await?;
                 replacement_fast_evidence = self
@@ -4426,24 +4435,13 @@ impl TwoTierSearcher {
                         exclusions,
                         text_fn,
                         request_filter,
-                        retrieve,
+                        &mut retrieve,
                     )
                     .await?;
                 cancellation_checkpoint(cx, "quality_search_to_coverage")?;
-                // bd-ctzo C4: the coverage receipt is built from the retained
-                // owner's witness and the candidates this tier ACTUALLY
-                // returned, then carried on the metrics so a caller can read
-                // it. It is assembled after retrieval on purpose — a
-                // contribution count taken before the results exist would be
-                // a prediction, not a measurement.
-                // Coverage replays the owner's raw candidate window. Use the
-                // final widened limit so eligible tail hits remain attributed
-                // to the tier that actually retrieved them.
-                quality_coverage = Some(activated.coverage_with_params(
-                    &hits,
-                    retrieval_limit,
-                    self.search_params,
-                )?);
+                // Count eligible results against the last window served before
+                // supplemental scores are added.
+                quality_coverage = quality_window.map(|window| window.into_coverage(&hits));
                 QualityPool::Retrieved(hits)
             }
             SemanticAdmission::LegacyUnidentified
