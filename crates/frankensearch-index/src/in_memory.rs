@@ -5964,6 +5964,91 @@ mod tests {
     }
 
     #[test]
+    fn strict_metadata_filters_reject_metadata_less_memory_and_quantized_searches() {
+        use frankensearch_core::{
+            BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode,
+            IncludeDocIdsFilter, MissingMetadataPolicy,
+        };
+
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let index = InMemoryVectorIndex::from_vectors(
+            (0..128).map(|row| format!("doc-{row}")).collect(),
+            vec![query.to_vec(); 128],
+            query.len(),
+        )
+        .unwrap();
+        let strict_type =
+            DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let strict_date =
+            DateRangeFilter::after(100).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let exact_scope = FilterChain::new(FilterMode::All)
+            .with(Box::new(IncludeDocIdsFilter::new(["doc-0"])))
+            .with(Box::new(strict_type.clone()));
+        let hashed_scope = FilterChain::new(FilterMode::All)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-0"])))
+            .with(Box::new(strict_date));
+        let filters: [&dyn SearchFilter; 4] =
+            [&strict_type, &strict_date, &exact_scope, &hashed_scope];
+        assert_eq!(
+            index
+                .search_top_k(&query, 3, Some(&DocTypeFilter::new(["active"])))
+                .unwrap()
+                .len(),
+            3
+        );
+        for filter in filters {
+            for parallel_enabled in [false, true] {
+                let classified = index
+                    .search_top_k_classified_with_params(
+                        &query,
+                        3,
+                        Some(filter),
+                        SearchParams {
+                            parallel_enabled,
+                            parallel_threshold: 0,
+                            parallel_chunk_size: 7,
+                        },
+                    )
+                    .unwrap();
+                assert!(classified.hits.is_empty(), "{}", filter.name());
+                assert_eq!(
+                    classified.zero_signal,
+                    Some(ZeroSignalReason::FilterEliminatedAll)
+                );
+            }
+            // Six candidates out of 128 exercises the actual quantized passes,
+            // rather than their full-width exact-search shortcut.
+            assert!(
+                index
+                    .search_top_k_int8_two_pass_filtered(&query, 3, 2, Some(filter))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                index
+                    .search_top_k_4bit_two_pass_filtered(&query, 3, 2, Some(filter))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        // Metadata policy belongs to its operand: an explicit ID-only OR
+        // branch still permits that exact document, never the whole corpus.
+        let any_scope = FilterChain::new(FilterMode::Any)
+            .with(Box::new(strict_type))
+            .with(Box::new(IncludeDocIdsFilter::new(["doc-127"])));
+        for hits in [
+            index.search_top_k(&query, 3, Some(&any_scope)),
+            index.search_top_k_int8_two_pass_filtered(&query, 3, 2, Some(&any_scope)),
+            index.search_top_k_4bit_two_pass_filtered(&query, 3, 2, Some(&any_scope)),
+        ] {
+            let hits = hits.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-127");
+        }
+    }
+
+    #[test]
     fn search_with_bitset_filter_uses_precomputed_hash_path() {
         // BitsetFilter resolves via matches_doc_id_hash (the precomputed-hash
         // prescreen). Result must equal the allowed doc-id set's top-k — i.e. the
