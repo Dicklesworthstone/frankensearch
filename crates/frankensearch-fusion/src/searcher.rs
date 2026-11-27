@@ -140,6 +140,17 @@ enum SemanticAdmission {
 struct QueryEmbeddingIdentities {
     fast: Option<EmbeddingIdentityBundleV1>,
     quality: Option<EmbeddingIdentityBundleV1>,
+    fast_kind: FastRetrievalKind,
+    quality_kind: Option<EmbeddingSpaceKindV1>,
+    quality_enabled: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FastRetrievalKind {
+    admitted: Option<EmbeddingSpaceKindV1>,
+    hash_control: bool,
+    // Unidentified legacy producers retain their name-based score labels.
+    hash_scores: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -452,8 +463,8 @@ fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
 }
 
 #[must_use]
-fn vector_exclusion_source(embedder: &dyn Embedder) -> &'static str {
-    if is_shipped_hash_embedder(embedder) {
+const fn vector_exclusion_source(hash_control: bool) -> &'static str {
+    if hash_control {
         "hash_control"
     } else {
         "semantic"
@@ -671,10 +682,19 @@ impl TwoTierSearcher {
         // but a metrics field nobody reads is why hash-only deployments look
         // healthy: queries succeed and return plausible lexical hits. Logging
         // it per query would spam a hot path, so it belongs here (`bd-a6zt`).
-        if is_shipped_hash_embedder(fast_embedder.as_ref()) {
+        let hash_control = index.fast_admitted_binding().map_or_else(
+            || {
+                index.fast_embedder_revision().is_empty()
+                    && is_shipped_hash_embedder(fast_embedder.as_ref())
+            },
+            |binding| {
+                binding.frozen_identity().identity.space.kind == EmbeddingSpaceKindV1::HashControl
+            },
+        );
+        if hash_control {
             tracing::warn!(
                 fast_embedder = %fast_embedder.id(),
-                "TwoTierSearcher constructed with a NON-SEMANTIC hash fast embedder; semantic \
+                "TwoTierSearcher configured with a non-semantic hash fast tier; semantic \
                  retrieval is unavailable and results will be lexical-only where a lexical \
                  backend is attached. If a semantic model is expected, the index generation \
                  must be rebuilt with it — installing a model alone does not repair an index \
@@ -1176,19 +1196,15 @@ impl TwoTierSearcher {
     fn admit_semantic_query(
         &self,
         cx: &Cx,
-        quality_enabled: bool,
     ) -> SearchResult<(SemanticAdmission, QueryEmbeddingIdentities)> {
         let fast = capture_query_identity(cx, self.fast_embedder.as_ref(), "fast")?;
-        let quality_embedder = self.quality_embedder.as_ref().filter(|_| quality_enabled);
-        let identities = QueryEmbeddingIdentities {
-            fast,
-            quality: quality_embedder
-                .map(|embedder| capture_query_identity(cx, embedder.as_ref(), "quality"))
-                .transpose()?
-                .flatten(),
-        };
-        let Some(fast_binding) = self.index.fast_admitted_binding() else {
-            if self.index.quality_admitted_binding().is_some() {
+        let fast_binding = self.index.fast_admitted_binding();
+        let quality_binding = self.index.quality_admitted_binding();
+        let fast_revision = self.index.fast_embedder_revision();
+        if let Some(binding) = fast_binding {
+            admit_tier_embedder(self.fast_embedder.as_ref(), fast.as_ref(), binding, "fast")?;
+        } else {
+            if quality_binding.is_some() {
                 return Err(SearchError::InvalidConfig {
                     field: "search_activation.mixed_admission".to_owned(),
                     value: "quality".to_owned(),
@@ -1200,43 +1216,87 @@ impl TwoTierSearcher {
             }
             admit_legacy_tier_embedder(
                 self.fast_embedder.as_ref(),
-                identities.fast.as_ref(),
-                self.index.fast_embedder_revision(),
+                fast.as_ref(),
+                fast_revision,
                 "fast",
             )?;
-            if let Some(embedder) = quality_embedder
+        }
+        cancellation_checkpoint(cx, "fast_identity_admission")?;
+        // Trust the query kind once its producer joins the retained owner or
+        // the complete producer fingerprint stamped into a legacy index.
+        let admitted = fast
+            .as_ref()
+            .filter(|_| fast_binding.is_some() || !fast_revision.is_empty())
+            .map(|bundle| bundle.space.kind);
+        let (hash_control, hash_scores) = if let Some(kind) = admitted {
+            let is_control = kind == EmbeddingSpaceKindV1::HashControl;
+            (is_control, is_control)
+        } else {
+            let hash_scores = frankensearch_core::is_hash_generation_id(self.fast_embedder.id());
+            cancellation_checkpoint(cx, "fast_kind_admission")?;
+            let hash_control = if hash_scores {
+                let semantic = self.fast_embedder.is_semantic();
+                cancellation_checkpoint(cx, "fast_kind_admission")?;
+                !semantic && self.fast_embedder.category() == ModelCategory::HashEmbedder
+            } else {
+                false
+            };
+            (hash_control, hash_scores)
+        };
+        cancellation_checkpoint(cx, "fast_kind_admission")?;
+        let quality_enabled = self.should_run_quality(hash_control);
+        let quality_embedder = self.quality_embedder.as_deref().filter(|_| quality_enabled);
+        let quality = quality_embedder
+            .map(|embedder| capture_query_identity(cx, embedder, "quality"))
+            .transpose()?
+            .flatten();
+        let identified_quality = if let Some(embedder) = quality_embedder {
+            if let Some(binding) = quality_binding {
+                admit_tier_embedder(embedder, quality.as_ref(), binding, "quality")?;
+                true
+            } else if fast_binding.is_none()
                 && let Some(revision) = self.index.quality_embedder_revision()
             {
-                admit_legacy_tier_embedder(
-                    embedder.as_ref(),
-                    identities.quality.as_ref(),
-                    revision,
-                    "quality",
-                )?;
+                admit_legacy_tier_embedder(embedder, quality.as_ref(), revision, "quality")?;
+                !revision.is_empty()
+            } else {
+                false
             }
-            return Ok((SemanticAdmission::LegacyUnidentified, identities));
-        };
-        admit_tier_embedder(
-            self.fast_embedder.as_ref(),
-            identities.fast.as_ref(),
-            fast_binding,
-            "fast",
-        )?;
-        // A quality owner participates only when refinement can use its producer.
-        let quality = if let Some(embedder) = quality_embedder
-            && let Some(binding) = self.index.quality_admitted_binding()
-        {
-            admit_tier_embedder(
-                embedder.as_ref(),
-                identities.quality.as_ref(),
-                binding,
-                "quality",
-            )?;
-            true
         } else {
             false
         };
-        Ok((SemanticAdmission::OwnerBacked { quality }, identities))
+        let quality_kind = quality
+            .as_ref()
+            .filter(|_| identified_quality)
+            .map(|bundle| bundle.space.kind);
+        if quality_kind == Some(EmbeddingSpaceKindV1::HashControl) {
+            return Err(SearchError::InvalidConfig {
+                field: "search.quality_kind".to_owned(),
+                value: "non_semantic".to_owned(),
+                reason: "progressive refinement requires a semantic quality producer".to_owned(),
+            });
+        }
+        let admission = if fast_binding.is_some() {
+            SemanticAdmission::OwnerBacked {
+                quality: quality_enabled && quality_binding.is_some(),
+            }
+        } else {
+            SemanticAdmission::LegacyUnidentified
+        };
+        Ok((
+            admission,
+            QueryEmbeddingIdentities {
+                fast,
+                quality,
+                fast_kind: FastRetrievalKind {
+                    admitted,
+                    hash_control,
+                    hash_scores,
+                },
+                quality_kind,
+                quality_enabled,
+            },
+        ))
     }
 
     /// Admit only the requested quality producer. A disabled, missing or
@@ -1305,6 +1365,9 @@ impl TwoTierSearcher {
             QueryEmbeddingIdentities {
                 fast: None,
                 quality: Some(identity),
+                fast_kind: FastRetrievalKind::default(),
+                quality_kind: Some(EmbeddingSpaceKindV1::Semantic),
+                quality_enabled: false,
             },
         ))
     }
@@ -1637,7 +1700,7 @@ impl TwoTierSearcher {
         // Empty progressive requests keep the same producer admission as real
         // retrieval without canonicalization or inference.
         if mode == SearchExecutionMode::Progressive && (k == 0 || query.is_empty()) {
-            let admission = self.admit_semantic_query(cx, self.should_run_quality());
+            let admission = self.admit_semantic_query(cx);
             cancellation_checkpoint(cx, "query_identity_admission")?;
             admission?;
         }
@@ -1662,9 +1725,6 @@ impl TwoTierSearcher {
         let (canon_query, parsed_query) =
             preparsed_quality_query.map_or_else(prepare_query_shape, Ok)?;
         let lexical_complement = parsed_query.is_positive_empty() && parsed_query.has_negations();
-        let quality_enabled = mode == SearchExecutionMode::Progressive
-            && !lexical_complement
-            && self.should_run_quality();
         // Admit before the canonicalized-empty exit, inference, embedding
         // caches or vector/ANN reads. A lexical complement has no semantic
         // query and does not consult either producer.
@@ -1674,13 +1734,16 @@ impl TwoTierSearcher {
         } else if mode == SearchExecutionMode::QualityOnly {
             quality_admission
         } else {
-            let admission = self.admit_semantic_query(cx, quality_enabled);
+            let admission = self.admit_semantic_query(cx);
             cancellation_checkpoint(cx, "query_identity_admission")?;
             Some(admission?)
         };
         if canon_query.trim().is_empty() {
             return Ok(metrics);
         }
+        let quality_enabled = admitted
+            .as_ref()
+            .is_some_and(|(_, identities)| identities.quality_enabled);
         let normalized_exclusions = if parsed_query.has_negations() {
             Some(NormalizedExclusions {
                 terms: parsed_query
@@ -1842,13 +1905,13 @@ impl TwoTierSearcher {
             let progressive_initial = self.run_phase1(
                 cx,
                 semantic_query,
-                &parsed_query,
                 normalized_exclusions.as_ref(),
                 candidate_target,
                 query_class,
                 admitted
                     .as_ref()
-                    .and_then(|(_, identities)| identities.fast.as_ref()),
+                    .map(|(_, identities)| identities)
+                    .expect("progressive query admitted"),
                 &text_fn,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
@@ -2037,7 +2100,7 @@ impl TwoTierSearcher {
                 &text_fn,
                 normalized_exclusions.as_ref(),
                 *admission,
-                identities.quality.as_ref(),
+                identities,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
                 telemetry_initial_event_id.clone(),
@@ -2307,7 +2370,10 @@ impl TwoTierSearcher {
                 },
             }
         } else if mode == SearchExecutionMode::Progressive && metrics.skip_reason.is_none() {
-            if is_shipped_hash_embedder(self.fast_embedder.as_ref()) {
+            if admitted
+                .as_ref()
+                .is_some_and(|(_, identities)| identities.fast_kind.hash_control)
+            {
                 metrics.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
             } else if quality_enabled {
                 if quality_circuit_open {
@@ -2849,10 +2915,16 @@ impl TwoTierSearcher {
                 elapsed,
                 root_request_id,
                 None,
+                Some(identity.space.kind),
             );
         }
         let (values, response_identity) = response?;
-        self.export_embedding_metrics(embedder, 1, metrics.quality_embed_ms);
+        self.export_embedding_metrics(
+            embedder,
+            1,
+            metrics.quality_embed_ms,
+            Some(identity.space.kind),
+        );
         let response_identity = response_identity.ok_or_else(|| SearchError::InvalidConfig {
             field: "query_embedding.quality.identity".to_owned(),
             value: "missing_bound_response".to_owned(),
@@ -3001,7 +3073,7 @@ impl TwoTierSearcher {
         cancellation_checkpoint(cx, "quality_initial_search_to_fusion")?;
         let fusion_start = Instant::now();
         let mut results = lexical_results.as_ref().map_or_else(
-            || vector_hits_to_scored_results(&hits, target, &self.config, embedder.id()),
+            || vector_hits_to_scored_results(&hits, target, &self.config, embedder.id(), false),
             |lexical| {
                 let rrf_config = RrfConfig {
                     k: self.effective_rrf_k(query_class),
@@ -3033,6 +3105,7 @@ impl TwoTierSearcher {
                         )
                     }),
                     embedder.id(),
+                    false,
                 )
             },
         );
@@ -3049,10 +3122,6 @@ impl TwoTierSearcher {
             if let Some(explanation) = &mut result.explanation {
                 for component in &mut explanation.components {
                     if let ExplainedSource::SemanticFast {
-                        embedder,
-                        cosine_sim,
-                    }
-                    | ExplainedSource::HashControl {
                         embedder,
                         cosine_sim,
                     } = &component.source
@@ -3087,11 +3156,10 @@ impl TwoTierSearcher {
         &self,
         cx: &Cx,
         semantic_query: &str,
-        _parsed_query: &ParsedQuery,
         normalized_exclusions: Option<&NormalizedExclusions>,
         k: usize,
         query_class: QueryClass,
-        identity: Option<&EmbeddingIdentityBundleV1>,
+        identities: &QueryEmbeddingIdentities,
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
@@ -3102,8 +3170,13 @@ impl TwoTierSearcher {
         let base_candidates =
             candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
 
-        let lexical_short_circuit =
-            lexical_source.is_some() && is_shipped_hash_embedder(self.fast_embedder.as_ref());
+        let FastRetrievalKind {
+            admitted,
+            hash_control,
+            hash_scores,
+        } = identities.fast_kind;
+        let identity = identities.fast.as_ref();
+        let lexical_short_circuit = lexical_source.is_some() && hash_control;
 
         // Adaptive budgets: identifiers lean lexical, NL leans semantic.
         let semantic_budget =
@@ -3348,6 +3421,7 @@ impl TwoTierSearcher {
                     self.fast_embedder.as_ref(),
                     1,
                     metrics.fast_embed_ms,
+                    admitted,
                 );
                 if let Some(root_request_id) = root_request_id {
                     let _ = self.emit_embedding_telemetry(
@@ -3357,11 +3431,10 @@ impl TwoTierSearcher {
                         fast_embed_elapsed,
                         root_request_id,
                         None,
+                        admitted,
                     );
                 }
-                if is_shipped_hash_embedder(self.fast_embedder.as_ref())
-                    && metrics.skip_reason.is_none()
-                {
+                if hash_control && metrics.skip_reason.is_none() {
                     // Hash vectors still run as an explicit control path, but
                     // they are never unlabeled semantic hits (bd-a6zt). A
                     // quality embedder does not make this a semantic lane.
@@ -3374,7 +3447,10 @@ impl TwoTierSearcher {
                         lexical.len(),
                         k,
                         self.config.graph_ranking_enabled,
-                        self.fast_embedder.is_semantic(),
+                        admitted.map_or_else(
+                            || self.fast_embedder.is_semantic(),
+                            |kind| kind == EmbeddingSpaceKindV1::Semantic,
+                        ),
                         self.quality_embedder.is_some(),
                     )
                 {
@@ -3437,7 +3513,7 @@ impl TwoTierSearcher {
                         self.index.fast_candidate_upper_bound(),
                         normalized_exclusions,
                         text_fn,
-                        vector_exclusion_source(self.fast_embedder.as_ref()),
+                        vector_exclusion_source(hash_control),
                         |limit| retrieve_fast(limit).map(|(hits, _)| hits),
                     )
                     .await?;
@@ -3457,7 +3533,7 @@ impl TwoTierSearcher {
                         self.index.fast_candidate_upper_bound(),
                         normalized_exclusions,
                         text_fn,
-                        vector_exclusion_source(self.fast_embedder.as_ref()),
+                        vector_exclusion_source(hash_control),
                         |limit| retrieve_fast(limit).map(|(hits, _)| hits),
                     )
                     .await?;
@@ -3543,7 +3619,7 @@ impl TwoTierSearcher {
                                 self.index.fast_candidate_upper_bound(),
                                 normalized_exclusions,
                                 text_fn,
-                                vector_exclusion_source(self.fast_embedder.as_ref()),
+                                vector_exclusion_source(hash_control),
                                 &mut fast_revoked,
                                 |limit| retrieve_fast(limit).map(|(hits, _)| hits),
                             )
@@ -3599,10 +3675,7 @@ impl TwoTierSearcher {
                     // to the vector-search timer.
                     metrics.vector_search_ms += coverage_start.elapsed().as_secs_f64() * 1000.0;
                 }
-                metrics.publish_vector_candidates(
-                    fast_hits.len(),
-                    is_shipped_hash_embedder(self.fast_embedder.as_ref()),
-                );
+                metrics.publish_vector_candidates(fast_hits.len(), hash_control);
                 metrics.phase1_vectors_searched = if zero_fast_query {
                     0
                 } else {
@@ -3631,6 +3704,7 @@ impl TwoTierSearcher {
                                     base_candidates,
                                     &self.config,
                                     self.fast_embedder.id(),
+                                    hash_scores,
                                 )
                             },
                             |graph| {
@@ -3643,9 +3717,7 @@ impl TwoTierSearcher {
                                     base_candidates,
                                     0,
                                     &rrf_config,
-                                    frankensearch_core::is_hash_generation_id(
-                                        self.fast_embedder.id(),
-                                    ),
+                                    hash_scores,
                                 );
                                 fused_hits_to_scored_results(
                                     &fused,
@@ -3661,6 +3733,7 @@ impl TwoTierSearcher {
                                         )
                                     }),
                                     self.fast_embedder.id(),
+                                    hash_scores,
                                 )
                             },
                         )
@@ -3683,7 +3756,7 @@ impl TwoTierSearcher {
                             base_candidates,
                             0,
                             &rrf_config,
-                            frankensearch_core::is_hash_generation_id(self.fast_embedder.id()),
+                            hash_scores,
                         );
                         fused_hits_to_scored_results(
                             &fused,
@@ -3699,6 +3772,7 @@ impl TwoTierSearcher {
                                 )
                             }),
                             self.fast_embedder.id(),
+                            hash_scores,
                         )
                     },
                 );
@@ -3746,6 +3820,7 @@ impl TwoTierSearcher {
                         fast_embed_elapsed,
                         root_request_id,
                         None,
+                        admitted,
                     );
                 }
                 if matches!(embed_err, SearchError::Cancelled { .. }) {
@@ -3879,7 +3954,7 @@ impl TwoTierSearcher {
                         self.index.fast_candidate_upper_bound(),
                         exclusions,
                         text_fn,
-                        vector_exclusion_source(self.fast_embedder.as_ref()),
+                        "semantic",
                         &mut fast_revoked,
                         |limit| {
                             // Mirror Phase 1's policy: only its native owner
@@ -4000,13 +4075,16 @@ impl TwoTierSearcher {
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         exclusions: Option<&NormalizedExclusions>,
         admission: SemanticAdmission,
-        identity: Option<&EmbeddingIdentityBundleV1>,
+        identities: &QueryEmbeddingIdentities,
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
         parent_event_id: Option<String>,
         lexical_source: Option<&dyn LexicalRead>,
         request_filter: &mut RequestFilter<'_>,
     ) -> SearchResult<Phase2Outcome> {
+        let identity = identities.quality.as_ref();
+        let quality_kind = identities.quality_kind;
+        let hash_scores = identities.fast_kind.hash_scores;
         let quality_embedder =
             self.quality_embedder
                 .as_ref()
@@ -4027,6 +4105,7 @@ impl TwoTierSearcher {
                     quality_embedder.as_ref(),
                     1,
                     metrics.quality_embed_ms,
+                    quality_kind,
                 );
                 if let Some(root_request_id) = root_request_id {
                     let _ = self.emit_embedding_telemetry(
@@ -4036,6 +4115,7 @@ impl TwoTierSearcher {
                         quality_embed_elapsed,
                         root_request_id,
                         parent_event_id.clone(),
+                        quality_kind,
                     );
                 }
                 output
@@ -4056,6 +4136,7 @@ impl TwoTierSearcher {
                         quality_embed_elapsed,
                         root_request_id,
                         parent_event_id,
+                        quality_kind,
                     );
                 }
                 return Err(err);
@@ -4620,7 +4701,13 @@ impl TwoTierSearcher {
             components.extend(blend_explanation.components(
                 fast_score,
                 quality_score,
-                |cosine_sim| ExplainedSource::vector_fast(self.fast_embedder.id(), cosine_sim),
+                |cosine_sim| {
+                    crate::rrf::fast_score_explanation_source(
+                        self.fast_embedder.id(),
+                        cosine_sim,
+                        hash_scores,
+                    )
+                },
                 |cosine_sim| ExplainedSource::SemanticQuality {
                     embedder: quality_embedder_id.to_owned(),
                     cosine_sim,
@@ -4692,8 +4779,13 @@ impl TwoTierSearcher {
                 &rrf_config,
             );
             cancellation_checkpoint(cx, "quality_refusion_to_result_construction")?;
-            let mut results =
-                fused_hits_to_scored_results(&fused, lexical_pool, None, self.fast_embedder.id());
+            let mut results = fused_hits_to_scored_results(
+                &fused,
+                lexical_pool,
+                None,
+                self.fast_embedder.id(),
+                hash_scores,
+            );
             let fusion_explanation = self.config.explain.then(|| {
                 FusionExplanation::new(
                     self.config.fusion_strategy,
@@ -5065,6 +5157,7 @@ impl TwoTierSearcher {
         embedder: &dyn Embedder,
         batch_size: usize,
         duration_ms: f64,
+        admitted_kind: Option<EmbeddingSpaceKindV1>,
     ) {
         let Some(exporter) = self.config.metrics_exporter.as_ref() else {
             return;
@@ -5074,7 +5167,10 @@ impl TwoTierSearcher {
             batch_size,
             duration_ms,
             dimension: embedder.dimension(),
-            is_semantic: embedder.is_semantic(),
+            is_semantic: admitted_kind.map_or_else(
+                || embedder.is_semantic(),
+                |kind| kind == EmbeddingSpaceKindV1::Semantic,
+            ),
         };
         exporter.on_embedding_completed(&payload);
     }
@@ -5086,11 +5182,11 @@ impl TwoTierSearcher {
     }
 
     /// Whether quality refinement should run.
-    fn should_run_quality(&self) -> bool {
+    fn should_run_quality(&self, hash_control: bool) -> bool {
         !self.config.fast_only
             && self.quality_embedder.is_some()
             && self.index.has_quality_index()
-            && !is_shipped_hash_embedder(self.fast_embedder.as_ref())
+            && !hash_control
     }
 
     fn phase_gate_should_skip_quality(&self) -> bool {
@@ -5334,8 +5430,19 @@ impl TwoTierSearcher {
         duration: Duration,
         root_request_id: &str,
         parent_event_id: Option<String>,
+        admitted_kind: Option<EmbeddingSpaceKindV1>,
     ) -> Option<String> {
         let host_adapter = self.host_adapter.as_ref()?;
+        let tier = if admitted_kind == Some(EmbeddingSpaceKindV1::HashControl) {
+            EmbedderTier::Hash
+        } else {
+            let tier = embedder_tier_for_stage(stage, embedder.category());
+            if tier == EmbedderTier::Hash && admitted_kind == Some(EmbeddingSpaceKindV1::Semantic) {
+                EmbedderTier::Fast
+            } else {
+                tier
+            }
+        };
 
         let event_id = next_telemetry_identifier("evt");
         let telemetry_instance = telemetry_instance_for_adapter(host_adapter.as_ref());
@@ -5355,7 +5462,7 @@ impl TwoTierSearcher {
                 doc_count: 1,
                 stage,
                 embedder_id: embedder.id().to_owned(),
-                tier: embedder_tier_for_stage(stage, embedder.category()),
+                tier,
                 dimension: embedder.dimension(),
                 status,
                 duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -5800,6 +5907,7 @@ fn fused_hits_to_scored_results(
     lexical_results: &[ScoredResult],
     explanation: Option<FusionExplanation<'_>>,
     fast_embedder_id: &str,
+    hash_control: bool,
 ) -> Vec<ScoredResult> {
     // Borrow each candidate's metadata `&Value` into the map instead of cloning
     // it: only the `fused` (top-k) hits below ever read it, so cloning every
@@ -5821,13 +5929,12 @@ fn fused_hits_to_scored_results(
         .iter()
         .map(|fh| {
             let mut fh = fh.clone();
-            let hash_control = frankensearch_core::is_hash_generation_id(fast_embedder_id);
             if hash_control {
                 fh.remap_hash_control_ranks();
             }
             #[allow(clippy::cast_possible_truncation)]
             let score = fh.rrf_score as f32;
-            let source = crate::rrf::classify_fused_hit_source(&fh, fast_embedder_id);
+            let source = crate::rrf::classify_fused_hit_source(&fh, hash_control);
             let explanation = explanation.as_ref().map(|explanation| {
                 Box::new(explanation.for_hit(&fh, score, fast_embedder_id, hash_control))
             });
@@ -5885,6 +5992,7 @@ fn vector_hits_to_scored_results(
     k: usize,
     config: &TwoTierConfig,
     fast_embedder_id: &str,
+    hash_control: bool,
 ) -> Vec<ScoredResult> {
     let mut seen = ahash::AHashSet::new();
     hits.iter()
@@ -5895,7 +6003,11 @@ fn vector_hits_to_scored_results(
                 Some(Box::new(HitExplanation {
                     final_score: f64::from(h.score),
                     components: vec![ScoreComponent {
-                        source: ExplainedSource::vector_fast(fast_embedder_id, f64::from(h.score)),
+                        source: crate::rrf::fast_score_explanation_source(
+                            fast_embedder_id,
+                            f64::from(h.score),
+                            hash_control,
+                        ),
                         raw_score: f64::from(h.score),
                         normalized_score: f64::from(h.score),
                         rrf_contribution: 0.0,
@@ -5911,7 +6023,7 @@ fn vector_hits_to_scored_results(
             ScoredResult {
                 doc_id: h.doc_id.clone(),
                 score: h.score,
-                source: if frankensearch_core::is_hash_generation_id(fast_embedder_id) {
+                source: if hash_control {
                     ScoreSource::HashControl
                 } else {
                     ScoreSource::SemanticFast
@@ -7720,8 +7832,8 @@ mod tests {
         }
     }
 
-    /// The in-process f32 storage variant an embedder must declare.
-    fn in_memory_identity(model_id: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+    /// The in-process f32 storage variant for a hash-control producer.
+    fn hash_control_identity(model_id: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
         let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
         "in-memory-f32".clone_into(&mut identity.storage.format);
         identity.storage.quantization = QuantizationFormat::F32;
@@ -7734,7 +7846,13 @@ mod tests {
     /// other little-endian f16 on disk — which is exactly why the join is on
     /// the space and the producer, not on the whole bundle.
     fn artifact_binding(model_id: &str, dimension: u32, sequence: u64) -> FsviV2IdentityBinding {
-        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        fixture_v2_binding(query_admission_identity(model_id, dimension), sequence)
+    }
+
+    fn fixture_v2_binding(
+        mut artifact: EmbeddingIdentityBundleV1,
+        sequence: u64,
+    ) -> FsviV2IdentityBinding {
         "fsvi-v2".clone_into(&mut artifact.storage.format);
         artifact.storage.quantization = QuantizationFormat::F16;
         "little-endian".clone_into(&mut artifact.storage.endianness);
@@ -7820,7 +7938,7 @@ mod tests {
             // Positive control: the embedder that produced this index.
             let matching = Arc::new(IdentityCountingEmbedder::new(
                 "matching",
-                in_memory_identity("ctzo-searcher-model", 4),
+                query_admission_identity("ctzo-searcher-model", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let searcher = TwoTierSearcher::new(
@@ -7853,7 +7971,7 @@ mod tests {
             // Same dimension, different space: refused, and NOTHING ran.
             let foreign = Arc::new(IdentityCountingEmbedder::new(
                 "foreign",
-                in_memory_identity("a-different-model", 4),
+                query_admission_identity("a-different-model", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let searcher = TwoTierSearcher::new(
@@ -7891,9 +8009,9 @@ mod tests {
             let binding = artifact_binding("ctzo-producer-model", 4, 23);
             let index = owner_backed_index(&dir, &binding);
 
-            let mut compatible = in_memory_identity("ctzo-producer-model", 4);
+            let mut compatible = query_admission_identity("ctzo-producer-model", 4);
             "a-different-implementation".clone_into(&mut compatible.producer.backend);
-            let reference = in_memory_identity("ctzo-producer-model", 4);
+            let reference = query_admission_identity("ctzo-producer-model", 4);
             assert_eq!(
                 compatible.space.fingerprint(),
                 reference.space.fingerprint(),
@@ -7978,7 +8096,7 @@ mod tests {
     fn reopened_v1_checks_both_producers_before_embedding_or_cache() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = owner_backed_dir("v1-producer-reopen");
-            let identity = in_memory_identity("same-model-revision", 4);
+            let identity = query_admission_identity("same-model-revision", 4);
             let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
             builder
                 .set_fast_embedder_id("same-id")
@@ -8165,7 +8283,7 @@ mod tests {
     }
 
     fn query_admission_identity(model: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
-        let mut identity = in_memory_identity(model, dimension);
+        let mut identity = hash_control_identity(model, dimension);
         identity.space.kind = EmbeddingSpaceKindV1::Semantic;
         identity.space.hash_control = None;
         identity.space.artifact_manifest_fingerprint = "a".repeat(64);
@@ -8177,6 +8295,234 @@ mod tests {
         identity.producer.space_fingerprint = identity.space.fingerprint();
         identity.validate().expect("semantic query identity");
         identity
+    }
+
+    fn producer_kind_index(
+        dir: &std::path::Path,
+        owner_backed: bool,
+        fast: &EmbeddingIdentityBundleV1,
+        quality: &EmbeddingIdentityBundleV1,
+    ) -> Arc<TwoTierIndex> {
+        if owner_backed {
+            return owner_backed_two_tier_index(
+                dir,
+                &fixture_v2_binding(fast.clone(), 91),
+                &fixture_v2_binding(quality.clone(), 91),
+            );
+        }
+        let mut writer = TwoTierIndex::create(dir, TwoTierConfig::default()).unwrap();
+        writer.set_fast_identity(fast).unwrap();
+        writer.set_quality_identity(quality).unwrap();
+        writer
+            .add_record(
+                "doc-near",
+                &[1.0, 0.0, 0.0, 0.0],
+                Some(&[0.0, 0.0, 1.0, 0.0]),
+            )
+            .unwrap();
+        writer
+            .add_quality_record("doc-quality-only", &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        drop(writer.finish().unwrap());
+        Arc::new(TwoTierIndex::open(dir, TwoTierConfig::default()).unwrap())
+    }
+
+    #[test]
+    fn async_producer_kind_hash_skips_unused_quality_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for owner_backed in [false, true] {
+                let dir = owner_backed_dir("typed-hash-fast");
+                let fast = hash_control_identity("control-fast", 4);
+                let stored_quality = hash_control_identity("control-quality", 4);
+                let index = producer_kind_index(&dir, owner_backed, &fast, &stored_quality);
+                let unused = Arc::new(query_admission_embedder("quality"));
+                let exporter = Arc::new(RecordingExporter::default());
+                let adapter = Arc::new(RecordingHostAdapter::new("typed-hash-fast"));
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(IdentityCountingEmbedder::new(
+                        "looks-semantic",
+                        fast,
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    )),
+                    TwoTierConfig {
+                        explain: true,
+                        metrics_exporter: Some(exporter.clone()),
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(unused.clone())
+                .with_host_adapter(adapter.clone());
+                let mut phases = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find the document",
+                        1,
+                        |_| None,
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .expect("unused quality cannot block the admitted hash producer");
+                let [SearchPhase::Initial { results, .. }] = phases.as_slice() else {
+                    panic!("hash retrieval must publish exactly one Initial phase");
+                };
+                assert_eq!(results[0].doc_id, "doc-near");
+                assert_eq!(results[0].source, ScoreSource::HashControl);
+                assert!(matches!(
+                    &results[0].explanation.as_ref().unwrap().components[0].source,
+                    ExplainedSource::HashControl { embedder, .. } if embedder == "looks-semantic"
+                ));
+                assert!(metrics.hash_control_candidates > 0);
+                assert_eq!(metrics.semantic_candidates, 0);
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert_eq!(unused.identity_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(unused.embed_count(), 0);
+                assert!(matches!(
+                    exporter.embedding.lock().unwrap().as_slice(),
+                    [EmbeddingMetrics {
+                        is_semantic: false,
+                        ..
+                    }]
+                ));
+                assert!(adapter.telemetry_events().into_iter().any(|event| {
+                    matches!(
+                        event.event,
+                        TelemetryEvent::Embedding { job, embedder, .. }
+                            if job.stage == EmbeddingStage::Fast && embedder.tier == EmbedderTier::Hash
+                    )
+                }));
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find the document",
+                        0,
+                        |_| None,
+                        |_| panic!("zero limit"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    metrics.zero_signal,
+                    Some(ZeroSignalReason::CallerRequestedZeroK)
+                );
+                assert_eq!(unused.identity_calls.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn async_producer_kind_semantic_overrides_hash_display_name() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for owner_backed in [false, true] {
+                let dir = owner_backed_dir("typed-semantic-fast");
+                let fast = query_admission_identity("semantic-fast", 4);
+                let quality = query_admission_identity("semantic-quality", 4);
+                let index = producer_kind_index(&dir, owner_backed, &fast, &quality);
+                let quality_embedder = Arc::new(IdentityCountingEmbedder::new(
+                    "quality",
+                    quality,
+                    vec![0.0, 1.0, 0.0, 0.0],
+                ));
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(IdentityCountingEmbedder::new(
+                        "fnv1a-256",
+                        fast,
+                        vec![1.0, 0.0, 0.0, 0.0],
+                    )),
+                    TwoTierConfig {
+                        explain: true,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(quality_embedder);
+                let mut phases = Vec::new();
+                let metrics = searcher
+                    .search(
+                        &cx,
+                        "find the document",
+                        1,
+                        |_| None,
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .unwrap();
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                    SearchPhase::Refined {
+                        results: refined, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("both admitted semantic tiers must run");
+                };
+                assert_eq!(initial[0].doc_id, "doc-near");
+                assert_eq!(initial[0].source, ScoreSource::SemanticFast);
+                assert!(matches!(
+                    &initial[0].explanation.as_ref().unwrap().components[0].source,
+                    ExplainedSource::SemanticFast { embedder, .. } if embedder == "fnv1a-256"
+                ));
+                assert!(refined.iter().all(|hit| {
+                    hit.source != ScoreSource::HashControl
+                        && hit
+                            .explanation
+                            .as_ref()
+                            .unwrap()
+                            .components
+                            .iter()
+                            .all(|component| {
+                                !matches!(component.source, ExplainedSource::HashControl { .. })
+                            })
+                }));
+                assert!(metrics.semantic_candidates > 0);
+                assert_eq!(metrics.hash_control_candidates, 0);
+                assert!(metrics.phase2_vectors_searched > 0);
+            }
+        });
+    }
+
+    #[test]
+    fn async_producer_kind_refuses_hash_as_quality_for_semantic_fast() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("stamped-hash-quality");
+            let fast = query_admission_identity("semantic-fast", 4);
+            let quality = hash_control_identity("control-quality", 4);
+            let index = producer_kind_index(&dir, false, &fast, &quality);
+            let fast_embedder = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                fast,
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let quality_embedder = Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                quality,
+                vec![0.0, 1.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast_embedder.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality_embedder.clone());
+            for k in [0, 1] {
+                let error = searcher
+                    .search(
+                        &cx,
+                        "find the document",
+                        k,
+                        |_| None,
+                        |_| panic!("phase before refusal"),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, .. } if field == "search.quality_kind"
+                ));
+            }
+            assert_eq!(fast_embedder.embed_count(), 0);
+            assert_eq!(quality_embedder.embed_count(), 0);
+        });
     }
 
     /// Reopen each production layout with independent 4D fast and 6D quality
@@ -8637,7 +8983,7 @@ mod tests {
                         legacy_dir = Some(dir);
                     }
                     "missing_identity" => quality.identity_refusal = Some("embedder.identity"),
-                    "control" => quality.identity = in_memory_identity("response-quality", 6),
+                    "control" => quality.identity = hash_control_identity("response-quality", 6),
                     "wrong_space" => {
                         quality.identity = query_admission_identity("foreign-quality", 6);
                     }
@@ -10228,7 +10574,7 @@ mod tests {
                 fast.category = category;
                 match fault {
                     "identity" => {
-                        fast.bound_response_identity = Some(in_memory_identity("foreign", 4));
+                        fast.bound_response_identity = Some(query_admission_identity("foreign", 4));
                     }
                     "dimension" => fast.bound_response_values = Some(vec![1.0]),
                     _ => fast.bound_response_values = Some(vec![f32::NAN; 4]),
@@ -11001,7 +11347,7 @@ mod tests {
                             let mut values = refused.vector.clone();
                             match fault {
                                 "space" => {
-                                    identity = in_memory_identity(
+                                    identity = query_admission_identity(
                                         "foreign-response",
                                         identity.space.dimension,
                                     );
@@ -11495,7 +11841,7 @@ mod tests {
             let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("mmr-fast", 4),
+                query_admission_identity("mmr-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let searcher =
@@ -11529,7 +11875,7 @@ mod tests {
             let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("mmr-fast", 4),
+                query_admission_identity("mmr-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let searcher =
@@ -11888,14 +12234,14 @@ mod tests {
                 index,
                 Arc::new(IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("mmr-fast", 4),
+                    query_admission_identity("mmr-fast", 4),
                     vec![1.0, 0.0, 0.0, 0.0],
                 )),
                 TwoTierConfig::default(),
             )
             .with_quality_embedder(Arc::new(IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("mmr-quality", 4),
+                query_admission_identity("mmr-quality", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             )))
             .with_mmr_config(MmrConfig {
@@ -11937,12 +12283,12 @@ mod tests {
             let index = owner_backed_partial_quality_index(&dir, &fast_binding, &quality_binding);
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("prf-fast", 4),
+                query_admission_identity("prf-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let quality = Arc::new(IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("prf-quality", 4),
+                query_admission_identity("prf-quality", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let searcher =
@@ -12031,12 +12377,12 @@ mod tests {
 
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("ctzo-refine-fast", 4),
+                query_admission_identity("ctzo-refine-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let quality = Arc::new(IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("ctzo-refine-quality", 4),
+                query_admission_identity("ctzo-refine-quality", 4),
                 vec![0.0, 1.0, 0.0, 0.0],
             ));
             let searcher =
@@ -12563,7 +12909,7 @@ mod tests {
                         native_quality && with_quality,
                         "{mode}"
                     );
-                    let identity = in_memory_identity("native-progressive-fast", 4);
+                    let identity = query_admission_identity("native-progressive-fast", 4);
                     let mut fast = IdentityCountingEmbedder::new(
                         "fast",
                         identity.clone(),
@@ -12583,7 +12929,7 @@ mod tests {
                     .with_embedding_cache(8);
                     let quality = Arc::new(IdentityCountingEmbedder::new(
                         "quality",
-                        in_memory_identity("native-progressive-quality", 4),
+                        query_admission_identity("native-progressive-quality", 4),
                         vec![0.0, 1.0, 0.0, 0.0],
                     ));
                     if with_quality {
@@ -12679,14 +13025,13 @@ mod tests {
                                 frankensearch_core::TierQueryCoverageV1::NotRequested
                             }
                         );
-                        // HashControl for both shapes: `artifact_binding` and
-                        // `in_memory_identity` build `explicit_test_model`
-                        // control spaces, which never report a semantic
-                        // topology (bd-ctzo C4). The quality coverage above is
-                        // what distinguishes progressive from fast-only.
                         assert_eq!(
                             coverage.topology,
-                            frankensearch_core::RetrievalTopology::HashControl
+                            if with_quality {
+                                frankensearch_core::RetrievalTopology::FullProgressive
+                            } else {
+                                frankensearch_core::RetrievalTopology::FastOnly
+                            }
                         );
                     }
                 }
@@ -12708,12 +13053,12 @@ mod tests {
                     23,
                 )
                 .unwrap();
-            let advertised = in_memory_identity("native-fast-response", 4);
+            let advertised = query_admission_identity("native-fast-response", 4);
             let mut foreign_producer = advertised.clone();
             "foreign-bound-backend".clone_into(&mut foreign_producer.producer.backend);
             for (response, field) in [
                 (
-                    in_memory_identity("foreign-fast-space", 4),
+                    query_admission_identity("foreign-fast-space", 4),
                     "query_embedding.fast.space_identity",
                 ),
                 (
@@ -12796,7 +13141,7 @@ mod tests {
                     .unwrap();
                 let mut fast = IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("native-fast-cancel", 4),
+                    query_admission_identity("native-fast-cancel", 4),
                     vec![1.0, 0.0, 0.0, 0.0],
                 )
                 .with_bound_response_values(vec![1.0, 0.0, 0.0]);
@@ -12855,7 +13200,7 @@ mod tests {
                 index,
                 Arc::new(IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("native-fast-filter-cancel", 4),
+                    query_admission_identity("native-fast-filter-cancel", 4),
                     vec![1.0, 0.0, 0.0, 0.0],
                 )),
                 TwoTierConfig::default(),
@@ -12896,7 +13241,8 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = owner_backed_dir("owner-fast-rounded-zero");
             let path = dir.join("fast.fsvi");
-            let binding = artifact_binding("owner-fast-rounded-zero", 4, 79);
+            let binding =
+                fixture_v2_binding(hash_control_identity("owner-fast-rounded-zero", 4), 79);
             // Sealed by the pre-validation writer in 8ff1a225. The original
             // nonzero F32 input rounded to zero in the stored F16 vector.
             std::fs::write(
@@ -12923,7 +13269,7 @@ mod tests {
             for exact_override in [false, true] {
                 let fast = Arc::new(IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("owner-fast-rounded-zero", 4),
+                    hash_control_identity("owner-fast-rounded-zero", 4),
                     vec![1.0, 0.0, 0.0, 0.0],
                 ));
                 let mut searcher = TwoTierSearcher::new(Arc::clone(&index), fast, config.clone());
@@ -12998,7 +13344,7 @@ mod tests {
             {
                 let fast = Arc::new(IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("native-fast-override", 4),
+                    query_admission_identity("native-fast-override", 4),
                     if zero_query {
                         vec![0.0; 4]
                     } else {
@@ -13246,10 +13592,10 @@ mod tests {
                 assert_eq!(index.has_native_quality_hnsw(), native);
                 let fast = Arc::new(IdentityCountingEmbedder::new(
                     "fast",
-                    in_memory_identity("native-quality-fast", 4),
+                    query_admission_identity("native-quality-fast", 4),
                     vec![1.0, 0.0, 0.0, 0.0],
                 ));
-                let identity = in_memory_identity("native-quality-provider", 4);
+                let identity = query_admission_identity("native-quality-provider", 4);
                 let quality = Arc::new(
                     IdentityCountingEmbedder::new(
                         "quality",
@@ -13335,12 +13681,12 @@ mod tests {
                     11,
                 )
                 .expect("enable native quality retrieval");
-            let advertised = in_memory_identity("native-response-quality", 4);
+            let advertised = query_admission_identity("native-response-quality", 4);
             let mut foreign_producer = advertised.clone();
             "foreign-bound-backend".clone_into(&mut foreign_producer.producer.backend);
             for (response, expected_field) in [
                 (
-                    in_memory_identity("foreign-bound-space", 4),
+                    query_admission_identity("foreign-bound-space", 4),
                     "query_embedding.quality.space_identity",
                 ),
                 (
@@ -13351,7 +13697,7 @@ mod tests {
                 for cached in [false, true] {
                     let fast = Arc::new(IdentityCountingEmbedder::new(
                         "fast",
-                        in_memory_identity("native-response-fast", 4),
+                        query_admission_identity("native-response-fast", 4),
                         vec![1.0, 0.0, 0.0, 0.0],
                     ));
                     let quality = Arc::new(
@@ -13446,7 +13792,7 @@ mod tests {
                 .expect("enable native quality retrieval");
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("native-cancel-fast", 4),
+                query_admission_identity("native-cancel-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             // Preflight accepts the advertised identity. Binding the actual
@@ -13454,7 +13800,7 @@ mod tests {
             // vector length; cancellation must win over that coincident refusal.
             let mut quality = IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("native-cancel-quality", 4),
+                query_admission_identity("native-cancel-quality", 4),
                 vec![0.0, 1.0, 0.0, 0.0],
             )
             .with_bound_response_values(vec![0.0, 1.0, 0.0]);
@@ -14558,12 +14904,12 @@ mod tests {
             let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("quality-identity-fast", 4),
+                query_admission_identity("quality-identity-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             let quality = Arc::new(IdentityCountingEmbedder::new(
                 "quality",
-                in_memory_identity("quality-identity-quality", 4),
+                query_admission_identity("quality-identity-quality", 4),
                 vec![0.0, 1.0, 0.0, 0.0],
             ));
             let searcher = TwoTierSearcher::new(
@@ -14624,7 +14970,7 @@ mod tests {
             let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
             let fast = Arc::new(IdentityCountingEmbedder::new(
                 "fast",
-                in_memory_identity("quality-identity-cancel-fast", 4),
+                query_admission_identity("quality-identity-cancel-fast", 4),
                 vec![1.0, 0.0, 0.0, 0.0],
             ));
             // Admission, the pre-inference check and the actual bound response
@@ -14633,7 +14979,7 @@ mod tests {
             let quality = Arc::new(
                 IdentityCountingEmbedder::new(
                     "quality",
-                    in_memory_identity("quality-identity-cancel-quality", 4),
+                    query_admission_identity("quality-identity-cancel-quality", 4),
                     vec![0.0, 1.0, 0.0, 0.0],
                 )
                 .cancel_on_identity_call(cx.clone(), 4),
@@ -16722,7 +17068,6 @@ mod tests {
                 .expect("hash control with lexical should stay lexical-only");
 
             assert!(!got_refined);
-            assert!(!searcher.should_run_quality());
             assert_eq!(metrics.phase1_vectors_searched, 0);
             assert_eq!(metrics.semantic_candidates, 0);
             assert_eq!(metrics.phase2_vectors_searched, 0);
@@ -18303,7 +18648,8 @@ mod tests {
             }))),
         }];
 
-        let scored = fused_hits_to_scored_results(&fused, &lexical_results, None, "fast-test");
+        let scored =
+            fused_hits_to_scored_results(&fused, &lexical_results, None, "fast-test", false);
         let lexical = scored
             .iter()
             .find(|result| result.doc_id == "lex-doc-1")
@@ -20005,7 +20351,7 @@ mod tests {
             })
             .collect();
         let config = TwoTierConfig::default();
-        let results = vector_hits_to_scored_results(&hits, 3, &config, "test-fast");
+        let results = vector_hits_to_scored_results(&hits, 3, &config, "test-fast", false);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].doc_id, "doc-0");
         assert_eq!(results[2].doc_id, "doc-2");
@@ -20014,7 +20360,7 @@ mod tests {
     #[test]
     fn vector_hits_to_scored_results_empty_hits() {
         let config = TwoTierConfig::default();
-        let results = vector_hits_to_scored_results(&[], 5, &config, "test-fast");
+        let results = vector_hits_to_scored_results(&[], 5, &config, "test-fast", false);
         assert!(results.is_empty());
     }
 
@@ -20026,7 +20372,7 @@ mod tests {
             doc_id: "my-doc".into(),
         }];
         let config = TwoTierConfig::default();
-        let results = vector_hits_to_scored_results(&hits, 10, &config, "test-fast");
+        let results = vector_hits_to_scored_results(&hits, 10, &config, "test-fast", false);
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.doc_id, "my-doc");
@@ -20056,7 +20402,7 @@ mod tests {
             hash_score: None,
             in_both_sources: true,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test", false);
         assert_eq!(results[0].source, ScoreSource::Hybrid);
         assert_eq!(results[0].fast_score, Some(0.8));
         assert_eq!(results[0].lexical_score, Some(3.0));
@@ -20076,7 +20422,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test", false);
         assert_eq!(results[0].source, ScoreSource::SemanticFast);
     }
 
@@ -20129,8 +20475,13 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results =
-            fused_hits_to_scored_results(&fused, &[], Some(default_rrf_explanation()), "fnv1a-256");
+        let results = fused_hits_to_scored_results(
+            &fused,
+            &[],
+            Some(default_rrf_explanation()),
+            "fnv1a-256",
+            true,
+        );
         assert_eq!(results[0].source, ScoreSource::HashControl);
         assert!(
             matches!(
@@ -20142,7 +20493,7 @@ mod tests {
             "hash explanation must not use SemanticFast: {:?}",
             results[0].explanation
         );
-        let semantic = fused_hits_to_scored_results(&fused, &[], None, "minilm-l6-v2");
+        let semantic = fused_hits_to_scored_results(&fused, &[], None, "minilm-l6-v2", false);
         assert_eq!(semantic[0].source, ScoreSource::SemanticFast);
 
         let remapped = vec![frankensearch_core::types::FusedHit {
@@ -20162,6 +20513,7 @@ mod tests {
             &[],
             Some(default_rrf_explanation()),
             "fnv1a-256",
+            true,
         );
         assert_eq!(remapped_results[0].source, ScoreSource::HashControl);
         assert_eq!(remapped_results[0].fast_score, Some(0.9));
@@ -20181,7 +20533,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test", false);
         assert_eq!(results[0].source, ScoreSource::Lexical);
     }
 
@@ -20199,7 +20551,7 @@ mod tests {
             hash_score: None,
             in_both_sources: false,
         }];
-        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test");
+        let results = fused_hits_to_scored_results(&fused, &[], None, "fast-test", false);
         assert_eq!(results[0].source, ScoreSource::Hybrid);
     }
 
@@ -20218,8 +20570,13 @@ mod tests {
             in_both_sources: true,
         }];
 
-        let results =
-            fused_hits_to_scored_results(&fused, &[], Some(default_rrf_explanation()), "fast-test");
+        let results = fused_hits_to_scored_results(
+            &fused,
+            &[],
+            Some(default_rrf_explanation()),
+            "fast-test",
+            false,
+        );
         let explanation = results[0]
             .explanation
             .as_ref()
@@ -20520,12 +20877,9 @@ mod tests {
     }
 
     #[test]
-    fn vector_exclusion_source_is_hash_control_for_hash_embedder() {
-        let hash = NonSemanticEmbedder::new("fnv1a-test", 4);
-        let semantic = StubEmbedder::new("fast", 4);
-        assert_eq!(vector_exclusion_source(&hash), "hash_control");
-        assert_eq!(vector_exclusion_source(&semantic), "semantic");
-        assert!(!vector_exclusion_source(&hash).contains("semantic"));
+    fn vector_exclusion_source_matches_the_retrieval_kind() {
+        assert_eq!(vector_exclusion_source(true), "hash_control");
+        assert_eq!(vector_exclusion_source(false), "semantic");
     }
 
     #[test]
@@ -20699,7 +21053,7 @@ mod tests {
             ..TwoTierConfig::default()
         };
         let searcher = TwoTierSearcher::new(index, fast, config).with_quality_embedder(quality);
-        assert!(!searcher.should_run_quality());
+        assert!(!searcher.should_run_quality(false));
     }
 
     #[test]
@@ -20707,7 +21061,7 @@ mod tests {
         let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
-        assert!(!searcher.should_run_quality());
+        assert!(!searcher.should_run_quality(false));
     }
 
     #[test]
@@ -20717,7 +21071,7 @@ mod tests {
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
-        assert!(!searcher.should_run_quality());
+        assert!(!searcher.should_run_quality(false));
     }
 
     #[test]
@@ -20727,17 +21081,17 @@ mod tests {
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
-        assert!(searcher.should_run_quality());
+        assert!(searcher.should_run_quality(false));
     }
 
     #[test]
-    fn should_run_quality_false_when_fast_embedder_is_hash_control() {
+    fn should_run_quality_false_for_hash_control() {
         let (_index_dir, index) = build_test_index_with_quality(4);
         let fast = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
-        assert!(!searcher.should_run_quality());
+        assert!(!searcher.should_run_quality(true));
     }
 
     #[test]

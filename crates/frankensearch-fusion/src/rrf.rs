@@ -18,9 +18,7 @@ use ahash::AHashMap;
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, ScoreComponent,
 };
-use frankensearch_core::{
-    FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit, is_hash_generation_id,
-};
+use frankensearch_core::{FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit};
 use tracing::{Level, debug, instrument};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -146,19 +144,38 @@ fn sanitize_graph_weight(weight: f64) -> f64 {
 /// Hash/fnv/jl vector-only hits are [`ScoreSource::HashControl`], never
 /// [`ScoreSource::SemanticFast`]. Lexical-only fused rows stay lexical.
 #[must_use]
-pub(crate) fn classify_fused_hit_source(hit: &FusedHit, fast_embedder_id: &str) -> ScoreSource {
+pub(crate) fn classify_fused_hit_source(hit: &FusedHit, hash_control: bool) -> ScoreSource {
     if hit.in_both_sources {
         ScoreSource::Hybrid
     } else if hit.lexical_rank.is_some() {
         ScoreSource::Lexical
     } else if hit.semantic_rank.is_some() || hit.hash_rank.is_some() {
-        if is_hash_generation_id(fast_embedder_id) {
+        if hash_control {
             ScoreSource::HashControl
         } else {
             ScoreSource::SemanticFast
         }
     } else {
         ScoreSource::Hybrid
+    }
+}
+
+pub(crate) fn fast_score_explanation_source(
+    embedder: &str,
+    cosine_sim: f64,
+    hash_control: bool,
+) -> ExplainedSource {
+    let embedder = embedder.to_owned();
+    if hash_control {
+        ExplainedSource::HashControl {
+            embedder,
+            cosine_sim,
+        }
+    } else {
+        ExplainedSource::SemanticFast {
+            embedder,
+            cosine_sim,
+        }
     }
 }
 
@@ -690,19 +707,8 @@ impl<'a> FusionExplanation<'a> {
             (hit.semantic_rank, hit.semantic_score)
         };
         if let Some((rank, raw_score)) = vector_rank.zip(vector_score) {
-            let embedder = embedder.to_owned();
-            let cosine_sim = f64::from(raw_score);
-            let source = if hash_control {
-                ExplainedSource::HashControl {
-                    embedder,
-                    cosine_sim,
-                }
-            } else {
-                ExplainedSource::SemanticFast {
-                    embedder,
-                    cosine_sim,
-                }
-            };
+            let source =
+                fast_score_explanation_source(embedder, f64::from(raw_score), hash_control);
             components.push(self.vector.component(source, rank, raw_score));
         }
         components.extend(self.graph_component(hit));
@@ -1416,15 +1422,15 @@ mod tests {
     #[test]
     fn classify_fused_hit_source_separates_hash_and_lexical() {
         assert_eq!(
-            classify_fused_hit_source(&fused("both", Some(0), Some(0), true), "fnv1a-256"),
+            classify_fused_hit_source(&fused("both", Some(0), Some(0), true), true),
             ScoreSource::Hybrid
         );
         assert_eq!(
-            classify_fused_hit_source(&fused("lex", Some(0), None, false), "fnv1a-256"),
+            classify_fused_hit_source(&fused("lex", Some(0), None, false), true),
             ScoreSource::Lexical
         );
         assert_eq!(
-            classify_fused_hit_source(&fused("hash", None, Some(0), false), "fnv1a-256"),
+            classify_fused_hit_source(&fused("hash", None, Some(0), false), true),
             ScoreSource::HashControl
         );
         let mut remapped = fused("hash-remapped", None, Some(2), false);
@@ -1432,15 +1438,11 @@ mod tests {
         assert_eq!(remapped.hash_rank, Some(2));
         assert_eq!(remapped.semantic_rank, None);
         assert_eq!(
-            classify_fused_hit_source(&remapped, "fnv1a-256"),
+            classify_fused_hit_source(&remapped, true),
             ScoreSource::HashControl
         );
         assert_eq!(
-            classify_fused_hit_source(&fused("legacy", None, Some(0), false), "hash/fnv1a"),
-            ScoreSource::HashControl
-        );
-        assert_eq!(
-            classify_fused_hit_source(&fused("sem", None, Some(0), false), "minilm-l6-v2"),
+            classify_fused_hit_source(&fused("sem", None, Some(0), false), false),
             ScoreSource::SemanticFast
         );
     }
