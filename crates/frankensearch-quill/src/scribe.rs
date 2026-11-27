@@ -60,8 +60,7 @@ use crate::quiver::{
     EncodedPositionList, EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection,
     FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput, NumericCodecError,
     NumericEntry, NumericFieldInput, NumericValue, PositionCodecError, PositionListLimits, Posting,
-    StatsCodecError,
-    StoredMetaCodecError, StoredMetaFieldInput,
+    StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
 #[cfg(feature = "bench-internals")]

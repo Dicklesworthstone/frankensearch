@@ -3953,11 +3953,12 @@ impl EncodedPositionList {
                 }
             })?;
             let run_len = validated_position_run_len(posting_ordinal, run)?;
-            let next_payload_len = payload_len.checked_add(run_len).ok_or(
-                PositionCodecError::ArithmeticOverflow {
-                    field: "position payload length",
-                },
-            )?;
+            let next_payload_len =
+                payload_len
+                    .checked_add(run_len)
+                    .ok_or(PositionCodecError::ArithmeticOverflow {
+                        field: "position payload length",
+                    })?;
             if next_payload_len > limits.max_bytes {
                 return Err(PositionCodecError::ByteLimitExceeded {
                     limit: limits.max_bytes,
@@ -3965,7 +3966,8 @@ impl EncodedPositionList {
                 });
             }
 
-            if directory.is_empty() || next_payload_len - block_start > POSITION_BLOCK_TARGET_BYTES {
+            if directory.is_empty() || next_payload_len - block_start > POSITION_BLOCK_TARGET_BYTES
+            {
                 block_start = payload_len;
                 if directory.len() >= limits.max_blocks {
                     return Err(PositionCodecError::BlockLimitExceeded {
@@ -4775,6 +4777,15 @@ impl PositionCursor<'_> {
         output: &mut Vec<u32>,
     ) -> Result<bool, PositionCodecError> {
         output.clear();
+        self.append_current_positions_to(output)
+    }
+
+    /// Append the current run to a caller's retained positions. A failed
+    /// decode preserves both the previous runs and the cursor for retry.
+    pub(crate) fn append_current_positions_to(
+        &mut self,
+        output: &mut Vec<u32>,
+    ) -> Result<bool, PositionCodecError> {
         let Some(posting_ordinal) = self.postings.posting_ordinal() else {
             return Ok(false);
         };
@@ -4793,8 +4804,9 @@ impl PositionCursor<'_> {
             usize::try_from(freq).map_err(|_| PositionCodecError::ArithmeticOverflow {
                 field: "current position count",
             })?;
+        let start = output.len();
         output
-            .try_reserve_exact(expected)
+            .try_reserve(expected)
             .map_err(|_| PositionCodecError::Allocation {
                 resource: "decoded current positions",
                 count: expected,
@@ -4810,7 +4822,7 @@ impl PositionCursor<'_> {
             self.position_reader.clone()
         };
         if let Err(error) = decode_position_run(&mut next_reader, posting_ordinal, freq, output) {
-            output.clear();
+            output.truncate(start);
             return Err(error);
         }
         if !self.current_positions_consumed {

@@ -49,8 +49,8 @@ use crate::quiver::{
     EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection, FieldStats,
     IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapEntry,
     IdMapEntryInput, IdMapPresence, IdMapSection, NumericEntry, NumericFieldInput, NumericSection,
-    PositionList, Posting, PostingList, StatsSection, StoredMetaCodecError, StoredMetaFieldInput,
-    StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
+    PositionList, PositionListLimits, Posting, PostingList, StatsSection, StoredMetaCodecError,
+    StoredMetaFieldInput, StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
     ValidatedTermPruningMetadata, aggregate_field_stats, check_posting_concat_bounds,
     project_doclen_len, project_id_hash_len, project_id_map_len, project_position_concat_bounds,
     project_stored_meta_len_total, seeded_id_hash,
@@ -7361,9 +7361,6 @@ fn compact_terms(
         .map_err(|error| compaction_source_validation(&error))?;
         let posting_list = PostingList::parse(posting_bytes, term.metadata.doc_freq)
             .map_err(|error| compaction_codec(SectionKind::POSTINGS, error))?;
-        let decoded = posting_list
-            .decode_all_bounded(term.metadata.doc_freq as usize)
-            .map_err(|error| compaction_codec(SectionKind::POSTINGS, error))?;
         let position_list = if let Some(span) = term.metadata.positions {
             let section = source
                 .positions
@@ -7380,35 +7377,8 @@ fn compact_terms(
         } else {
             None
         };
-        let mut retained = Vec::<Posting>::new();
-        retained
-            .try_reserve_exact(decoded.len())
-            .map_err(|_| CompactionError::Allocation {
-                resource: "retained postings",
-                count: decoded.len(),
-            })?;
-        let mut retained_positions = Vec::new();
-        for (ordinal, posting) in decoded.iter().copied().enumerate() {
-            if tombstones.contains(posting.doc_id) {
-                continue;
-            }
-            if let Some(position_list) = &position_list {
-                let ordinal =
-                    u32::try_from(ordinal).map_err(|_| CompactionError::ArithmeticOverflow {
-                        field: "position posting ordinal",
-                    })?;
-                for position in position_list
-                    .positions_for_ordinal(ordinal)
-                    .map_err(|error| compaction_codec(SectionKind::POSITIONS, error))?
-                {
-                    retained_positions.push(
-                        position
-                            .map_err(|error| compaction_codec(SectionKind::POSITIONS, error))?,
-                    );
-                }
-            }
-            retained.push(posting);
-        }
+        let (retained, retained_positions) =
+            retain_compaction_postings(&posting_list, position_list.as_ref(), tombstones)?;
         if retained.is_empty() {
             continue;
         }
@@ -7438,21 +7408,6 @@ fn compact_terms(
                 fieldnorms.fieldnorm_id(u64::from(docid))
             })
             .map_err(|error| compaction_codec(SectionKind::BLOCKMAX, error))?;
-        let encoded_positions = if position_list.is_some() {
-            Some(
-                EncodedPositionList::encode(&retained, &retained_positions)
-                    .map_err(|error| compaction_codec(SectionKind::POSITIONS, error))?,
-            )
-        } else {
-            None
-        };
-        if encoded_positions.is_some() && !has_positions {
-            return Err(CompactionError::SectionCodec {
-                section: SectionKind::POSITIONS,
-                detail: "term carries positions but the schema has no POSITIONS section".to_owned(),
-            });
-        }
-
         let postings_offset = durable_compaction_len(&postings_output, "POSTINGS offset")?;
         append_compaction_bytes(
             &mut postings_output,
@@ -7465,14 +7420,24 @@ fn compact_terms(
             encoded_blockmax.as_bytes(),
             "BLOCKMAX output",
         )?;
-        let positions_span = if let Some(encoded_positions) = encoded_positions {
+        let positions_span = if position_list.is_some() {
+            if !has_positions {
+                return Err(CompactionError::SectionCodec {
+                    section: SectionKind::POSITIONS,
+                    detail: "term carries positions but the schema has no POSITIONS section"
+                        .to_owned(),
+                });
+            }
+            let start = positions_output.len();
             let offset = durable_compaction_len(&positions_output, "POSITIONS offset")?;
-            let len = durable_compaction_len(encoded_positions.as_bytes(), "POSITIONS length")?;
-            append_compaction_bytes(
+            EncodedPositionList::append_with_limits(
                 &mut positions_output,
-                encoded_positions.as_bytes(),
-                "POSITIONS output",
-            )?;
+                &retained,
+                &retained_positions,
+                PositionListLimits::default(),
+            )
+            .map_err(|error| compaction_codec(SectionKind::POSITIONS, error))?;
+            let len = durable_compaction_len(&positions_output[start..], "POSITIONS length")?;
             Some(ByteSpan::new(offset, len))
         } else {
             None
@@ -7510,6 +7475,47 @@ fn compact_terms(
         terms,
         total_tokens,
     })
+}
+
+/// Walk one validated pair of streams in posting order. A positional cursor
+/// shares its run boundary with the next posting, including at block seams.
+fn retain_compaction_postings(
+    postings: &PostingList<'_>,
+    positions: Option<&PositionList<'_>>,
+    tombstones: &TombstoneSet,
+) -> Result<(Vec<Posting>, Vec<u32>), CompactionError> {
+    let mut retained = Vec::new();
+    let mut retained_positions = Vec::new();
+    let count = postings.doc_freq() as usize;
+    retained
+        .try_reserve_exact(count)
+        .map_err(|_| CompactionError::Allocation {
+            resource: "retained postings",
+            count,
+        })?;
+    if let Some(positions) = positions {
+        let codec_error = |error| compaction_codec(SectionKind::POSITIONS, error);
+        let mut cursor = positions.cursor().map_err(codec_error)?;
+        while let Some(posting) = cursor.current() {
+            if !tombstones.contains(posting.doc_id) {
+                cursor
+                    .append_current_positions_to(&mut retained_positions)
+                    .map_err(codec_error)?;
+                retained.push(posting);
+            }
+            cursor.next().map_err(codec_error)?;
+        }
+    } else {
+        let codec_error = |error| compaction_codec(SectionKind::POSTINGS, error);
+        let mut cursor = postings.cursor().map_err(codec_error)?;
+        while let Some(posting) = cursor.current() {
+            if !tombstones.contains(posting.doc_id) {
+                retained.push(posting);
+            }
+            cursor.next().map_err(codec_error)?;
+        }
+    }
+    Ok((retained, retained_positions))
 }
 
 fn durable_compaction_len(bytes: &[u8], field: &'static str) -> Result<u64, CompactionError> {
@@ -19169,6 +19175,45 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const EMPTY_TERM_DICTIONARY: [u8; 4] = 0_u32.to_le_bytes();
+
+    #[test]
+    fn compaction_reads_each_position_run_once_across_tombstones_and_blocks() -> TestResult {
+        let postings: Vec<_> = (0..1_100).map(|doc| Posting::new(doc, 4)).collect();
+        let positions: Vec<_> = postings
+            .iter()
+            .flat_map(|p| [p.doc_id, p.doc_id, p.doc_id + 1, p.doc_id + 200])
+            .collect();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let position_bytes = EncodedPositionList::encode(&postings, &positions)?;
+        assert!(position_bytes.block_count() > 1);
+        let position_list = position_bytes.position_list(&posting_list)?;
+        let deleted: Vec<u32> = (0..1_100).step_by(5).collect();
+        let tombstones = TombstoneSet::from_sorted_docids(&deleted)?;
+        let expected: Vec<_> = postings
+            .iter()
+            .copied()
+            .filter(|p| p.doc_id % 5 != 0)
+            .collect();
+        let expected_positions: Vec<_> = expected
+            .iter()
+            .flat_map(|p| [p.doc_id, p.doc_id, p.doc_id + 1, p.doc_id + 200])
+            .collect();
+        crate::quiver::reset_position_run_work_for_test();
+        let (live, flat) =
+            retain_compaction_postings(&posting_list, Some(&position_list), &tombstones)?;
+        assert_eq!(live, expected);
+        assert_eq!(flat, expected_positions);
+        assert_eq!(
+            crate::quiver::position_run_work_for_test(),
+            (live.len(), deleted.len())
+        );
+        let (basic_live, basic_positions) =
+            retain_compaction_postings(&posting_list, None, &tombstones)?;
+        assert_eq!(basic_live, live);
+        assert!(basic_positions.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn publication_authority_phase_decodes_in_const_context() {
