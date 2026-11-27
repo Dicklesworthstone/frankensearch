@@ -3098,6 +3098,7 @@ mod tests {
                     state.0 = offset;
                     if state.1 == self.target_pass && offset > 0 {
                         state.2 = true;
+                        drop(state);
                         self.cx.set_cancel_requested(true);
                     }
                 }
