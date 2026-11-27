@@ -1134,16 +1134,14 @@ impl SyncTwoTierSearcher {
         admit_tier_query(fast_index, fast, "fast")?;
         let hash_control = admitted_tier_is_hash_control(fast_index, fast);
 
-        let quality = if self.config.fast_only {
-            // Disabled quality is outside this request's admission contract.
-            // A stale precomputed quality embedding must not block valid fast
-            // retrieval, just as an absent quality embedding does not.
+        let quality = if self.config.fast_only || hash_control {
+            // An unused quality embedding cannot prevent valid fast retrieval.
             None
         } else {
             match (query.quality(), self.index.quality_index()) {
                 (Some(bound), Some(quality_index)) => {
                     admit_tier_query(quality_index, bound, "quality")?;
-                    if !hash_control && admitted_tier_is_hash_control(quality_index, bound) {
+                    if admitted_tier_is_hash_control(quality_index, bound) {
                         return Err(SearchError::InvalidConfig {
                             field: "sync_search.quality_kind".to_owned(),
                             value: "non_semantic".to_owned(),
@@ -1355,12 +1353,6 @@ impl SyncTwoTierSearcher {
             final_ranking,
         };
 
-        // The quality arm needs four things: it must not be switched off, the
-        // index must have a quality tier, the caller must have bound a
-        // QUALITY-space embedding for it, and the fast lane must be semantic.
-        // A hash-control fast lane is a control path, not a first semantic
-        // pass, so a bound quality embedding does not schedule refinement.
-        let quality_query = quality_query.filter(|_| !self.config.fast_only && !hash_control);
         let Some(quality_query) = quality_query else {
             // Same vocabulary as the async searcher (searcher.rs) — the two
             // sides share one skip_reason contract; "fast_only" is the string
@@ -5585,6 +5577,7 @@ mod tests {
     #[test]
     fn hash_control_skips_quality_and_does_not_become_semantic_quality() {
         let hash_bundle = EmbeddingIdentityBundleV1::explicit_test_model("fnv1a-256", 2);
+        let quality_bundle = semantic_identity("sync-fixture", 2);
         let doc_ids = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
         let fast = InMemoryVectorIndex::from_vectors_with_identity(
             doc_ids.clone(),
@@ -5593,10 +5586,11 @@ mod tests {
             &hash_bundle.space,
         )
         .expect("hash-control fast index");
-        let quality = InMemoryVectorIndex::from_vectors(
+        let quality = InMemoryVectorIndex::from_vectors_with_identity(
             doc_ids,
             vec![vec![0.2, 0.8], vec![1.0, 0.0], vec![0.0, 1.0]],
             2,
+            &quality_bundle.space,
         )
         .expect("quality index");
         let searcher = SyncTwoTierSearcher::new(
@@ -5605,63 +5599,53 @@ mod tests {
             ),
             TwoTierConfig::default(),
         );
-        let query = TieredQueryEmbeddings::progressive(
-            BoundQueryEmbedding::new(vec![1.0, 0.0], hash_bundle)
-                .expect("hash-control query binds"),
-            BoundQueryEmbedding::new(
-                vec![1.0, 0.0],
-                EmbeddingIdentityBundleV1::explicit_test_model("sync-fixture", 2),
-            )
-            .expect("quality query binds"),
-        );
-        let (results, metrics) = searcher
-            .search_collect(&query, 2)
-            .expect("hash-control search still returns hits");
-        assert!(!results.is_empty());
-        assert!(
-            results
-                .iter()
-                .all(|result| result.source == ScoreSource::HashControl),
-            "hash-control hits must not be relabeled SemanticQuality: {:?}",
-            results
-                .iter()
-                .map(|result| result.source)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(metrics.phase2_vectors_searched, 0);
-        assert_eq!(
-            metrics.skip_reason.as_deref(),
-            Some("non_semantic_fast_embedder_vector_control")
-        );
-        assert!(metrics.hash_control_candidates > 0);
-        assert_eq!(metrics.semantic_candidates, 0);
-        let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
-        assert!(
-            phases
-                .iter()
-                .any(|phase| matches!(phase, SearchPhase::Initial { .. }))
-        );
-        assert!(
-            !phases
-                .iter()
-                .any(|phase| matches!(phase, SearchPhase::Refined { .. })),
-            "hash-control Initial must not schedule a Refined phase"
-        );
-        assert!(
-            matches!(phases.first(), Some(SearchPhase::Initial { .. })),
-            "first hash-control phase must be Initial, got {:?}",
-            phases.first()
-        );
-        if let Some(SearchPhase::Initial {
-            metrics: phase_metrics,
-            ..
-        }) = phases.first()
-        {
+        let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], hash_bundle)
+            .expect("hash-control query binds");
+        let (fast_only, _) = searcher
+            .search_collect(&TieredQueryEmbeddings::fast_only(fast.clone()), 2)
+            .expect("hash-control search without a quality query");
+        assert_eq!(fast_only.len(), 2);
+
+        for (bundle, vector) in [
+            (quality_bundle, vec![1.0, 0.0]),
+            (semantic_identity("foreign-quality", 2), vec![1.0, 0.0]),
+            (semantic_identity("wrong-width", 3), vec![1.0, 0.0, 0.0]),
+        ] {
+            let quality = BoundQueryEmbedding::new(vector, bundle).expect("quality query binds");
+            let query = TieredQueryEmbeddings::progressive(fast.clone(), quality);
+            let (results, metrics) = searcher
+                .search_collect(&query, 2)
+                .expect("unused quality must not block hash-control results");
+            assert_eq!(results.len(), fast_only.len());
+            for (hit, expected) in results.iter().zip(&fast_only) {
+                assert_eq!(hit.doc_id, expected.doc_id);
+                assert_eq!(hit.score.to_bits(), expected.score.to_bits());
+                assert_eq!(hit.source, ScoreSource::HashControl);
+                assert_eq!(hit.quality_score, None);
+            }
+            assert_eq!(metrics.phase2_vectors_searched, 0);
             assert_eq!(
-                phase_metrics.hash_control_candidates,
-                metrics.hash_control_candidates
+                metrics.skip_reason.as_deref(),
+                Some("non_semantic_fast_embedder_vector_control")
             );
-            assert!(phase_metrics.hash_control_candidates > 0);
+            assert!(metrics.hash_control_candidates > 0);
+            assert_eq!(metrics.semantic_candidates, 0);
+            let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+            assert!(matches!(
+                phases.as_slice(),
+                [SearchPhase::Initial { metrics: phase_metrics, .. }]
+                    if phase_metrics.hash_control_candidates == metrics.hash_control_candidates
+            ));
+
+            let (empty, zero_metrics) = searcher
+                .search_collect(&query, 0)
+                .expect("zero-limit hash control must admit only the fast tier");
+            assert!(empty.is_empty());
+            assert_eq!(
+                zero_metrics.zero_signal,
+                Some(ZeroSignalReason::CallerRequestedZeroK)
+            );
+            assert!(searcher.search_iter(&query, 0).next().is_none());
         }
     }
 
@@ -8724,9 +8708,14 @@ mod tests {
                 panic!("invalid query shape must be refused before lexical work");
             }
         }
+        // Use semantic fixtures so both fast and quality participate in admission.
+        let bind_query = |vector: Vec<f32>| {
+            let dimension = u32::try_from(vector.len()).unwrap();
+            BoundQueryEmbedding::new(vector, semantic_identity("sync-fixture", dimension)).unwrap()
+        };
         for declared in [false, true] {
             let index = if declared {
-                let identity = EmbeddingIdentityBundleV1::explicit_test_model("sync-fixture", 2);
+                let identity = semantic_identity("sync-fixture", 2);
                 let tier = || {
                     InMemoryVectorIndex::from_vectors_with_identity(
                         vec!["a".to_owned()],
@@ -8748,10 +8737,8 @@ mod tests {
                 ("quality", vec![1.0, 0.0], vec![0.0; 3]),
                 ("quality", vec![1.0, 0.0], vec![1.0, 0.0, 0.0]),
             ] {
-                let query = TieredQueryEmbeddings::progressive(
-                    bound("sync-fixture", fast),
-                    bound("sync-fixture", quality),
-                );
+                let query =
+                    TieredQueryEmbeddings::progressive(bind_query(fast), bind_query(quality));
                 for k in [0, 2] {
                     if declared {
                         // Width is part of the declared space. Its identity
