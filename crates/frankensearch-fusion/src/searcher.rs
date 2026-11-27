@@ -3028,6 +3028,7 @@ impl TwoTierSearcher {
             let classified = activated.as_ref().map_or_else(
                 || {
                     self.index.search_quality_classified_with_producer(
+                        cx,
                         bound,
                         limit,
                         self.search_params,
@@ -4459,7 +4460,12 @@ impl TwoTierSearcher {
                 cancellation_checkpoint(cx, "quality_identity_to_search")?;
                 let retrieve = |limit| {
                     self.index
-                        .search_quality_classified_with_producer(&bound, limit, self.search_params)
+                        .search_quality_classified_with_producer(
+                            cx,
+                            &bound,
+                            limit,
+                            self.search_params,
+                        )
                         .map(|classified| classified.hits)
                 };
                 let hits = retrieve(quality_budget)?;
@@ -10198,7 +10204,7 @@ mod tests {
                     (
                         index.search_fast(fast_query.vector(), 64).unwrap(),
                         index
-                            .search_quality_with_producer(&quality_query, 64)
+                            .search_quality_with_producer(&cx, &quality_query, 64)
                             .unwrap(),
                     )
                 } else {
@@ -10386,7 +10392,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 index
-                    .search_quality_with_producer(&quality_query, 4)
+                    .search_quality_with_producer(&cx, &quality_query, 4)
                     .unwrap()
                     .len(),
                 1,

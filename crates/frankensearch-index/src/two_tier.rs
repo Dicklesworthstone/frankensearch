@@ -2027,30 +2027,47 @@ impl TwoTierIndex {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] when the quality tier is absent or
-    /// its stored producer differs. Propagates dimension and vector read errors.
+    /// its stored producer differs. Propagates dimension and vector read errors,
+    /// and returns [`SearchError::Cancelled`] without a partial candidate set.
     pub fn search_quality_with_producer(
         &self,
+        cx: &Cx,
         query: &BoundQueryEmbedding,
         k: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         Ok(self
-            .search_quality_classified_with_producer(query, k, None)?
+            .search_quality_classified_with_producer(cx, query, k, None)?
             .hits)
     }
 
     /// Retrieve classified quality candidates bound to the persisted producer.
     /// Explicit parameters configure the same exact scan; no raw-vector
     /// search or dimension-only admission is exposed by this entry point.
+    /// The caller's cancellation context covers main rows, resident WAL,
+    /// unusable-candidate widening and any empty-result census, including
+    /// Rayon scans selected by the explicit parameters.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::search_quality_with_producer`].
     pub fn search_quality_classified_with_producer(
         &self,
+        cx: &Cx,
         query: &BoundQueryEmbedding,
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<ClassifiedHits> {
+        self.search_quality_classified_with_producer_controlled(query, k, params, cx)
+    }
+
+    fn search_quality_classified_with_producer_controlled(
+        &self,
+        query: &BoundQueryEmbedding,
+        k: usize,
+        params: Option<SearchParams>,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<ClassifiedHits> {
+        cancel.checkpoint()?;
         let index = self
             .quality_tier()
             .ok_or_else(|| SearchError::InvalidConfig {
@@ -2066,9 +2083,12 @@ impl TwoTierIndex {
                     .to_owned(),
             });
         }
-        params.map_or_else(
-            || index.search_top_k_classified(query.vector(), k, None),
-            |params| index.search_top_k_classified_with_params(query.vector(), k, None, params),
+        index.search_top_k_classified_cancellable(
+            cancel,
+            query.vector(),
+            k,
+            None,
+            params.unwrap_or_default(),
         )
     }
 
@@ -4570,6 +4590,212 @@ mod tests {
             .expect("sequential override search");
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn producer_bound_quality_search_cancels_during_exact_scan_and_retries_identically() {
+        use std::sync::Mutex;
+
+        use crate::search::SCAN_CHECKPOINT_INTERVAL;
+
+        const ROWS: usize = 4096;
+        const CANCEL_AFTER: usize = 17;
+
+        #[derive(Clone, Copy)]
+        struct CancelDuringRows<'a> {
+            cx: &'a Cx,
+            visits: &'a Mutex<usize>,
+        }
+
+        impl ScanCancellation for CancelDuringRows<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                ScanCancellation::checkpoint(self.cx)
+            }
+
+            fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+                {
+                    let mut visits = self.visits.lock().unwrap();
+                    *visits += 1;
+                    if *visits == CANCEL_AFTER {
+                        self.cx.set_cancel_requested(true);
+                    }
+                }
+                ScanCancellation::checkpoint_at(self.cx, offset)
+            }
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let identity = EmbeddingIdentityBundleV1::explicit_test_model("quality-cancel", 2);
+        let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity.clone()).unwrap();
+        for quantization in [Quantization::F16, Quantization::F32] {
+            for wal in [false, true] {
+                let dir = temp_index_dir(&format!("quality-scan-cancel-{quantization:?}-{wal}"));
+                fs::create_dir_all(&dir).unwrap();
+                write_index_file(
+                    &dir.join(VECTOR_INDEX_FAST_FILENAME),
+                    &[("unrelated-fast", &[0.0, 1.0])],
+                )
+                .unwrap();
+                let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+                let mut writer = VectorIndex::create_with_revision(
+                    &quality_path,
+                    "quality-cancel",
+                    &identity.fingerprint(),
+                    2,
+                    quantization,
+                )
+                .unwrap();
+                writer.write_record("replaced", &[1.0, 0.0]).unwrap();
+                let rows: Vec<_> = (0..ROWS)
+                    .map(|row| {
+                        let score = f32::from(u16::try_from(row).unwrap()) / 4096.0;
+                        (format!("quality-{row:05}"), vec![score, 1.0])
+                    })
+                    .collect();
+                if !wal {
+                    for (id, vector) in &rows {
+                        writer.write_record(id, vector).unwrap();
+                    }
+                }
+                writer.finish().unwrap();
+                if wal {
+                    let mut writer = VectorIndex::open_writer(&quality_path).unwrap();
+                    writer.append_batch(&rows).unwrap();
+                    writer.append("replaced", &[-1.0, 0.0]).unwrap();
+                }
+                let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+                assert!(index.quality_admitted_owner().is_none());
+                let reference = index
+                    .quality_tier()
+                    .unwrap()
+                    .search_top_k_classified(query.vector(), 23, None)
+                    .unwrap();
+                assert_eq!(reference.hits.len(), 23);
+                for parallel_enabled in [false, true] {
+                    for parallel_chunk_size in [37, ROWS] {
+                        let params = Some(SearchParams {
+                            parallel_enabled,
+                            parallel_threshold: 1,
+                            parallel_chunk_size,
+                        });
+                        let cx = Cx::for_testing();
+                        let visits = Mutex::new(0);
+                        let result = pool.install(|| {
+                            index.search_quality_classified_with_producer_controlled(
+                                &query,
+                                23,
+                                params,
+                                CancelDuringRows {
+                                    cx: &cx,
+                                    visits: &visits,
+                                },
+                            )
+                        });
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        let visits = *visits.lock().unwrap();
+                        assert!(visits >= CANCEL_AFTER, "cancel only after real row work");
+                        let workers = if parallel_enabled { 2 } else { 1 };
+                        assert!(
+                            visits <= CANCEL_AFTER + workers * SCAN_CHECKPOINT_INTERVAL,
+                            "quality scan continued after cancellation: {visits} row visits"
+                        );
+                        cx.set_cancel_requested(false);
+                        let before = cx.checkpoint_state().checkpoint_count;
+                        let actual = pool
+                            .install(|| {
+                                index.search_quality_classified_with_producer(
+                                    &cx, &query, 23, params,
+                                )
+                            })
+                            .unwrap();
+                        assert_eq!(actual.zero_signal, reference.zero_signal);
+                        assert_eq!(actual.hits.len(), reference.hits.len());
+                        for (actual, expected) in actual.hits.iter().zip(&reference.hits) {
+                            assert_eq!(actual.doc_id, expected.doc_id);
+                            assert_eq!(actual.index, expected.index);
+                            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+                        }
+                        assert!(
+                            cx.checkpoint_state().checkpoint_count > before + 2,
+                            "the public entry point must pass its context into the scan"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn producer_bound_quality_search_admits_before_rows_and_refuses_cancelled_shortcuts() {
+        #[derive(Clone, Copy)]
+        struct NoRowWork;
+        impl ScanCancellation for NoRowWork {
+            fn checkpoint(self) -> SearchResult<()> {
+                Ok(())
+            }
+
+            fn checkpoint_at(self, _offset: usize) -> SearchResult<()> {
+                panic!("a mismatched producer cannot read quality rows");
+            }
+        }
+
+        let dir = temp_index_dir("quality-scan-admission");
+        fs::create_dir_all(&dir).unwrap();
+        write_index_file(
+            &dir.join(VECTOR_INDEX_FAST_FILENAME),
+            &[("fast", &[1.0, 0.0])],
+        )
+        .unwrap();
+        let identity = EmbeddingIdentityBundleV1::explicit_test_model("quality-admitted", 2);
+        let mut writer = VectorIndex::create_with_revision(
+            &dir.join(VECTOR_INDEX_QUALITY_FILENAME),
+            "quality-admitted",
+            &identity.fingerprint(),
+            2,
+            Quantization::F16,
+        )
+        .unwrap();
+        writer.write_record("quality", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        let wrong = BoundQueryEmbedding::new(
+            vec![1.0, 0.0],
+            EmbeddingIdentityBundleV1::explicit_test_model("quality-foreign", 2),
+        )
+        .unwrap();
+        for limit in [0, 1] {
+            assert!(matches!(
+                index.search_quality_classified_with_producer_controlled(
+                    &wrong, limit, None, NoRowWork,
+                ),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "search_activation.quality.producer_revision"
+            ));
+        }
+        let cx = Cx::for_testing();
+        for values in [vec![1.0, 0.0], vec![0.0, 0.0]] {
+            let zero_query = values.iter().all(|&value| value == 0.0);
+            let query = BoundQueryEmbedding::new(values, identity.clone()).unwrap();
+            for limit in [0, 1] {
+                cx.set_cancel_requested(false);
+                assert_eq!(
+                    index
+                        .search_quality_with_producer(&cx, &query, limit)
+                        .unwrap()
+                        .len(),
+                    usize::from(limit != 0 && !zero_query)
+                );
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    index.search_quality_with_producer(&cx, &query, limit),
+                    Err(SearchError::Cancelled { .. })
+                ));
+            }
+        }
     }
 
     #[test]

@@ -415,7 +415,7 @@ impl VectorIndex {
 
     fn owner_search_census(
         &self,
-        cx: &Cx,
+        cancel: impl ScanCancellation,
         native_ann: bool,
     ) -> SearchResult<(bool, ZeroSignalReason)> {
         let mut reason = if self.record_count() == 0 {
@@ -424,7 +424,7 @@ impl VectorIndex {
             ZeroSignalReason::AllTombstoned
         };
         for row in 0..self.record_count() {
-            cx.checkpoint_at(row)?;
+            cancel.checkpoint_at(row)?;
             if !self.is_deleted(row) {
                 reason = ZeroSignalReason::NoUsableVectors;
                 if self.is_vector_usable(row) {
@@ -498,13 +498,13 @@ impl VectorIndex {
     /// never returns a partial candidate batch.
     pub(crate) fn search_top_k_classified_cancellable(
         &self,
-        cx: &Cx,
+        cancel: impl ScanCancellation,
         query: &[f32],
         limit: usize,
         filter: Option<&dyn SearchFilter>,
         params: SearchParams,
     ) -> SearchResult<ClassifiedHits> {
-        ScanCancellation::checkpoint(cx)?;
+        cancel.checkpoint()?;
         self.ensure_query_dimension(query)?;
         if let Some(reason) = query_zero_signal(query, limit)? {
             return Ok(ClassifiedHits::empty(reason));
@@ -513,26 +513,32 @@ impl VectorIndex {
             limit,
             self.record_count().saturating_add(self.wal_entries.len()),
             |candidate_limit| {
-                self.search_top_k_controlled::<false>(query, candidate_limit, filter, params, cx)
+                self.search_top_k_controlled::<false>(
+                    query,
+                    candidate_limit,
+                    filter,
+                    params,
+                    cancel,
+                )
             },
             |hit| self.classified_hit_is_usable(hit),
-            || self.classified_search_census_cancellable(cx, filter.is_some()),
-            cx,
+            || self.classified_search_census_cancellable(cancel, filter.is_some()),
+            cancel,
         );
-        ScanCancellation::checkpoint(cx)?;
+        cancel.checkpoint()?;
         let mut classified = result?;
         classified.hits = deduplicate_ranked_hits(classified.hits);
-        ScanCancellation::checkpoint(cx)?;
+        cancel.checkpoint()?;
         Ok(classified)
     }
 
     fn classified_search_census_cancellable(
         &self,
-        cx: &Cx,
+        cancel: impl ScanCancellation,
         had_filter: bool,
     ) -> SearchResult<(bool, ZeroSignalReason)> {
         if self.wal_entries.is_empty() {
-            let (usable, reason) = self.owner_search_census(cx, false)?;
+            let (usable, reason) = self.owner_search_census(cancel, false)?;
             return Ok((
                 usable,
                 if usable && had_filter {
@@ -545,18 +551,18 @@ impl VectorIndex {
         let mut replaced = AHashSet::with_capacity(self.wal_entries.len());
         let mut usable_wal = false;
         for (offset, entry) in self.wal_entries.iter().enumerate() {
-            cx.checkpoint_at(offset)?;
+            cancel.checkpoint_at(offset)?;
             replaced.insert(entry.doc_id.as_str());
             usable_wal = usable_wal || crate::vector_signal_usable(&entry.embedding);
             if usable_wal && had_filter {
-                ScanCancellation::checkpoint(cx)?;
+                cancel.checkpoint()?;
                 return Ok((true, ZeroSignalReason::FilterEliminatedAll));
             }
         }
         let mut has_usable = usable_wal;
         let mut all_main_shadowed = true;
         for row in 0..self.record_count() {
-            cx.checkpoint_at(row)?;
+            cancel.checkpoint_at(row)?;
             if self.is_deleted(row) {
                 continue;
             }
@@ -569,7 +575,7 @@ impl VectorIndex {
                 Err(_) => all_main_shadowed = false,
             }
             if has_usable && !all_main_shadowed {
-                ScanCancellation::checkpoint(cx)?;
+                cancel.checkpoint()?;
                 return Ok((
                     true,
                     if had_filter {
@@ -580,7 +586,7 @@ impl VectorIndex {
                 ));
             }
         }
-        ScanCancellation::checkpoint(cx)?;
+        cancel.checkpoint()?;
         let reason = if has_usable && had_filter {
             ZeroSignalReason::FilterEliminatedAll
         } else if usable_wal && all_main_shadowed {
