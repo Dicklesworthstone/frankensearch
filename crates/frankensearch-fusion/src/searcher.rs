@@ -1602,17 +1602,21 @@ impl TwoTierSearcher {
     ) -> SearchResult<TwoTierMetrics> {
         cancellation_checkpoint(cx, "search_admission")?;
         let mut metrics = TwoTierMetrics::default();
+        let parse_query = || -> SearchResult<_> {
+            let canonical = self.canonicalizer.canonicalize_query(query);
+            cancellation_checkpoint(cx, "query_shape_admission")?;
+            let parsed = ParsedQuery::parse(&canonical);
+            Ok((canonical, parsed))
+        };
 
         // Determine whether a nonempty quality request is actually lexical
         // browsing before admitting an unrelated semantic producer. Retain the
         // canonicalized text and parse so a custom canonicalizer runs exactly
         // once. Empty requests and k=0 keep their strict topology admission.
         let preparsed_quality_query =
-            (mode == SearchExecutionMode::QualityOnly && k > 0 && !query.is_empty()).then(|| {
-                let canonical = self.canonicalizer.canonicalize_query(query);
-                let parsed = ParsedQuery::parse(&canonical);
-                (canonical, parsed)
-            });
+            (mode == SearchExecutionMode::QualityOnly && k > 0 && !query.is_empty())
+                .then(parse_query)
+                .transpose()?;
         let quality_lexical_complement = preparsed_quality_query
             .as_ref()
             .is_some_and(|(_, parsed)| parsed.is_positive_empty() && parsed.has_negations());
@@ -1626,7 +1630,7 @@ impl TwoTierSearcher {
             };
 
         // Empty progressive requests keep the same producer admission as real
-        // retrieval, without invoking the canonicalizer or either embedder.
+        // retrieval without canonicalization or inference.
         if mode == SearchExecutionMode::Progressive && (k == 0 || query.is_empty()) {
             let admission = self.admit_semantic_query(cx, self.should_run_quality());
             cancellation_checkpoint(cx, "query_identity_admission")?;
@@ -1650,13 +1654,8 @@ impl TwoTierSearcher {
         }
 
         // Reuse quality-only preflight without running text transforms twice.
-        let (canon_query, parsed_query) = preparsed_quality_query.unwrap_or_else(|| {
-            let canonical = self.canonicalizer.canonicalize_query(query);
-            let parsed = ParsedQuery::parse(&canonical);
-            (canonical, parsed)
-        });
+        let (canon_query, parsed_query) = preparsed_quality_query.map_or_else(parse_query, Ok)?;
         let lexical_complement = parsed_query.is_positive_empty() && parsed_query.has_negations();
-        cancellation_checkpoint(cx, "query_shape_admission")?;
         let quality_enabled = mode == SearchExecutionMode::Progressive
             && !lexical_complement
             && self.should_run_quality();
@@ -13627,6 +13626,42 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn quality_complement_cancellation_from_canonicalizer_precedes_mmr_validation() {
+        struct CancellingCanonicalizer(Cx);
+
+        impl Canonicalizer for CancellingCanonicalizer {
+            fn canonicalize(&self, text: &str) -> String {
+                text.to_owned()
+            }
+
+            fn canonicalize_query(&self, query: &str) -> String {
+                self.0.set_cancel_requested(true);
+                query.to_owned()
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = query_admission_index("exact-v2");
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(query_admission_embedder("fast")),
+                TwoTierConfig::default(),
+            )
+            .with_canonicalizer(Box::new(CancellingCanonicalizer(cx.clone())))
+            .with_mmr_config(MmrConfig {
+                enabled: true,
+                candidate_pool: 1_001,
+                ..MmrConfig::default()
+            });
+            let error = searcher
+                .search_quality_only(&cx, "-omitted", 3, |_| None, |_| {})
+                .await
+                .expect_err("cancellation during query shaping must take precedence");
+            assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
+        });
     }
 
     #[test]
