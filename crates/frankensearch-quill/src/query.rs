@@ -908,6 +908,10 @@ impl fmt::Display for QueryExplanation {
 /// Classify a raw query exactly as the shipping explanation surface does.
 #[must_use]
 pub fn classify_query(query: &str) -> QueryExplanation {
+    classify_admitted_query(truncated_prefix(query).0)
+}
+
+fn classify_admitted_query(query: &str) -> QueryExplanation {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return QueryExplanation::Empty;
@@ -917,7 +921,7 @@ pub fn classify_query(query: &str) -> QueryExplanation {
     {
         return QueryExplanation::Phrase;
     }
-    if trimmed.split_whitespace().count() <= 1 {
+    if trimmed.split_whitespace().nth(1).is_none() {
         QueryExplanation::Simple
     } else {
         QueryExplanation::Boolean
@@ -1395,7 +1399,7 @@ impl DefaultQueryParser {
             );
         }
 
-        let explanation = classify_query(query);
+        let explanation = classify_admitted_query(query);
         let mut tokens = lex(query, &mut diagnostics);
         peel_redundant_outer_groups(&mut tokens);
         let mut grammar = Grammar {
@@ -5324,7 +5328,7 @@ impl CassQueryParser {
             observe_tokens(&[]);
             return ParsedQuery {
                 query: Query::empty(),
-                explanation: classify_query(admitted_query),
+                explanation: classify_admitted_query(admitted_query),
                 diagnostics,
                 was_truncated,
             };
@@ -5367,7 +5371,7 @@ impl CassQueryParser {
                         );
                         return ParsedQuery {
                             query: Query::empty(),
-                            explanation: classify_query(admitted_query),
+                            explanation: classify_admitted_query(admitted_query),
                             diagnostics,
                             was_truncated,
                         };
@@ -5416,7 +5420,7 @@ impl CassQueryParser {
         }
         ParsedQuery {
             query,
-            explanation: classify_query(admitted_query),
+            explanation: classify_admitted_query(admitted_query),
             diagnostics: grammar.diagnostics,
             was_truncated,
         }
@@ -9080,6 +9084,21 @@ mod tests {
             truncate_query(&byte_long_but_char_short),
             byte_long_but_char_short
         );
+    }
+
+    #[test]
+    fn raw_explanations_classify_only_the_searchable_prefix() {
+        let whitespace = " ".repeat(MAX_QUERY_LENGTH);
+        let multibyte = "é".repeat(MAX_QUERY_LENGTH);
+        for (query, expected) in [
+            (format!("{whitespace}unsearchable"), QueryExplanation::Empty),
+            (format!("{multibyte} extra"), QueryExplanation::Simple),
+        ] {
+            let parsed = parser().parse(&query);
+            assert!(parsed.was_truncated);
+            assert_eq!(classify_query(&query), expected);
+            assert_eq!(parsed.explanation, expected);
+        }
     }
 
     #[test]

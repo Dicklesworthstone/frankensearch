@@ -16269,21 +16269,10 @@ impl SnippetTailWorkShape {
                     prefix,
                     ..
                 } if fields.iter().any(|field| field.field_id == content_field) => {
-                    if *prefix && !terms.is_empty() {
-                        self.add_term_count(terms.len().saturating_sub(1));
-                        self.add_wildcard_glob(expansion_limit);
-                    } else {
-                        self.add_term_count(terms.len());
-                    }
+                    self.add_term_count(snippet_phrase_terms(terms, *prefix).len());
                 }
                 QueryNode::Boolean { clauses, .. } => {
-                    pending.extend(
-                        clauses
-                            .iter()
-                            .rev()
-                            .filter(|clause| clause.occur != Occur::MustNot)
-                            .map(|clause| clause.query),
-                    );
+                    pending.extend(clauses.iter().rev().map(|clause| clause.query));
                 }
                 QueryNode::Set { field_id, values } if *field_id == content_field => {
                     self.add_term_count(
@@ -19796,6 +19785,15 @@ fn compiled_snippet_terms(
         .collect()
 }
 
+/// Tantivy's `PhrasePrefixQuery` visits its fixed terms for highlighting.
+/// The final prefix is a ranking constraint and has no snippet term.
+fn snippet_phrase_terms(
+    terms: &[crate::query::PositionedTerm],
+    prefix: bool,
+) -> &[crate::query::PositionedTerm] {
+    &terms[..terms.len().saturating_sub(usize::from(prefix))]
+}
+
 fn collect_snippet_term_bytes(
     checkpoint: &QueryCheckpointHandle<'_>,
     query: &Query,
@@ -19826,31 +19824,16 @@ fn collect_snippet_term_bytes(
                 prefix,
                 ..
             } if fields.iter().any(|field| field.field_id == content_field) => {
-                let prefix_index = (*prefix).then_some(phrase_terms.len().saturating_sub(1));
-                for (index, term) in phrase_terms.iter().enumerate() {
-                    if prefix_index == Some(index) {
-                        let pattern = format!("{}*", term.text);
-                        terms.extend(snapshot_glob_terms(
-                            Some(checkpoint),
-                            snapshot,
-                            schema,
-                            content_field,
-                            pattern.as_bytes(),
-                            expansion_limit,
-                        )?);
-                    } else {
-                        terms.insert(term.text.as_bytes().to_vec());
-                    }
-                }
+                terms.extend(
+                    snippet_phrase_terms(phrase_terms, *prefix)
+                        .iter()
+                        .map(|term| term.text.as_bytes().to_vec()),
+                );
             }
             QueryNode::Boolean { clauses, .. } => {
-                pending.extend(
-                    clauses
-                        .iter()
-                        .rev()
-                        .filter(|clause| clause.occur != Occur::MustNot)
-                        .map(|clause| clause.query),
-                );
+                // BooleanQuery::query_terms visits every child. For example,
+                // a hit can contain one term of an excluded conjunction.
+                pending.extend(clauses.iter().rev().map(|clause| clause.query));
             }
             QueryNode::Set { field_id, values } if *field_id == content_field => {
                 terms.extend(values.iter().filter_map(|value| match value {
@@ -26311,6 +26294,72 @@ mod tests {
                 "{:?}",
                 extra[2]
             );
+        });
+    }
+
+    #[test]
+    fn public_snippets_follow_phrase_prefix_and_boolean_query_terms() {
+        run_with_cx(|cx| async move {
+            let documents = [IndexableDocument::new("target", "bright starship starlight")];
+            let index = QuillIndex::in_memory(QuillConfig {
+                // Matching this phrase has two possible suffixes. Snippet
+                // generation must not turn it into an independent glob query.
+                glob_expansion_limit: 1,
+                ..deterministic_config()
+            })
+            .unwrap();
+            index.index_documents_visible(&cx, &documents).await.unwrap();
+            #[cfg(feature = "tantivy-oracle")]
+            let oracle = {
+                let oracle = frankensearch_lexical::TantivyIndex::in_memory().unwrap();
+                oracle.index_documents(&cx, &documents).await.unwrap();
+                oracle.commit(&cx).await.unwrap();
+                oracle
+            };
+
+            let config = crate::SnippetConfig::default();
+            for sealed in [false, true] {
+                if sealed {
+                    index.commit(&cx).await.unwrap();
+                }
+                for (query, expected) in [
+                    (
+                        r#"content:"bright sta"*"#,
+                        "<b>bright</b> starship starlight",
+                    ),
+                    (
+                        "+content:bright -(content:starship AND content:missing)",
+                        "<b>bright</b> <b>starship</b> starlight",
+                    ),
+                ] {
+                    let ranked = index.search_with_snippets(&cx, query, 1, &config).unwrap();
+                    assert_eq!(ranked.len(), 1, "{query}");
+                    assert_eq!(ranked[0].document_id, "target");
+                    assert_eq!(ranked[0].snippet.as_deref(), Some(expected), "{query}");
+                    let selected = index
+                        .snippets_for_documents(&cx, query, &["target"], &config, usize::MAX)
+                        .unwrap();
+                    assert_eq!(
+                        selected.as_slice(),
+                        std::slice::from_ref(&ranked[0].snippet)
+                    );
+
+                    #[cfg(feature = "tantivy-oracle")]
+                    {
+                        let hits = oracle
+                            .search_with_snippets(
+                                &cx,
+                                query,
+                                1,
+                                &frankensearch_lexical::SnippetConfig::default(),
+                            )
+                            .unwrap();
+                        assert_eq!(hits.len(), 1, "{query}");
+                        assert_eq!(hits[0].doc_id, ranked[0].document_id);
+                        assert_eq!(hits[0].snippet, ranked[0].snippet, "{query}");
+                    }
+                }
+            }
         });
     }
 
