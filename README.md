@@ -42,18 +42,19 @@ path builds the loader-capable default from source; it never silently installs
 the model-free lite profile. Use `--lite` only when that reduced capability is
 intentional: lite indexes, watches and searches by keyword only (its index
 has no vector tiers, so a running `fsfs watch` does not block searches from
-other processes). Intel macOS is the explicit exception:
-the pinned ONNX Runtime has no supported x86_64 Darwin distribution, so
-ordinary semantic installation fails with `unsupported_platform` and points to
-`--lite` instead of attempting a source build that cannot succeed.
+other processes). On Intel macOS the standard profile reports
+`unsupported_platform` because the pinned ONNX Runtime has no x86_64 Darwin
+distribution. Use `bash install.sh --native` to build the ONNX-free semantic
+profile from the release source and check its two model loaders on the host.
 
 The Linux x86-64 full archive requires glibc 2.39 or newer (Ubuntu 24.04 and
 later) from fsfs 1.12.2, which is built inside Ubuntu 24.04 by
 `scripts/build_fsfs_gnu_full_release.sh`; 1.10.0 through 1.12.1 required 2.43.
-A source build works from glibc 2.38, the floor of the bundled ONNX Runtime
-archive; older systems have no semantic build yet and the installer points
-them to `--lite`
-([#62](https://github.com/Dicklesworthstone/frankensearch/issues/62)). The standard installer
+A standard source build requires glibc 2.38 for the bundled ONNX Runtime.
+On older Linux distributions, `bash install.sh --native` builds with the
+host toolchain and checks the staged executable before replacing the installed
+binary. The native route requires a working Rust nightly toolchain and network
+access for the release source and dependencies. The standard installer
 provisions and verifies the two default search models, Potion and MiniLM,
 requiring roughly 621 MB. Install optional models separately with
 `fsfs download-models MODEL`. Offline installation requires the default pair
@@ -136,8 +137,10 @@ The two downloads use revision-pinned manifests and verify every file before
 atomic promotion. Explicit `--verify` is fail-closed: a missing or corrupt
 registered cache returns a typed nonzero error rather than a successful payload.
 `fsfs status` reports manifest states (`missing`, `incomplete`, `mismatch`, or
-`verified`); only `fsfs doctor` also opens each verified cache through the
-compiled Model2Vec/FastEmbed loader. A hard doctor verdict exits nonzero with
+`verified`). Use `fsfs download-models MODEL --verify-loader --offline` with an
+exact registered embedding model ID to verify its bytes and open it with this
+executable. A successful probe reports `loadable`. To also check the configured
+models against the index generation, use `fsfs doctor`. A hard doctor verdict exits nonzero with
 one stable `subsystem_error` report with the failing checks in its context. If the cache is absent or offline mode
 forbids acquisition, indexing fails with an actionable typed error; it never
 substitutes hash control embeddings for semantic results. Building with
@@ -173,7 +176,10 @@ or invalid native quality model leaves a new index fast-only; an existing
 native quality generation rejects incompatible models and preserves Initial
 results when refinement fails. The standard build's default quality model remains ONNX.
 
-For an ONNX-free source build, use the explicit native profile:
+Install the ONNX-free build with `bash install.sh --native`. The installer
+provisions Potion and native English F32 MiniLM and opens both loaders before
+publishing the executable. For v1.13.0, the installer uses Python 3 to read
+the staged binary's `doctor` report. To build manually from a checkout, run:
 
 ```bash
 cargo build --release -p frankensearch-fsfs --locked --no-default-features --features semantic-native

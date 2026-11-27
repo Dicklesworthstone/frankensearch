@@ -21,6 +21,7 @@ fsfs download-models potion-multilingual-128m
 fsfs download-models all-minilm-l6-v2
 fsfs download-models potion-multilingual-128m --verify
 fsfs download-models all-minilm-l6-v2 --verify
+fsfs download-models all-minilm-l6-v2 --verify-loader --offline
 fsfs status --format json
 fsfs doctor --format json
 ```
@@ -29,7 +30,9 @@ Downloads are revision-pinned, SHA-verified, and atomically promoted. Explicit
 verification refreshes the durable receipt and returns a typed nonzero error for
 a missing, incomplete, or corrupt registered cache. Status is observational: it
 may full-hash an uncached installation for that invocation but never mints a
-receipt. Doctor additionally
+receipt. Use `--verify-loader` with an exact embedding model ID to verify all
+manifest files and open that model with the current executable. Success reports
+`loadable` and works without an index. Doctor additionally
 opens verified caches through the compiled loaders, so a directory that merely
 exists is never reported as semantic-ready. A hard doctor verdict emits one
 `subsystem_error` report with the failing checks in its context and exits nonzero, while warning-only diagnostics remain
@@ -50,11 +53,11 @@ The installer verifies every downloaded release archive and fails closed if a
 checksum, checksum tool, or matching manifest entry is unavailable. When a full
 artifact is unavailable, ordinary installation builds the loader-capable default
 from source; it never silently substitutes lite. Only `install.sh --lite`
-selects the model-free source profile. Intel macOS currently has no supported
-FastEmbed/ONNX Runtime distribution: ordinary semantic installation returns the
-typed `unsupported_platform` outcome, while an explicit `--lite` installation
-remains available. The installer never pretends the unbuildable default source
-route succeeded on that target.
+selects the model-free profile. Use `bash install.sh --native` for an ONNX-free
+semantic source build, including on Intel macOS or Linux hosts where the
+packaged ONNX Runtime cannot load. The installer provisions Potion and native
+English F32 MiniLM and checks both loaders before publishing the binary.
+Rebuild any existing ONNX quality index with the native producer.
 
 Full release binaries explicitly select `embedded-models`. From the workspace
 root, provision and verify the exact, pinned source files before building that

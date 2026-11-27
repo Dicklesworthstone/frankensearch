@@ -19,6 +19,7 @@
 #   --offline          Never touch the network; requires --version and a local
 #                      --artifact-url plus --checksum
 #   --from-source      Build from source instead of downloading binary
+#   --native           Build ONNX-free semantic search from source.
 #   --lite             Install the model-free profile (~15MB). Prefers the
 #                      prebuilt fsfs-lite-* artifact; source-builds only as a
 #                      fallback (or when combined with --from-source).
@@ -50,6 +51,7 @@ EASY=0
 QUIET=0
 VERIFY=0
 FROM_SOURCE=0
+NATIVE=0
 LITE=0
 FORCE=0
 OFFLINE=0
@@ -376,7 +378,7 @@ fail_unsupported_semantic_platform() {
   local target="$1"
   err "unsupported_platform: the ordinary semantic fsfs profile is not available for ${target}"
   err "The pinned ONNX Runtime distribution has no Intel macOS binary, so a default source fallback would fail."
-  err "Use install.sh --lite for an explicit model-free build, or install the semantic profile on Apple Silicon or Linux."
+  err "Use install.sh --native to build native semantic search, or install.sh --lite for an explicit model-free build."
   return 78
 }
 
@@ -566,8 +568,63 @@ install_binary() (
   install_fs_command mv -f -- "$staged_binary" "$destination_binary"
 )
 
+# Earlier semantic-native releases expose real loader admission through doctor.
+# Use a fresh index so the caller's existing generation cannot affect the probe.
+verify_native_doctor() {
+  local binary="$1" directory="$2" receipt="$3" model_root
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "Python 3 is required to check loader results from this older fsfs release."
+    return 1
+  fi
+  # Keep the exact cache used by download-models, including a model_dir set in
+  # user/project config. The installer's probe selects the native pair explicitly.
+  model_root=$(python3 - "$receipt" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as report:
+    envelope = json.load(report)
+if envelope.get("ok") is not True or envelope.get("error") is not None:
+    sys.exit("model verification returned an error")
+data = envelope["data"]
+models = data["models"]
+if (len(models) != 1 or models[0]["id"] != "all-minilm-l6-v2-native"
+        or models[0]["verified"] is not True or not isinstance(data["model_root"], str)
+        or not data["model_root"]):
+    sys.exit("native quality model verification did not identify its cache")
+print(data["model_root"])
+PY
+  ) || return 1
+  mkdir "$directory" || return 1
+  cat >"$directory.toml" <<'TOML'
+[indexing]
+fast_model = "potion-multilingual-128m"
+quality_model = "all-minilm-l6-v2-native"
+TOML
+  FRANKENSEARCH_MODEL_DIR="$model_root" "$binary" doctor --offline --format json \
+    --index-dir "$directory" --config "$directory.toml" --no-fast-only >"$directory.json" || return 1
+  python3 - "$directory.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as report:
+    envelope = json.load(report)
+if envelope.get("ok") is not True or envelope.get("error") is not None:
+    sys.exit("fsfs doctor returned an error")
+data = envelope["data"]
+if data["overall"] not in ("pass", "warn"):
+    sys.exit("fsfs doctor reported a failed inspection")
+for tier, model in (("fast", "potion-multilingual-128m"), ("quality", "all-minilm-l6-v2-native")):
+    checks = [check for check in data["checks"] if check["name"] == "model." + tier]
+    if len(checks) != 1 or checks[0]["verdict"] != "pass" or not checks[0]["detail"].lower().startswith(
+        model + " is manifest-verified and loadable at "
+    ):
+        sys.exit("fsfs doctor did not load " + model)
+PY
+}
+
 provision_default_semantic_models() {
-  local staged_binary="$1" model_id
+  local staged_binary="$1" model_id quality_model=all-minilm-l6-v2 help_output verify_loader=0
   local -a verify_flags=(--verify)
 
   if [ "$OFFLINE" -eq 1 ]; then
@@ -577,22 +634,42 @@ provision_default_semantic_models() {
     info "Provisioning the default search model artifacts..."
   fi
 
+  if help_output=$("$staged_binary" help 2>/dev/null) && [[ "$help_output" == *"--verify-loader"* ]]; then
+    verify_loader=1
+    verify_flags=(--verify-loader --offline)
+  fi
   # Select the shipped default search pair explicitly. Older fsfs releases
   # interpret a bare download-models command as the entire optional catalog.
-  for model_id in potion-multilingual-128m all-minilm-l6-v2; do
+  if [ "$NATIVE" -eq 1 ]; then quality_model=all-minilm-l6-v2-native; fi
+  for model_id in potion-multilingual-128m "$quality_model"; do
     if [ "$OFFLINE" -eq 0 ]; then
       if ! "$staged_binary" download-models "$model_id"; then
         err "Semantic model provisioning failed for $model_id. The existing fsfs installation was not replaced."
         return 1
       fi
     fi
-    if ! "$staged_binary" download-models "$model_id" "${verify_flags[@]}"; then
+    if [ "$NATIVE" -eq 1 ] && [ "$verify_loader" -eq 0 ] && [ "$model_id" = "$quality_model" ]; then
+      if ! "$staged_binary" download-models "$model_id" --verify --format json >"$TMP/native-model.json"; then
+        err "Semantic model verification failed for $model_id. The existing fsfs installation was not replaced."
+        return 1
+      fi
+    elif ! "$staged_binary" download-models "$model_id" "${verify_flags[@]}"; then
       err "Semantic model verification failed for $model_id. The existing fsfs installation was not replaced."
       return 1
     fi
   done
 
-  ok "Default search model artifacts are present and verified."
+  if [ "$verify_loader" -eq 1 ]; then
+    ok "Fast and quality models loaded successfully."
+  elif [ "$NATIVE" -eq 1 ]; then
+    if ! verify_native_doctor "$staged_binary" "$TMP/native-doctor" "$TMP/native-model.json"; then
+      err "Native semantic doctor could not verify both model loaders. The existing fsfs installation was not replaced."
+      return 1
+    fi
+    ok "Native fast and quality models loaded successfully."
+  else
+    ok "Default search model artifacts are present and verified."
+  fi
 }
 
 # Highest glibc symbol version a dynamic-loader failure names, e.g. "2.43" from
@@ -626,7 +703,7 @@ verify_staged_binary() {
     if [ -n "$host_glibc" ] && [ "$(printf '%s\n2.38\n' "$host_glibc" | sort -t. -k1,1n -k2,2n | head -n 1)" = "2.38" ]; then
       err "  Build it from source on this host instead (about 20 minutes): install.sh --from-source"
     else
-      err "  A source build cannot help either: the bundled ONNX Runtime needs glibc 2.38 or newer (GH #62)."
+      err "  The default source build also requires glibc 2.38. Build the ONNX-free semantic profile with install.sh --native."
     fi
     # Lite is static MUSL and needs no glibc; it searches by keyword only.
     if [ "$LITE" -eq 0 ]; then
@@ -642,7 +719,7 @@ usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] \\
-                  [--force] [--offline] [--from-source] [--lite] [--quiet] [--no-gum]
+                  [--force] [--offline] [--from-source] [--native | --lite] [--quiet] [--no-gum]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -659,6 +736,8 @@ Options:
                      --artifact-url and --checksum; full installs also require
                      the verified default models in the local cache
   --from-source      Build from source instead of downloading binary
+  --native           Build ONNX-free semantic search from source with Potion and
+                     native English MiniLM (including Intel macOS and older Linux).
   --lite             Install the model-free profile (~15MB). Prefers the
                      prebuilt fsfs-lite-* release artifact and only builds from
                      source as a fallback (or with --from-source). The Cargo
@@ -684,6 +763,7 @@ parse_args() {
       --force) FORCE=1; shift;;
       --offline) OFFLINE=1; shift;;
       --from-source) FROM_SOURCE=1; shift;;
+      --native) NATIVE=1; FROM_SOURCE=1; shift;;
       # --lite selects the model-free profile. It no longer implies --from-source:
       # the prebuilt fsfs-lite-* artifact is published every release, so --lite
       # downloads and verifies it (seconds) and only source-builds when that
@@ -699,6 +779,11 @@ parse_args() {
         ;;
     esac
   done
+  if [ "$NATIVE" -eq 1 ] && { [ "$LITE" -eq 1 ] || [ -n "$ARTIFACT_URL$CHECKSUM$CHECKSUM_URL" ]; }; then
+    err "--native builds a semantic profile from source and conflicts with --lite and release archive/checksum options."
+    return 2
+  fi
+  return 0
 }
 
 run_installer_contract_test() {
@@ -965,7 +1050,7 @@ case "${OS}-${ARCH}" in
   *) :;;
 esac
 
-if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
+if [ "$LITE" -eq 0 ] && [ "$NATIVE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
   fail_unsupported_semantic_platform "$TARGET"
   exit $?
 fi
@@ -983,7 +1068,7 @@ check_offline_preconditions "$OFFLINE" "$VERSION" "$FROM_SOURCE" "$ARTIFACT_URL"
 
 # Version lookup may use the network. Unsupported ordinary profiles are
 # rejected above before any release lookup, artifact probe, or filesystem
-# installation mutation. Intel macOS remains available only through --lite.
+# installation mutation. Explicit --native and --lite builds can proceed on Intel macOS.
 resolve_version
 
 # Remaining preflight. Every check below is observational, so a rejection here
@@ -1242,6 +1327,9 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   if [ "$LITE" -eq 1 ]; then
     info "Building lite variant (semantic model loaders disabled)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs --no-default-features)
+  elif [ "$NATIVE" -eq 1 ]; then
+    info "Building native semantic loaders (Potion and native MiniLM)"
+    (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs --no-default-features --features semantic-native)
   else
     info "Building default semantic-loader variant (model bytes acquired separately)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs)
@@ -1285,6 +1373,8 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   if [ "$LITE" -eq 1 ]; then
     info "Model-free build: Model2Vec and FastEmbed execution are not compiled."
     info "Install the standard build for semantic retrieval; downloaded files alone cannot activate this lite binary."
+  elif [ "$NATIVE" -eq 1 ]; then
+    info "Native semantic search installed. Run fsfs index /path/to/files, then fsfs search \"your query\"."
   else
     info "Semantic loaders installed. Provision and verify the registered models with:"
     info "  ${BINARY_NAME} download-models potion-multilingual-128m"

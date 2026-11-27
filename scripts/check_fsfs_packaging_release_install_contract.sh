@@ -227,6 +227,10 @@ check_e2e() {
 }
 
 check_installer_behavior() {
+  if ! bash "$ROOT_DIR/tests/installer/native_semantic_source.sh"; then
+    echo "[installer][FAIL] native semantic source route"
+    FAILURES=$((FAILURES + 1))
+  fi
   local installer="$ROOT_DIR/install.sh"
   local archive="$ROOT_DIR/README.md"
   local expected=""
@@ -1263,7 +1267,7 @@ GLIBC_STUB
     --artifact-url "$glibc_archive" --checksum "$glibc_digest" --dest "$dest" 2>&1) || status=$?
   if [[ "$status" -ne 0 && "$output" == *"install.verify.glibc_too_old"* \
     && "$output" == *"needs glibc 2.99"* \
-    && ( "$output" == *"install.sh --from-source"* || "$output" == *"source build cannot help"* ) \
+    && ( "$output" == *"install.sh --from-source"* || "$output" == *"install.sh --native"* ) \
     && "$output" != *"install.sh --lite"* \
     && "$output" != *"install.verify.version_mismatch"* ]] \
     && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
@@ -1842,9 +1846,9 @@ source_install = 'install_binary "$BIN" "$DEST/${BINARY_NAME}"'
 artifact_start = installer.index('[ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }')
 artifact_section = installer[artifact_start:]
 require(
-    'for model_id in potion-multilingual-128m all-minilm-l6-v2; do' in installer
+    'for model_id in potion-multilingual-128m "$quality_model"; do' in installer
     and '"$staged_binary" download-models "$model_id"' in installer
-    and '"$staged_binary" download-models "$model_id" --verify' in installer,
+    and 'verify_flags=(--verify)' in installer and '"${verify_flags[@]}"' in installer,
     "ordinary source installation must explicitly provision and verify both default search models",
 )
 require(
@@ -1915,7 +1919,7 @@ require(
     "Intel macOS must fail with a typed semantic-install outcome instead of an impossible source fallback",
 )
 unsupported_gate = (
-    'if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then\n'
+    'if [ "$LITE" -eq 0 ] && [ "$NATIVE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then\n'
     '  fail_unsupported_semantic_platform "$TARGET"'
 )
 require(
