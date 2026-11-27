@@ -362,13 +362,14 @@ fn terminal_lexical_candidate_error(error: &SearchError) -> bool {
         )
 }
 
-/// Compare a v1 producer fingerprint without manufacturing an admitted owner.
-/// Empty, identity-less indexes retain their explicit legacy/control behavior;
-/// an identified semantic model needs an index built with its whole identity.
+/// Check the v1 producer fingerprint and stored width without manufacturing
+/// an admitted owner. A declared semantic producer needs a matching stamp.
+/// Identity-less, unstamped providers retain their legacy behavior.
 fn admit_legacy_tier_embedder(
     embedder: &dyn Embedder,
     identity: Option<&EmbeddingIdentityBundleV1>,
     revision: &str,
+    stored_dimension: usize,
     tier: &str,
 ) -> SearchResult<()> {
     let identity = match identity {
@@ -383,10 +384,9 @@ fn admit_legacy_tier_embedder(
         }
     };
     identity.validate()?;
-    if revision.is_empty() && identity.space.kind == EmbeddingSpaceKindV1::HashControl {
-        return Ok(());
-    }
-    if revision != identity.fingerprint() {
+    let requires_stamp =
+        !revision.is_empty() || identity.space.kind == EmbeddingSpaceKindV1::Semantic;
+    if requires_stamp && revision != identity.fingerprint() {
         return Err(SearchError::InvalidConfig {
             field: format!("search_activation.{tier}.producer_revision"),
             value: revision.to_owned(),
@@ -394,6 +394,14 @@ fn admit_legacy_tier_embedder(
                 "the stored {tier} vectors do not bind this embedder's complete producer \
                  identity; rebuild the index with this embedder before searching"
             ),
+        });
+    }
+    // capture_query_identity already checked that the width fits in usize.
+    let found = identity.space.dimension as usize;
+    if stored_dimension != found {
+        return Err(SearchError::DimensionMismatch {
+            expected: stored_dimension,
+            found,
         });
     }
     Ok(())
@@ -1193,6 +1201,8 @@ impl TwoTierSearcher {
     /// producer than the one that wrote the index — including the
     /// certified-compatible case, which is comparison-grade telemetry and
     /// never an admission basis.
+    /// Returns [`SearchError::DimensionMismatch`] when a declared producer's
+    /// width disagrees with the retained v1 tier.
     fn admit_semantic_query(
         &self,
         cx: &Cx,
@@ -1218,6 +1228,7 @@ impl TwoTierSearcher {
                 self.fast_embedder.as_ref(),
                 fast.as_ref(),
                 fast_revision,
+                self.index.fast_dimension(),
                 "fast",
             )?;
         }
@@ -1251,9 +1262,18 @@ impl TwoTierSearcher {
             if let Some(binding) = quality_binding {
                 admit_tier_embedder(embedder, quality.as_ref(), binding, "quality")?;
             } else if fast_binding.is_none()
-                && let Some(revision) = self.index.quality_embedder_revision()
+                && let (Some(revision), Some(dimension)) = (
+                    self.index.quality_embedder_revision(),
+                    self.index.quality_dimension(),
+                )
             {
-                admit_legacy_tier_embedder(embedder, quality.as_ref(), revision, "quality")?;
+                admit_legacy_tier_embedder(
+                    embedder,
+                    quality.as_ref(),
+                    revision,
+                    dimension,
+                    "quality",
+                )?;
             }
         }
         let quality_kind = quality.as_ref().map(|bundle| bundle.space.kind);
@@ -1309,13 +1329,13 @@ impl TwoTierSearcher {
                     model: "quality".to_owned(),
                     reason: "quality-only retrieval requires a quality embedder".to_owned(),
                 })?;
-        if !self.index.has_quality_index() {
+        let Some(dimension) = self.index.quality_dimension() else {
             return Err(SearchError::InvalidConfig {
                 field: "search_activation.quality".to_owned(),
                 value: "absent".to_owned(),
                 reason: "quality-only retrieval requires a quality index".to_owned(),
             });
-        }
+        };
         let identity = capture_query_identity(cx, embedder, "quality")?.ok_or_else(|| {
             SearchError::InvalidConfig {
                 field: "search_activation.quality.embedder_identity".to_owned(),
@@ -1338,7 +1358,7 @@ impl TwoTierSearcher {
                         .to_owned(),
                 });
             }
-            admit_legacy_tier_embedder(embedder, Some(&identity), revision, "quality")?;
+            admit_legacy_tier_embedder(embedder, Some(&identity), revision, dimension, "quality")?;
             SemanticAdmission::LegacyUnidentified
         };
         if identity.space.kind != EmbeddingSpaceKindV1::Semantic {
@@ -1551,8 +1571,8 @@ impl TwoTierSearcher {
     /// hydration and exclusion handling as [`Self::search`]. Queries containing
     /// only exclusions retain the single-phase lexical-complement behavior.
     ///
-    /// Quality identity and request topology are validated even for empty
-    /// queries or `k == 0`, before model, lexical or vector work. Exclusion-only
+    /// Quality identity, vector width and request topology are validated even
+    /// for empty queries or `k == 0`, before model, lexical or vector work. Exclusion-only
     /// browsing with a positive limit has no semantic tier to admit and does
     /// not require a quality model, quality index or compatible vector identity.
     /// Quality inference and retrieval use `quality_timeout_ms`; failure is returned
@@ -1563,7 +1583,8 @@ impl TwoTierSearcher {
     ///
     /// Returns [`SearchError::InvalidConfig`] for `fast_only`, a missing quality
     /// index, nonsemantic or unidentified quality, and producer/response
-    /// identity mismatches. A missing quality embedder returns
+    /// identity mismatches. A conflicting vector width returns
+    /// [`SearchError::DimensionMismatch`]. A missing quality embedder returns
     /// [`SearchError::EmbedderUnavailable`]. Otherwise propagates quality
     /// inference, retrieval, timeout, exclusion and cancellation errors.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
@@ -8223,6 +8244,7 @@ mod tests {
                             matching.as_ref(),
                             Some(&identity),
                             revision,
+                            index.fast_dimension(),
                             "fast",
                         ),
                         Err(SearchError::InvalidConfig { field, .. })
@@ -8317,6 +8339,141 @@ mod tests {
         Arc::new(TwoTierIndex::open(dir, TwoTierConfig::default()).unwrap())
     }
 
+    fn stamped_v1_with_dimensions(
+        fast_dimension: usize,
+        quality_dimension: usize,
+    ) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
+        let dir = owner_backed_dir("stamped-dimension");
+        for (tier, embedder_dimension, dimension, axis) in [
+            ("fast", 4, fast_dimension, 0),
+            ("quality", 6, quality_dimension, 1),
+        ] {
+            let identity =
+                query_admission_identity(&format!("response-{tier}"), embedder_dimension);
+            let path = dir.join(format!("vector.{tier}.idx"));
+            let mut writer = frankensearch_index::VectorIndex::create_with_revision(
+                &path,
+                tier,
+                &identity.fingerprint(),
+                dimension,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap()
+            .with_publication_nonce(19);
+            let mut vector = vec![0.0; dimension];
+            vector[axis] = 1.0;
+            writer.write_record(tier, &vector).unwrap();
+            writer.finish().unwrap();
+        }
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
+        (dir, Arc::new(index))
+    }
+
+    #[test]
+    fn async_stamped_v1_checks_requested_tier_width_before_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut violations = Vec::new();
+            for (fast_width, quality_width, quality_only, expected, found) in
+                [(3, 6, false, 3, 4), (4, 5, false, 5, 6), (4, 5, true, 5, 6)]
+            {
+                let (_dir, index) = stamped_v1_with_dimensions(fast_width, quality_width);
+                let fast = Arc::new(query_admission_embedder("fast"));
+                let quality = Arc::new(query_admission_embedder("quality"));
+                let lexical = Arc::new(RetainedMetadataLexical::default());
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality.clone())
+                    .with_lexical(lexical.clone());
+                for (query, k) in [
+                    ("find relevant documents", 0),
+                    ("", 1),
+                    ("  ", 1),
+                    ("find relevant documents", 1),
+                ] {
+                    let before = (
+                        fast.embed_count(),
+                        quality.embed_count(),
+                        lexical.searches.load(Ordering::Relaxed),
+                    );
+                    let mut phases = 0;
+                    let result = if quality_only {
+                        searcher
+                            .search_quality_only(&cx, query, k, |_| None, |_| phases += 1)
+                            .await
+                    } else {
+                        searcher
+                            .search(&cx, query, k, |_| None, |_| phases += 1)
+                            .await
+                    };
+                    let after = (
+                        fast.embed_count(),
+                        quality.embed_count(),
+                        lexical.searches.load(Ordering::Relaxed),
+                    );
+                    let outcome = result.as_ref().err().map(SearchError::diagnostic_code);
+                    if before != after
+                        || phases != 0
+                        || !matches!(
+                            result,
+                            Err(SearchError::DimensionMismatch { expected: actual, found: query_width })
+                                if actual == expected && query_width == found
+                        )
+                    {
+                        violations.push((
+                            fast_width,
+                            quality_width,
+                            quality_only,
+                            query,
+                            k,
+                            outcome,
+                            before,
+                            after,
+                            phases,
+                        ));
+                    }
+                }
+            }
+            assert!(
+                violations.is_empty(),
+                "unexpected admission outcomes: {violations:#?}"
+            );
+        });
+    }
+
+    #[test]
+    fn async_stamped_v1_ignores_unrequested_tier_width() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_fast_dir, index) = stamped_v1_with_dimensions(4, 5);
+            let fast = Arc::new(query_admission_embedder("fast"));
+            let quality = Arc::new(query_admission_embedder("quality"));
+            let searcher = TwoTierSearcher::new(
+                index,
+                fast.clone(),
+                TwoTierConfig {
+                    fast_only: true,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(quality.clone());
+            let (fast_results, _) = searcher
+                .search_collect(&cx, "find relevant documents", 1)
+                .await
+                .unwrap();
+            assert_eq!(fast_results[0].doc_id, "fast");
+            assert_eq!(fast.embed_count(), 1);
+            assert_eq!(quality.identity_count(), 0);
+
+            let (_quality_dir, index) = stamped_v1_with_dimensions(3, 6);
+            let searcher =
+                quality_only_test_searcher(index, quality.clone(), TwoTierConfig::default());
+            let (quality_results, _) = searcher
+                .search_quality_only_collect(&cx, "find relevant documents", 1)
+                .await
+                .unwrap();
+            assert_eq!(quality_results[0].doc_id, "quality");
+            assert_eq!(quality.embed_count(), 1);
+        });
+    }
+
     #[test]
     fn async_unstamped_tier_refuses_declared_semantic_producer() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -8393,6 +8550,18 @@ mod tests {
             assert_eq!(results[0].source, ScoreSource::HashControl);
             assert_eq!(metrics.semantic_candidates, 0);
             assert!(metrics.hash_control_candidates > 0);
+            assert_eq!(hash.embed_count(), 1);
+
+            let (_dir, index) = build_test_index(3);
+            let searcher = TwoTierSearcher::new(index, hash.clone(), TwoTierConfig::default());
+            let error = searcher.search_collect(&cx, "query", 0).await.unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: 3,
+                    found: 4,
+                }
+            ));
             assert_eq!(hash.embed_count(), 1);
         });
     }
