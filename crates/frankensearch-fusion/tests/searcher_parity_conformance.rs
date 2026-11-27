@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use frankensearch_core::explanation::{ExplainedSource, HitExplanation};
+use frankensearch_core::filter::{DocTypeFilter, MissingMetadataPolicy, SearchFilter};
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::traits::{LexicalRead, SearchFuture};
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
@@ -514,11 +515,12 @@ fn lexical_phase_snapshots(
     hits: Vec<ScoredResult>,
     k: usize,
     weights: (f64, f64),
+    filter: Option<&dyn SearchFilter>,
 ) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(true), config.clone())
         .with_rrf_weights(weights.0, weights.1)
         .with_lexical(Arc::new(StaticLexical { hits: hits.clone() }))
-        .search_iter(&tiered_query(query_vec), k)
+        .search_iter_with_filter(&tiered_query(query_vec), k, filter)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
     let (_index_dir, index) = async_index("lexical-phase-snapshots", true);
@@ -539,10 +541,11 @@ fn lexical_phase_snapshots(
                 .with_rrf_weights(weights.0, weights.1)
                 .with_quality_embedder(quality)
                 .with_lexical(lexical)
-                .search(
+                .search_with_filter(
                     &cx,
                     "how does this parity conformance query retrieve results",
                     k,
+                    filter,
                     |_| None,
                     |phase| slot.push((phase_label(&phase), phase_results(&phase).to_vec())),
                 )
@@ -1126,6 +1129,36 @@ fn explain_mode_preserves_field_parity_in_each_progressive_phase() {
 }
 
 #[test]
+fn strict_filter_rejects_unknown_lexical_and_vector_hits_in_each_phase() {
+    let query = [1.0, 0.0, 0.0, 0.0];
+    let filter = DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+    // doc-c (lexical leader) and doc-b (vector only) both lack metadata.
+    let mut hits = lexical_hits();
+    hits[1].metadata = Some(Arc::new(serde_json::json!({"doc_type": "archived"})));
+    hits[2].metadata = Some(Arc::new(serde_json::json!({"doc_type": "active"})));
+    let (sync, asynchronous) = lexical_phase_snapshots(
+        &query,
+        TwoTierConfig::default(),
+        hits,
+        3,
+        (1.0, 1.0),
+        Some(&filter),
+    );
+    for (api, phases) in [("sync", sync), ("async", asynchronous)] {
+        assert_eq!(
+            phases.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            ["initial", "refined"],
+            "{api}"
+        );
+        for (phase, hits) in phases {
+            assert_eq!(hits.len(), 1, "{api} {phase}");
+            assert_eq!(hits[0].doc_id, "doc-d", "{api} {phase}");
+            assert_eq!(hits[0].metadata.as_deref().unwrap()["doc_type"], "active");
+        }
+    }
+}
+
+#[test]
 fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
     let config = TwoTierConfig {
         candidate_multiplier: 3,
@@ -1134,7 +1167,7 @@ fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
     };
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
     let (sync_phases, async_phases) =
-        lexical_phase_snapshots(&query, config, lexical_hits(), 3, (1.0, 1.0));
+        lexical_phase_snapshots(&query, config, lexical_hits(), 3, (1.0, 1.0), None);
     let sync_labels = sync_phases
         .iter()
         .map(|(label, _)| *label)
@@ -1186,7 +1219,7 @@ fn explanations_preserve_scoring_in_both_fusion_strategies() {
             ..TwoTierConfig::default()
         };
         let (sync, asynchronous) =
-            lexical_phase_snapshots(&query, config, hits.clone(), 5, (2.0, 0.5));
+            lexical_phase_snapshots(&query, config, hits.clone(), 5, (2.0, 0.5), None);
         for (api, phases) in [("sync", sync), ("async", asynchronous)] {
             let (phase, initial) = phases.first().expect("initial results");
             assert_eq!(*phase, "initial");

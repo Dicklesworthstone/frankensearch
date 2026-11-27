@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{DocTypeFilter, MissingMetadataPolicy, SearchFilter};
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
-use frankensearch_core::{ScoreSource, SearchError, SearchPhase, TwoTierConfig};
-use frankensearch_fusion::SyncTwoTierSearcher;
+use frankensearch_core::{
+    ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, TwoTierConfig,
+};
+use frankensearch_fusion::{SyncLexicalSearch, SyncTwoTierSearcher};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams};
 
 /// Bind a hand-built fixture vector to an explicitly synthetic identity.
@@ -234,6 +236,92 @@ fn search_filter_is_applied_to_results() {
         .search_collect_with_filter(&tiered(normalize(vec![1.0, 0.0])), 3, Some(&ExcludeA))
         .expect("filtered search");
     assert!(results.iter().all(|result| result.doc_id != "a"));
+}
+
+#[test]
+fn strict_doc_type_filter_returns_no_vector_hits_without_metadata() {
+    let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
+    let query = tiered(vec![1.0, 0.0]);
+    let filter = DocTypeFilter::new(["active"]);
+    let (permissive, _) = searcher
+        .search_collect_with_filter(&query, 3, Some(&filter))
+        .expect("vector-only search");
+    assert_eq!(permissive.len(), 3);
+
+    let strict = filter.on_missing_metadata(MissingMetadataPolicy::Reject);
+    let (hits, _) = searcher
+        .search_collect_with_filter(&query, 3, Some(&strict))
+        .expect("strict vector-only search");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn strict_doc_type_filter_fills_each_phase_from_the_one_percent_active_tail() {
+    struct MetadataSource;
+    impl SyncLexicalSearch for MetadataSource {
+        fn search_sync(&self, _: &[f32], _: usize) -> SearchResult<Vec<ScoredResult>> {
+            Ok(Vec::new())
+        }
+
+        fn metadata_for_documents(
+            &self,
+            ids: &[&str],
+        ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+            Ok(ids
+                .iter()
+                .map(|id| match *id {
+                    "unknown" => None,
+                    "active-a" | "active-b" => {
+                        Some(Arc::new(serde_json::json!({"doc_type": "active"})))
+                    }
+                    _ => Some(Arc::new(serde_json::json!({"doc_type": "archived"}))),
+                })
+                .collect())
+        }
+    }
+
+    // Every archived document and the unknown document outrank both active
+    // documents on vector score. Post-filtering the first k would lose both.
+    let mut ids: Vec<_> = (0..198).map(|i| format!("archived-{i}")).collect();
+    ids.extend(["unknown", "active-a", "active-b"].map(str::to_owned));
+    let mut vectors = vec![vec![1.0, 0.0]; 199];
+    vectors.extend([vec![0.8, 0.6], vec![0.6, 0.8]]);
+    let fast = InMemoryVectorIndex::from_vectors(ids.clone(), vectors.clone(), 2).unwrap();
+    let quality = InMemoryVectorIndex::from_vectors(ids, vectors, 2).unwrap();
+    let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap());
+    let searcher = SyncTwoTierSearcher::new(
+        index,
+        TwoTierConfig {
+            candidate_multiplier: 1,
+            ..TwoTierConfig::default()
+        },
+    )
+    .with_lexical(Arc::new(MetadataSource));
+    let query = tiered(vec![1.0, 0.0]);
+    let strict = DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+    let mut phases = searcher.search_iter_with_filter(&query, 2, Some(&strict));
+    let Some(SearchPhase::Initial {
+        results: initial, ..
+    }) = phases.next()
+    else {
+        panic!("expected initial results");
+    };
+    let Some(SearchPhase::Refined {
+        results: refined, ..
+    }) = phases.next()
+    else {
+        panic!("expected refined results");
+    };
+    for results in [initial, refined] {
+        let mut ids: Vec<_> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["active-a", "active-b"]);
+        assert!(
+            results
+                .iter()
+                .all(|hit| hit.metadata.as_deref().unwrap()["doc_type"] == "active")
+        );
+    }
 }
 
 #[test]

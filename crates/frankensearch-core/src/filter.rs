@@ -4,10 +4,11 @@
 //! scores) in vector search, enabling early-exit when the filter is selective.
 //! This avoids computing dot products for non-matching records.
 //!
-//! When `metadata` is `None` (e.g., during vector search where metadata is not
-//! stored alongside vectors), filters that require metadata return `true`
-//! (permissive default) to avoid incorrectly filtering out documents whose
-//! metadata is simply unavailable.
+//! [`DocTypeFilter`] and [`DateRangeFilter`] accept missing metadata by default.
+//! Use [`MissingMetadataPolicy::Reject`] to require a known matching value.
+//! Searchers with a stored metadata source can evaluate candidates after
+//! hydration. A direct vector scan with no metadata rejects every candidate
+//! when either strict filter is applied on its own.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -417,13 +418,35 @@ impl fmt::Debug for FilterChain {
 
 // ─── Built-in Filters ────────────────────────────────────────────────────────
 
+/// How a built-in metadata filter evaluates a document with no metadata.
+///
+/// When metadata is present, the required field must exist, have the expected
+/// type, and satisfy the filter under either policy.
+///
+/// ```
+/// use frankensearch_core::{DocTypeFilter, MissingMetadataPolicy, SearchFilter};
+/// use serde_json::json;
+///
+/// let filter = DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+/// assert!(!filter.matches("unknown", None));
+/// assert!(filter.matches("known", Some(&json!({"doc_type": "active"}))));
+/// ```
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MissingMetadataPolicy {
+    /// Include the document when metadata is unavailable.
+    #[default]
+    Allow,
+    /// Exclude the document when metadata is unavailable.
+    Reject,
+}
+
 /// Matches documents whose `doc_type` metadata field is in a given set.
 ///
-/// Returns `true` (permissive) when metadata is `None`, since `doc_type`
-/// cannot be determined without metadata.
+/// Use [`Self::on_missing_metadata`] to change the default permissive policy.
 #[derive(Debug, Clone)]
 pub struct DocTypeFilter {
     allowed_types: HashSet<String>,
+    missing_metadata: MissingMetadataPolicy,
 }
 
 impl DocTypeFilter {
@@ -432,14 +455,22 @@ impl DocTypeFilter {
     pub fn new(types: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             allowed_types: types.into_iter().map(Into::into).collect(),
+            missing_metadata: MissingMetadataPolicy::Allow,
         }
+    }
+
+    /// Set how documents without metadata are evaluated.
+    #[must_use]
+    pub const fn on_missing_metadata(mut self, policy: MissingMetadataPolicy) -> Self {
+        self.missing_metadata = policy;
+        self
     }
 }
 
 impl SearchFilter for DocTypeFilter {
     fn matches(&self, _doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
         let Some(meta) = metadata else {
-            return true;
+            return self.missing_metadata == MissingMetadataPolicy::Allow;
         };
         let Some(doc_type) = meta.get("doc_type").and_then(serde_json::Value::as_str) else {
             return false;
@@ -466,11 +497,12 @@ impl SearchFilter for DocTypeFilter {
 /// falls within a given range.
 ///
 /// Either bound may be `None` for an open-ended range.
-/// Returns `true` (permissive) when metadata is `None`.
+/// Use [`Self::on_missing_metadata`] to change the default permissive policy.
 #[derive(Debug, Clone, Copy)]
 pub struct DateRangeFilter {
     min_timestamp: Option<i64>,
     max_timestamp: Option<i64>,
+    missing_metadata: MissingMetadataPolicy,
 }
 
 impl DateRangeFilter {
@@ -480,7 +512,15 @@ impl DateRangeFilter {
         Self {
             min_timestamp: min,
             max_timestamp: max,
+            missing_metadata: MissingMetadataPolicy::Allow,
         }
+    }
+
+    /// Set how documents without metadata are evaluated.
+    #[must_use]
+    pub const fn on_missing_metadata(mut self, policy: MissingMetadataPolicy) -> Self {
+        self.missing_metadata = policy;
+        self
     }
 
     /// Filter for documents created at or after a timestamp.
@@ -505,7 +545,7 @@ impl DateRangeFilter {
 impl SearchFilter for DateRangeFilter {
     fn matches(&self, _doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
         let Some(meta) = metadata else {
-            return true;
+            return self.missing_metadata == MissingMetadataPolicy::Allow;
         };
         let Some(created_at) = meta.get("created_at").and_then(serde_json::Value::as_i64) else {
             return false;
@@ -891,6 +931,45 @@ mod tests {
     fn doc_type_filter_permissive_when_no_metadata() {
         let filter = DocTypeFilter::new(["tweet"]);
         assert!(filter.matches("doc-1", None));
+    }
+
+    #[test]
+    fn strict_filters_require_known_matching_fields_on_both_scan_paths() {
+        let types =
+            DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let dates =
+            DateRangeFilter::between(10, 20).on_missing_metadata(MissingMetadataPolicy::Reject);
+        for (metadata, type_match, date_match) in [
+            (None, false, false),
+            (Some(json!(null)), false, false),
+            (Some(json!({})), false, false),
+            (
+                Some(json!({"doc_type": 1, "created_at": "10"})),
+                false,
+                false,
+            ),
+            (
+                Some(json!({"doc_type": "archived", "created_at": 20})),
+                false,
+                true,
+            ),
+            (
+                Some(json!({"doc_type": "active", "created_at": 21})),
+                true,
+                false,
+            ),
+            (
+                Some(json!({"doc_type": "active", "created_at": 10})),
+                true,
+                true,
+            ),
+        ] {
+            let metadata = metadata.as_ref();
+            assert_eq!(types.matches("doc", metadata), type_match);
+            assert_eq!(dates.matches("doc", metadata), date_match);
+            assert_eq!(types.matches_doc_id_hash(42, metadata), Some(type_match));
+            assert_eq!(dates.matches_doc_id_hash(42, metadata), Some(date_match));
+        }
     }
 
     // --- DateRangeFilter ---

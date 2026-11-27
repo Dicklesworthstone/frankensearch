@@ -4260,6 +4260,31 @@ mod tests {
     // --- SearchFilter integration tests ---
 
     #[test]
+    fn strict_metadata_filter_rejects_both_fsvi_and_wal_rows() {
+        use frankensearch_core::{DocTypeFilter, MissingMetadataPolicy};
+
+        let path = temp_index_path("strict-metadata");
+        let query = [1.0, 0.0];
+        write_index(&path, &[("base", query.to_vec())]).expect("write index");
+        let mut index = VectorIndex::open(&path).expect("open index");
+        index.append("wal", &query).expect("append to WAL");
+
+        let filter = DocTypeFilter::new(["active"]);
+        let hits = index.search_top_k(&query, 2, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 2);
+
+        let strict = filter.on_missing_metadata(MissingMetadataPolicy::Reject);
+        let result = index
+            .search_top_k_classified(&query, 2, Some(&strict))
+            .unwrap();
+        assert!(result.hits.is_empty());
+        assert_eq!(
+            result.zero_signal,
+            Some(ZeroSignalReason::FilterEliminatedAll)
+        );
+    }
+
+    #[test]
     fn bitset_filter_during_vector_search() {
         let path = temp_index_path("bitset-filter");
         write_index(
