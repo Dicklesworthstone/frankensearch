@@ -205,6 +205,14 @@ pub struct CliInput {
     pub query: Option<String>,
     /// Search or build only the independently admitted quality vector tier.
     pub quality_only: bool,
+    /// Explicit trusted native fixed-authority selection receipt for search.
+    pub authority_receipt: Option<PathBuf>,
+    /// Native receipt query mode: lexical, fast, quality, full, or partial.
+    pub authority_mode: Option<String>,
+    /// Maximum authenticated component bytes admitted for a native search.
+    pub authority_max_image_bytes: Option<usize>,
+    /// Maximum retained source bytes hydrated for one native result page.
+    pub authority_max_source_bytes: Option<usize>,
     /// Explicitly rebuild a complete store from these sources before searching.
     /// Models must already be available unless acquisition is explicitly requested.
     pub recover_source: Option<PathBuf>,
@@ -290,6 +298,110 @@ pub struct CliInput {
 }
 
 impl CliInput {
+    pub(crate) fn authority_selection_requested(&self) -> bool {
+        self.authority_receipt.is_some()
+            || self.authority_mode.is_some()
+            || self.authority_max_image_bytes.is_some()
+            || self.authority_max_source_bytes.is_some()
+    }
+
+    pub(crate) fn validate_authority_selection(&self) -> SearchResult<()> {
+        if !self.authority_selection_requested() {
+            return Ok(());
+        }
+        let reason = if self.authority_receipt.is_none() {
+            Some("authority query options require --authority-receipt PATH")
+        } else if self.command != CliCommand::Search {
+            Some(
+                "--authority-receipt supports search only; explain, mutation, watch, serve and daemon commands are not supported",
+            )
+        } else if self
+            .authority_receipt
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            Some("--authority-receipt requires a nonempty trusted receipt path")
+        } else if self.authority_mode.as_deref().is_some_and(|mode| {
+            !matches!(mode, "lexical" | "fast" | "quality" | "full" | "partial")
+        }) {
+            Some("--authority-mode expects lexical|fast|quality|full|partial")
+        } else if self.authority_max_image_bytes == Some(0)
+            || self.authority_max_source_bytes == Some(0)
+        {
+            Some("authority image and source byte budgets must be positive")
+        } else if self.index_dir.is_some()
+            || self.generation_id.is_some()
+            || self.generation_manifest_sha256.is_some()
+        {
+            Some(
+                "the trusted authority receipt selects its current root; omit --index-dir, --generation and --manifest-sha256",
+            )
+        } else if self.recover_source.is_some() || self.acquire_models {
+            Some(
+                "authority receipt search cannot recover sources or acquire models; install the selected models separately",
+            )
+        } else if self.quality_only || self.overrides.fast_only == Some(true) {
+            Some(
+                "use --authority-mode to select a native tier instead of --quality-only or --fast-only",
+            )
+        } else if self.daemon
+            || self.daemon_socket.is_some()
+            || self.daemon_idle_timeout_ms.is_some()
+            || self.daemon_poll_ms.is_some()
+            || self.daemon_stop
+        {
+            Some("authority receipt search runs locally and cannot use daemon options")
+        } else if self.overrides.explain == Some(true) {
+            Some("authority receipt search does not yet provide fsfs rank explanations")
+        } else if self.stream {
+            Some(
+                "authority receipt search returns one final page; omit --stream or use frankensearch-native authority-search for progressive streaming",
+            )
+        } else if self.filter.is_some() || self.expand || self.compact {
+            Some("authority receipt search does not support --filter, --expand or --compact")
+        } else if self.model_name.is_some()
+            || self.download_list
+            || self.download_verify
+            || self.download_verify_loader
+            || self.download_output_dir.is_some()
+            || self.config_action.is_some()
+            || self.completion_shell.is_some()
+            || self.update_check_only
+            || self.update_rollback
+            || self.update_rollback_version.is_some()
+            || self.uninstall_purge
+            || self.uninstall_yes
+            || self.uninstall_dry_run
+        {
+            Some(
+                "authority receipt search cannot accept model download, configuration edit, update, or uninstall options",
+            )
+        } else if self.watch
+            || self.full_reindex
+            || self.complete_quality
+            || self.target_path.is_some()
+            || self.input_file.is_some()
+            || !self.delete_ids.is_empty()
+            || self.delete_prefix
+            || self.overrides.roots.is_some()
+            || self.overrides.exclude_patterns.is_some()
+            || self.overrides.upgrade_reuse.is_some()
+            || self.overrides.allow_background_indexing.is_some()
+        {
+            Some("authority receipt search cannot accept source indexing or mutation options")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.authority_receipt".into(),
+                value: self.authority_mode.clone().unwrap_or_default(),
+                reason: reason.into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_quality_only(&self) -> SearchResult<()> {
         if !self.quality_only {
             return Ok(());
@@ -1023,6 +1135,57 @@ where
                 input.index_dir = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--authority-receipt" => {
+                let value = expect_value(&tokens, idx, flag)?;
+                if input
+                    .authority_receipt
+                    .replace(PathBuf::from(value))
+                    .is_some()
+                {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.authority_receipt".into(),
+                        value: flag.into(),
+                        reason: "supply --authority-receipt only once".into(),
+                    });
+                }
+                idx += 2;
+            }
+            "--authority-mode" => {
+                let value = expect_value(&tokens, idx, flag)?;
+                if input.authority_mode.replace(value.to_owned()).is_some() {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.authority_mode".into(),
+                        value: flag.into(),
+                        reason: "supply --authority-mode only once".into(),
+                    });
+                }
+                idx += 2;
+            }
+            "--authority-max-image-bytes" | "--authority-max-source-bytes" => {
+                let value = expect_value(&tokens, idx, flag)?;
+                let bytes = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "cli.authority_budget".into(),
+                        value: value.into(),
+                        reason: format!("{flag} requires a positive integer byte limit"),
+                    })?;
+                let field = if flag == "--authority-max-image-bytes" {
+                    &mut input.authority_max_image_bytes
+                } else {
+                    &mut input.authority_max_source_bytes
+                };
+                if field.replace(bytes).is_some() {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.authority_budget".into(),
+                        value: flag.into(),
+                        reason: "supply each authority budget only once".into(),
+                    });
+                }
+                idx += 2;
+            }
             "--generation" | "--manifest-sha256" => {
                 let value = expect_value(&tokens, idx, flag)?.to_owned();
                 let field = if flag == "--generation" {
@@ -1114,6 +1277,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
         // Default search path uses daemon transport to amortize startup/index warmup.
         input.daemon = input.command == CliCommand::Search
             && input.recover_source.is_none()
+            && input.authority_receipt.is_none()
             && input.generation_id.is_none()
             && input.generation_manifest_sha256.is_none();
     }
@@ -1125,6 +1289,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    input.validate_authority_selection()?;
     input.validate_quality_only()?;
     input.validate_retained_selection()?;
     input.validate_search_recovery()?;
@@ -1431,6 +1596,10 @@ fn is_known_cli_flag(token: &str) -> bool {
                 | "--theme"
                 | "--config"
                 | "--index-dir"
+                | "--authority-receipt"
+                | "--authority-mode"
+                | "--authority-max-image-bytes"
+                | "--authority-max-source-bytes"
                 | "--generation"
                 | "--manifest-sha256"
                 | "--recover-source"
@@ -1449,6 +1618,84 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn authority_receipt_search_keeps_explicit_modes_budgets_and_local_transport() {
+        for mode in ["lexical", "fast", "quality", "full", "partial"] {
+            let input = parse_cli_args([
+                "search",
+                "retained original query",
+                "--authority-receipt=selection.json",
+                "--authority-mode",
+                mode,
+                "--authority-max-image-bytes=1048576",
+                "--authority-max-source-bytes=4096",
+                "--limit=all",
+                "--format=jsonl",
+                "--no-fast-only",
+            ])
+            .unwrap();
+            assert_eq!(
+                input.authority_receipt.as_deref(),
+                Some(Path::new("selection.json"))
+            );
+            assert_eq!(input.authority_mode.as_deref(), Some(mode));
+            assert_eq!(input.authority_max_image_bytes, Some(1_048_576));
+            assert_eq!(input.authority_max_source_bytes, Some(4096));
+            assert_eq!(input.overrides.limit, Some(0));
+            assert_eq!(input.overrides.fast_only, Some(false));
+            assert_eq!(input.format, OutputFormat::Jsonl);
+            assert!(!input.daemon);
+            assert!(!input.stream);
+        }
+        let input =
+            parse_cli_args(["search", "--authority-receipt", "selection.json", "query"]).unwrap();
+        assert_eq!(input.query.as_deref(), Some("query"));
+        assert!(input.authority_mode.is_none());
+        assert!(!input.daemon);
+    }
+
+    #[test]
+    fn authority_receipt_flags_refuse_ambiguous_or_unsupported_execution() {
+        for extra in [
+            vec!["--daemon"],
+            vec!["--daemon-socket", "socket"],
+            vec!["--stream"],
+            vec!["--explain"],
+            vec!["--compact"],
+            vec!["--expand"],
+            vec!["--filter", "path:src"],
+            vec!["--fast-only"],
+            vec!["--quality-only"],
+            vec!["--index-dir", "other-root"],
+            vec!["--recover-source", "sources"],
+            vec!["--acquire-models"],
+            vec!["--generation", "old"],
+            vec!["--roots", "sources"],
+            vec!["--watch"],
+            vec!["--authority-mode", "unknown"],
+            vec!["--authority-max-image-bytes", "0"],
+            vec!["--authority-max-source-bytes", "-1"],
+            vec!["--authority-receipt", "second.json"],
+            vec!["--authority-mode", "fast", "--authority-mode", "quality"],
+        ] {
+            let mut args = vec!["search", "query", "--authority-receipt", "selection.json"];
+            args.extend(extra);
+            assert!(parse_cli_args(args.clone()).is_err(), "{args:?}");
+        }
+        for args in [
+            vec!["search", "query", "--authority-mode", "lexical"],
+            vec!["search", "query", "--authority-max-source-bytes", "4096"],
+            vec!["search", "query", "--authority-max-image-bytes", "4096"],
+            vec!["explain", "R1", "--authority-receipt", "selection.json"],
+            vec!["index", "--authority-receipt", "selection.json"],
+            vec!["serve", "--authority-receipt", "selection.json"],
+            vec!["daemon", "--authority-receipt", "selection.json"],
+            vec!["watch", "--authority-receipt", "selection.json"],
+        ] {
+            assert!(parse_cli_args(args.clone()).is_err(), "{args:?}");
+        }
+    }
 
     #[test]
     fn retained_selection_preserves_search_policy_and_uses_local_transport() {

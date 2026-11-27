@@ -38,10 +38,10 @@ use frankensearch_core::{
     HitExplanation, IndexableDocument, LexicalTermScore, ModelCategory, RerankDocument, Reranker,
     ScoreComponent, SearchError, SearchResult, VectorHit, with_cancellation,
 };
+use frankensearch_durability::fsvi_protector::FsviRepairError;
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
 };
-use frankensearch_durability::fsvi_protector::FsviRepairError;
 #[cfg(feature = "semantic-loaders")]
 use frankensearch_embed::FastEmbedEmbedder;
 #[cfg(test)]
@@ -148,14 +148,14 @@ use crate::lifecycle::{
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::output_schema::{
     IndexFreshnessPayload, OutputEnvelope, OutputError, OutputWarning, OutputWarningCode,
-    RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload, SearchHitScoreEvidence,
-    SearchOutputPhase, SearchPayload, SemanticBlendHit, SemanticBlendPayload, SemanticTierScore,
-    error_code_for,
+    RerankHitScore, RerankStagePayload, RerankStageStatus, SearchHitPayload,
+    SearchHitScoreEvidence, SearchOutputPhase, SearchPayload, SemanticBlendHit,
+    SemanticBlendPayload, SemanticTierScore, error_code_for,
 };
 use crate::pressure::{
-    DEFAULT_IO_CEILING_MIB_PER_SEC, DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
-    HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
-    PressureState, PressureTransition,
+    DEFAULT_IO_CEILING_MIB_PER_SEC, DegradationControllerConfig, DegradationSignal,
+    DegradationStateMachine, DegradationTransition, HostPressureCollector, PressureController,
+    PressureControllerConfig, PressureSignal, PressureState, PressureTransition,
 };
 use crate::pressure_sensing::IndexPressureMonitor;
 use crate::query_execution::{
@@ -4117,7 +4117,10 @@ impl ExplainSession {
         hit: &ExplainSessionHit,
     ) -> Option<(Vec<ScoreComponent>, Option<f32>)> {
         let blend = self.semantic_blend.as_ref()?;
-        let evidence = blend.hits.iter().find(|evidence| evidence.path == hit.path)?;
+        let evidence = blend
+            .hits
+            .iter()
+            .find(|evidence| evidence.path == hit.path)?;
         // Quality-only sessions have always saved tier evidence in Initial.
         // Older sessions put a normalized value in semantic_score, but kept
         // the actual ranked similarity in the quality tier's raw score.
@@ -4130,7 +4133,10 @@ impl ExplainSession {
         let rrf_rank = hit.semantic_rank.filter(|_| !hit.lexical_fallback_tail);
         let rrf_contribution = rrf_contribution_for_rank(self.rrf_k, rrf_rank);
         let mut components = Vec::with_capacity(3);
-        if !quality_only && rrf_rank.is_some() && let Some(score) = semantic_score {
+        if !quality_only
+            && rrf_rank.is_some()
+            && let Some(score) = semantic_score
+        {
             components.push(ScoreComponent {
                 source: ExplainedSource::SemanticBlend,
                 raw_score: f64::from(score),
@@ -4161,10 +4167,18 @@ impl ExplainSession {
             components.push(ScoreComponent {
                 source,
                 raw_score: f64::from(raw_score),
-                normalized_score: f64::from(if quality_only { raw_score } else { tier.normalized_score }),
+                normalized_score: f64::from(if quality_only {
+                    raw_score
+                } else {
+                    tier.normalized_score
+                }),
                 // The final fusion ranks either the combined semantic score
                 // or the sole quality tier, once per document.
-                rrf_contribution: if quality_only && quality { rrf_contribution } else { 0.0 },
+                rrf_contribution: if quality_only && quality {
+                    rrf_contribution
+                } else {
+                    0.0
+                },
                 weight: f64::from(tier.weight),
             });
         }
@@ -7175,7 +7189,9 @@ fn install_verified_executable(
             reason: "the installation path must have a parent directory".into(),
         })?;
     let stage = update_staging_directory(parent)?;
-    let binary = stage.path().join(if cfg!(windows) { "fsfs.exe" } else { "fsfs" });
+    let binary = stage
+        .path()
+        .join(if cfg!(windows) { "fsfs.exe" } else { "fsfs" });
     fs::copy(source, &binary)?;
     #[cfg(unix)]
     {
@@ -8534,6 +8550,9 @@ impl FsfsRuntime {
     ///
     /// Returns any surfaced `SearchError` from the selected runtime lane.
     pub async fn run_mode(&self, cx: &Cx, mode: InterfaceMode) -> SearchResult<()> {
+        if self.cli_input.authority_selection_requested() {
+            return Box::pin(self.run_mode_with_complete_generations(cx, mode, None, false)).await;
+        }
         match mode {
             InterfaceMode::Cli => self.run_cli(cx).await,
             InterfaceMode::Tui => self.run_tui(cx).await,
@@ -8555,6 +8574,15 @@ impl FsfsRuntime {
         mode: InterfaceMode,
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
+        if self.cli_input.authority_selection_requested() {
+            return Box::pin(self.run_mode_with_complete_generations(
+                cx,
+                mode,
+                Some(shutdown),
+                false,
+            ))
+            .await;
+        }
         match mode {
             InterfaceMode::Cli => Box::pin(self.run_cli_with_shutdown(cx, shutdown)).await,
             InterfaceMode::Tui => self.run_tui_with_shutdown(cx, shutdown).await,
@@ -8578,6 +8606,11 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
+        if self.cli_input.authority_selection_requested() {
+            let _cancellation_scope =
+                Self::bind_foreground_cli_cancellation(cx, self.cli_input.command, shutdown)?;
+            return Box::pin(self.run_authority_search(cx)).await;
+        }
         if self.cli_input.generation_id.is_some()
             || self.cli_input.generation_manifest_sha256.is_some()
         {
@@ -9442,8 +9475,7 @@ impl FsfsRuntime {
             );
         }
 
-        let mut pressure_collector =
-            HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC)?;
+        let mut pressure_collector = HostPressureCollector::new(DEFAULT_IO_CEILING_MIB_PER_SEC)?;
         let mut pressure_controller = self.new_pressure_controller();
         let mut degradation_machine = self.new_degradation_state_machine()?;
         match self.collect_pressure_signal(&mut pressure_collector) {
@@ -12847,10 +12879,17 @@ impl FsfsRuntime {
             Err(error) => return unavailable(error.to_string()),
         };
         let lexical = if let Some(expected) = expected_fingerprint
-            && Self::search_index_fingerprint_at_root(&index_root).ok().as_deref() == Some(expected)
+            && Self::search_index_fingerprint_at_root(&index_root)
+                .ok()
+                .as_deref()
+                == Some(expected)
         {
             let opened = Self::open_explain_lexical_index(cx, &index_root).await;
-            if Self::search_index_fingerprint_at_root(&index_root).ok().as_deref() == Some(expected) {
+            if Self::search_index_fingerprint_at_root(&index_root)
+                .ok()
+                .as_deref()
+                == Some(expected)
+            {
                 opened
             } else {
                 Err("the search index changed while opening lexical evidence".to_owned())
@@ -13319,7 +13358,10 @@ impl FsfsRuntime {
             ));
             // A foreground legacy search can still be in flight during
             // first publication, including on the previous executable.
-            (target.store_root.as_path(), FSFS_COMPLETE_EXPLAIN_SESSION_FILE)
+            (
+                target.store_root.as_path(),
+                FSFS_COMPLETE_EXPLAIN_SESSION_FILE,
+            )
         } else {
             (index_root, FSFS_EXPLAIN_SESSION_FILE)
         };
@@ -13377,8 +13419,10 @@ impl FsfsRuntime {
     fn load_complete_explain_session_at_root(root: &Path) -> SearchResult<Option<ExplainSession>> {
         // Earlier versions saved complete sessions at the legacy path.
         // The caller still compares the exact selected generation stamp.
-        Self::read_explain_session(root, FSFS_COMPLETE_EXPLAIN_SESSION_FILE)?
-            .map_or_else(|| Self::load_explain_session_at_root(root), |session| Ok(Some(session)))
+        Self::read_explain_session(root, FSFS_COMPLETE_EXPLAIN_SESSION_FILE)?.map_or_else(
+            || Self::load_explain_session_at_root(root),
+            |session| Ok(Some(session)),
+        )
     }
 
     fn read_explain_session(
@@ -13388,10 +13432,12 @@ impl FsfsRuntime {
         if !Self::admit_explain_directory(index_root, false)? {
             return Ok(None);
         }
-        let Some(raw) = read_regular_search_record(&index_root.join(session_file))
-            .map_err(|source| SearchError::SubsystemError {
-                subsystem: "fsfs.explain.session",
-                source: Box::new(source),
+        let Some(raw) =
+            read_regular_search_record(&index_root.join(session_file)).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.explain.session",
+                    source: Box::new(source),
+                }
             })?
         else {
             return Ok(None);
@@ -13938,8 +13984,7 @@ impl FsfsRuntime {
                 "expanded-query fusion has no complete per-query explanation evidence; run the search without --expand for ranking explanations",
             ));
         }
-        if let Err(error) =
-            self.invalidate_expanded_query_explanation(&resources.index_root, query)
+        if let Err(error) = self.invalidate_expanded_query_explanation(&resources.index_root, query)
         {
             warn!(
                 error_code = error_code_for(&error),
@@ -15425,8 +15470,8 @@ impl FsfsRuntime {
             None if self.complete_explain_target.is_some() => {
                 // Older complete entries used the shared filename. Accept
                 // them only through the complete-generation check below.
-                let historical = cache_path
-                    .with_file_name(format!("{}.json", Self::search_cache_key_hash(key)));
+                let historical =
+                    cache_path.with_file_name(format!("{}.json", Self::search_cache_key_hash(key)));
                 read_regular_search_record(&historical)?
             }
             current => current,
@@ -15524,7 +15569,8 @@ impl FsfsRuntime {
     }
 
     fn search_payload_explanation_candidates(payload: &SearchPayload) -> Vec<FusedCandidate> {
-        payload.hits
+        payload
+            .hits
             .iter()
             .map(|hit| {
                 let evidence = payload
@@ -17540,7 +17586,11 @@ impl FsfsRuntime {
                     &manifest,
                     &install_dir,
                     &destination,
-                    if operation == "verify-loader" { "loadable" } else { "verified" },
+                    if operation == "verify-loader" {
+                        "loadable"
+                    } else {
+                        "verified"
+                    },
                     Some(true),
                     Self::path_bytes(&destination)?,
                     None,
@@ -19050,13 +19100,19 @@ impl FsfsRuntime {
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
         let paths = [
             Some(vector_path.as_path()),
-            quality_vector_path.try_exists()?.then_some(quality_vector_path.as_path()),
+            quality_vector_path
+                .try_exists()?
+                .then_some(quality_vector_path.as_path()),
         ];
         publication_lease.fence("explicit vector writer admission")?;
-        let mut indexes = Self::retry_vector_writer_open(&vector_path, Duration::from_secs(2), || {
-            VectorIndex::open_writers(paths.into_iter().flatten())
-        })?.into_iter();
-        let mut index = indexes.next().ok_or(SearchError::IndexNotFound { path: vector_path })?;
+        let mut indexes =
+            Self::retry_vector_writer_open(&vector_path, Duration::from_secs(2), || {
+                VectorIndex::open_writers(paths.into_iter().flatten())
+            })?
+            .into_iter();
+        let mut index = indexes
+            .next()
+            .ok_or(SearchError::IndexNotFound { path: vector_path })?;
 
         // First compact WAL into main index.
         let compaction_stats = index.compact()?;
@@ -19243,13 +19299,14 @@ impl FsfsRuntime {
             }
 
             compactor_lease.fence("daemon WAL observation")?;
-            let observed_wal_bytes = tiers.each_ref().map(|(_, _, wal)| {
-                wal.metadata().map(|metadata| metadata.len()).unwrap_or(0)
-            });
-            let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] = std::array::from_fn(|position| {
-                observed_wal_bytes[position] > previous_wal_bytes[position]
-                    && tiers[position].1.exists()
-            });
+            let observed_wal_bytes = tiers
+                .each_ref()
+                .map(|(_, _, wal)| wal.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+            let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] =
+                std::array::from_fn(|position| {
+                    observed_wal_bytes[position] > previous_wal_bytes[position]
+                        && tiers[position].1.exists()
+                });
             if pending.iter().any(|pending| *pending) {
                 last_activity = std::time::Instant::now();
                 let publication_lease =
@@ -19272,7 +19329,11 @@ impl FsfsRuntime {
                     // Recheck both under exclusion before selecting maintenance.
                     let pending: [bool; FSFS_VECTOR_GENERATION_FILES.len()] =
                         std::array::from_fn(|position| {
-                            tiers[position].2.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                            tiers[position]
+                                .2
+                                .metadata()
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0)
                                 > previous_wal_bytes[position]
                                 && tiers[position].1.exists()
                         });
@@ -19291,13 +19352,16 @@ impl FsfsRuntime {
                         Err(FsviRepairError::Failed(error)) => return Err(error),
                     }
 
-                    let pending_tiers = tiers.iter().zip(pending)
+                    let pending_tiers = tiers
+                        .iter()
+                        .zip(pending)
                         .filter_map(|(tier, pending)| pending.then_some(tier));
                     // Admit all locks and strictly validate every pending WAL
                     // before recovery or compaction can modify an earlier tier.
                     let Some(indexes) = VectorIndex::try_open_writers(
                         pending_tiers.clone().map(|(_, path, _)| path.as_path()),
-                    )? else {
+                    )?
+                    else {
                         debug!("daemon: deferring compaction while vector readers are active");
                         break 'maintenance;
                     };
@@ -19318,7 +19382,9 @@ impl FsfsRuntime {
                                 if self.cli_input.format == OutputFormat::Table {
                                     println!(
                                         "daemon: {tier}: compacted {} WAL entries -> {} total records ({:.1}ms)",
-                                        stats.wal_records, stats.total_records_after, stats.elapsed_ms
+                                        stats.wal_records,
+                                        stats.total_records_after,
+                                        stats.elapsed_ms
                                     );
                                 }
                             }
@@ -19517,7 +19583,9 @@ impl FsfsRuntime {
             reason: reason.into(),
         };
         if !contents.is_local() {
-            return Err(pid_file_error("compactor PID file belongs to a different host"));
+            return Err(pid_file_error(
+                "compactor PID file belongs to a different host",
+            ));
         }
         let process = crate::concurrency::ProcessTarget::open(contents.pid)
             .ok_or_else(|| pid_file_error("compactor PID file must name a positive process ID"))?;
@@ -19536,7 +19604,9 @@ impl FsfsRuntime {
                 if !process.is_alive() {
                     return Ok(false);
                 }
-                return Err(pid_file_error("recorded PID does not hold this index's compactor lock"));
+                return Err(pid_file_error(
+                    "recorded PID does not hold this index's compactor lock",
+                ));
             }
         }
         let started = std::time::Instant::now();
@@ -19700,9 +19770,11 @@ impl FsfsRuntime {
         let mut refusals = 0u32;
         loop {
             match open() {
-                Err(SearchError::InvalidConfig { field, reason, value })
-                    if field == "fsvi.map_lock" && started.elapsed() < budget =>
-                {
+                Err(SearchError::InvalidConfig {
+                    field,
+                    reason,
+                    value,
+                }) if field == "fsvi.map_lock" && started.elapsed() < budget => {
                     if refusals == 0 {
                         info!(
                             path = %value,
@@ -20036,6 +20108,11 @@ impl FsfsRuntime {
     pub fn search_recovery_context(
         &self,
     ) -> Option<crate::degradation_advisor::SearchRecoveryContext> {
+        if self.cli_input.authority_selection_requested() {
+            // Ordinary fsfs source recovery cannot mutate a native fixed
+            // authority. Do not attach legacy rebuild advice to this route.
+            return None;
+        }
         let requested = self.requested_search_mode();
         let mode = self
             .search_mode_for_query(
@@ -22431,12 +22508,16 @@ impl FsfsRuntime {
         let destination = match fs::canonicalize(&index_root) {
             Ok(destination) => destination,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(invalid_alias("the index directory symlink has no existing destination"));
+                return Err(invalid_alias(
+                    "the index directory symlink has no existing destination",
+                ));
             }
             Err(error) => return Err(error.into()),
         };
         if !fs::metadata(&destination)?.is_dir() {
-            return Err(invalid_alias("the index directory symlink must point to a directory"));
+            return Err(invalid_alias(
+                "the index directory symlink must point to a directory",
+            ));
         }
 
         // Keep the footprint, lease, discovery exclusion and catalog on one
@@ -22483,7 +22564,10 @@ impl FsfsRuntime {
         let index_root = self.resolve_index_root(&target_root)?;
         // A retained rebuild writes inside one candidate but owns the complete
         // store's footprint, including the predecessor and inactive generations.
-        let storage_root = self.discovery_excluded_root.as_deref().unwrap_or(&index_root);
+        let storage_root = self
+            .discovery_excluded_root
+            .as_deref()
+            .unwrap_or(&index_root);
         self.admit_storage_write(cx, storage_root, "index.start")?;
         // One-shot and watch-mode indexing mutate checkpoint + FSVI + sentinel
         // state; exclude every other mutating fsfs process for the duration.
@@ -22801,9 +22885,12 @@ impl FsfsRuntime {
             None
         };
         let probe_free_digests = if (can_reuse_without_inference
-            || (legacy_probes_deferred && self.receipt_seed == Some(retained_reuse::ReceiptSeed::Legacy)))
+            || (legacy_probes_deferred
+                && self.receipt_seed == Some(retained_reuse::ReceiptSeed::Legacy)))
             && let Some(producers) = primary_admission.as_ref().zip(quality_admission.as_ref())
-            && let Some(checkpoint) = existing_checkpoint.as_ref().zip(checkpoint_manifests.as_ref())
+            && let Some(checkpoint) = existing_checkpoint
+                .as_ref()
+                .zip(checkpoint_manifests.as_ref())
         {
             Box::pin(retained_reuse::prove_two_tier_reuse_without_inference(
                 cx,
@@ -28760,6 +28847,13 @@ impl FsfsRuntime {
     ///
     /// Returns `SearchError` when onboarding/indexing flow cannot complete.
     pub async fn run_tui(&self, cx: &Cx) -> SearchResult<()> {
+        if self.cli_input.authority_selection_requested() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.authority_receipt".to_owned(),
+                value: "tui".to_owned(),
+                reason: "trusted authority receipt search requires CLI mode".to_owned(),
+            });
+        }
         if self.cli_input.generation_id.is_some()
             || self.cli_input.generation_manifest_sha256.is_some()
         {
@@ -30763,6 +30857,11 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>
               --generation ID --manifest-sha256 HASH --index-dir STORE searches an exact retained generation locally.
               Copy both values from one trusted publication receipt. The same selectors support the follow-up explain command.
+              --authority-receipt PATH searches one trusted native fixed-authority generation locally.
+              --authority-mode lexical|fast|quality|full|partial selects its query tier; default follows the receipt (partial defaults to fast).
+              --authority-max-image-bytes N (default 268435456) and --authority-max-source-bytes N (default 16777216) bound admission and hydration.
+              Native receipt search returns one final page with document IDs and retained-source snippets in any output format.
+              It supports --limit all and --no-fast-only, but not --stream, --explain, daemon, filter, recovery, or mutation options.
               --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
               Recovery uses installed models by default. Add --acquire-models to download missing required models first; --offline still forbids acquisition.
               After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.
@@ -31127,12 +31226,9 @@ fn available_space_for_path(path: &Path) -> Option<u64> {
         }
     }
 
-    best_match.map(|(_, bytes)| bytes).or_else(|| {
-        disks
-            .iter()
-            .map(sysinfo::Disk::available_space)
-            .max()
-    })
+    best_match
+        .map(|(_, bytes)| bytes)
+        .or_else(|| disks.iter().map(sysinfo::Disk::available_space).max())
 }
 
 fn absolutize_path(path: &Path) -> SearchResult<PathBuf> {
@@ -35819,7 +35915,9 @@ fn index_discovery_walker_with_alias(
     let discovery = discovery.clone();
     // The legacy CLI alias is excluded by its original spelling only; a user
     // can retarget it during a watch. The actual store has a fixed destination.
-    let physical_store = if discovery.follow_symlinks && let Some(store) = excluded_root {
+    let physical_store = if discovery.follow_symlinks
+        && let Some(store) = excluded_root
+    {
         match fs::canonicalize(store) {
             Ok(path) => Some(path),
             // The first watch observation can precede creation of the store.
@@ -35829,10 +35927,16 @@ fn index_discovery_walker_with_alias(
     } else {
         None
     };
-    let excluded_roots = [excluded_root.map(Path::to_path_buf), index_alias.map(Path::to_path_buf)];
+    let excluded_roots = [
+        excluded_root.map(Path::to_path_buf),
+        index_alias.map(Path::to_path_buf),
+    ];
     let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
     walker.filter_entry(move |entry| {
-        if excluded_roots.iter().flatten().any(|root| entry.path().starts_with(root))
+        if excluded_roots
+            .iter()
+            .flatten()
+            .any(|root| entry.path().starts_with(root))
         {
             return false;
         }
@@ -39204,7 +39308,8 @@ mod tests {
                 writer.write_record(id, &vector).unwrap();
             }
             writer.finish().unwrap();
-            resources.quality_vector_index = Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+            resources.quality_vector_index =
+                Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
             let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
             resources.fast_embedder = Some(admitted_shared(&fast));
             let lexical = create_test_quill(&cx, &temp.path().join("lexical")).await;
@@ -39308,7 +39413,10 @@ mod tests {
                         Ok(resources.lexical_index.as_ref().unwrap()),
                     );
                     assert!(warnings.is_empty());
-                    assert_eq!(explanation.ranking.reason_code, "query.explain.quality_only");
+                    assert_eq!(
+                        explanation.ranking.reason_code,
+                        "query.explain.quality_only"
+                    );
                     let [quality] = explanation.ranking.components.as_slice() else {
                         panic!("expected one quality component for {}", hit.path);
                     };
@@ -39319,7 +39427,10 @@ mod tests {
                     let expected_raw = f64::from(fused.semantic_score.unwrap());
                     assert_eq!(quality.raw_score.to_bits(), expected_raw.to_bits());
                     assert_eq!(quality.normalized_score.to_bits(), expected_raw.to_bits());
-                    assert_eq!(quality.rrf_contribution.to_bits(), fused.fused_score.to_bits());
+                    assert_eq!(
+                        quality.rrf_contribution.to_bits(),
+                        fused.fused_score.to_bits()
+                    );
                     assert_eq!(
                         explanation.ranking.fusion.as_ref().unwrap().semantic_score,
                         fused.semantic_score
@@ -39356,14 +39467,21 @@ mod tests {
             assert_ranked_quality(&legacy_session);
 
             let mode = SearchExecutionMode::QualityOnly;
-            let key = runtime.search_cache_key("quality search", FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, mode).unwrap();
+            let key = runtime
+                .search_cache_key("quality search", FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, mode)
+                .unwrap();
             let fingerprint = &resources.generation_fingerprint;
             runtime
                 .write_search_payload_cache(&key, std::slice::from_ref(payload), fingerprint)
                 .unwrap();
-            let cached = runtime.try_load_search_payload_cache(&key, fingerprint).unwrap().unwrap();
+            let cached = runtime
+                .try_load_search_payload_cache(&key, fingerprint)
+                .unwrap()
+                .unwrap();
             assert_eq!(cached.as_slice(), std::slice::from_ref(payload));
-            runtime.persist_explain_session_for_cached_payloads("quality search", &cached).unwrap();
+            runtime
+                .persist_explain_session_for_cached_payloads("quality search", &cached)
+                .unwrap();
             let replayed = runtime.load_explain_session().unwrap().unwrap();
             assert_eq!(replayed.hits, session.hits);
             assert_ranked_quality(&replayed);
@@ -40042,7 +40160,8 @@ mod tests {
                 let session = effective.load_explain_session().unwrap().unwrap();
                 assert_eq!(session.hits[0].path, winner);
                 assert_eq!(session.hits[0].semantic_score, Some(expected_score));
-                let (components, ranked_score) = session.semantic_components(&session.hits[0]).unwrap();
+                let (components, ranked_score) =
+                    session.semantic_components(&session.hits[0]).unwrap();
                 assert_eq!(ranked_score, Some(expected_score));
                 assert_eq!(components.len(), 3);
                 assert!(
@@ -43761,7 +43880,9 @@ mod tests {
                 );
             });
             let timeout_ms = if disconnect { 10_000 } else { 1000 };
-            let request = format!("{{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":{timeout_ms},\"stream\":true}}");
+            let request = format!(
+                "{{\"query\":\"recover failed network requests\",\"quality_timeout_ms\":{timeout_ms},\"stream\":true}}"
+            );
             client.write_all(request.as_bytes()).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
             let mut reader = std::io::BufReader::new(client);
@@ -43778,7 +43899,11 @@ mod tests {
                 while calls.load(Ordering::SeqCst) == 0 && Instant::now() < start_deadline {
                     thread::sleep(Duration::from_millis(1));
                 }
-                assert_eq!(calls.load(Ordering::SeqCst), 1, "quality work was never admitted");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "quality work was never admitted"
+                );
                 match reader.get_ref().shutdown(std::net::Shutdown::Both) {
                     Ok(()) => {}
                     // Darwin reports that the server already closed its end.
@@ -51208,7 +51333,11 @@ mod tests {
                 .unwrap();
             let payload = payloads.last().unwrap();
             assert_eq!(
-                payload.hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+                payload
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
                 ["expanded.md", "original.md"]
             );
             let (explained, warnings) = runtime
@@ -51949,7 +52078,9 @@ mod tests {
             let child = runtime.detached_fsfs_command([command.into()]).unwrap();
             for name in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
                 assert!(
-                    child.get_envs().any(|(key, value)| key == name && value.is_none()),
+                    child
+                        .get_envs()
+                        .any(|(key, value)| key == name && value.is_none()),
                     "{command} must unset {name}"
                 );
             }
@@ -58908,7 +59039,13 @@ mod tests {
                 ..CliInput::default()
             });
             runtime
-                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                )
                 .await
                 .unwrap();
 
@@ -58925,20 +59062,36 @@ mod tests {
             let sentinel = store.join(super::FSFS_SENTINEL_FILE);
             let before = fs::read(&sentinel).unwrap();
             let error = low_budget
-                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                )
                 .await
                 .unwrap_err();
             assert!(super::storage_admission::storage_admission_denial(&error).is_some());
             assert_eq!(fs::read(&sentinel).unwrap(), before);
 
             runtime
-                .run_one_shot_index_scaffold_internal(&cx, CliCommand::Index, |_| Ok(()), false, true)
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                )
                 .await
                 .unwrap();
             assert_eq!(fs::read_link(alias).unwrap(), store);
             runtime.cli_input.command = CliCommand::Search;
-            let result = runtime.execute_search_payload(&cx, "sharedtoken", 10).await.unwrap();
-            let paths: super::BTreeSet<_> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
+            let result = runtime
+                .execute_search_payload(&cx, "sharedtoken", 10)
+                .await
+                .unwrap();
+            let paths: super::BTreeSet<_> =
+                result.hits.iter().map(|hit| hit.path.as_str()).collect();
             assert_eq!(paths, super::BTreeSet::from(["alpha.md", "beta.md"]));
         });
     }
@@ -58959,7 +59112,9 @@ mod tests {
                 index_dir: Some(dangling),
                 ..CliInput::default()
             });
-            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            let error = runtime
+                .resolve_legacy_index_alias(CliCommand::Index)
+                .unwrap_err();
             assert!(error.to_string().contains("no existing destination"));
             assert!(!missing.exists());
 
@@ -58968,20 +59123,27 @@ mod tests {
             let file_alias = temp.path().join("file-alias");
             std::os::unix::fs::symlink(&file, &file_alias).unwrap();
             runtime.cli_input.index_dir = Some(file_alias);
-            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            let error = runtime
+                .resolve_legacy_index_alias(CliCommand::Index)
+                .unwrap_err();
             assert!(error.to_string().contains("must point to a directory"));
             assert_eq!(fs::read(file).unwrap(), b"ordinary file");
 
             let store_root = temp.path().join("complete");
-            let store = crate::generation_store::CompleteGenerationStore::create(&cx, &store_root)
-                .unwrap();
+            let store =
+                crate::generation_store::CompleteGenerationStore::create(&cx, &store_root).unwrap();
             fs::create_dir(store_root.join("generations")).unwrap();
             let complete_alias = temp.path().join("complete-alias");
             std::os::unix::fs::symlink(&store_root, &complete_alias).unwrap();
             runtime.cli_input.index_dir = Some(complete_alias.clone());
-            let error = runtime.resolve_legacy_index_alias(CliCommand::Index).unwrap_err();
+            let error = runtime
+                .resolve_legacy_index_alias(CliCommand::Index)
+                .unwrap_err();
             assert!(error.to_string().contains("complete-generation store"));
-            assert!(crate::generation_store::CompleteGenerationStore::create(&cx, &complete_alias).is_err());
+            assert!(
+                crate::generation_store::CompleteGenerationStore::create(&cx, &complete_alias)
+                    .is_err()
+            );
             assert!(store.active(&cx).unwrap().is_none());
         });
     }
@@ -60960,7 +61122,9 @@ mod tests {
             let path = root.join(super::FSFS_EXPLAIN_SESSION_FILE);
             let mut competing = search.load_explain_session().unwrap().unwrap();
             competing.hits[0].final_score = -1.0;
-            search.persist_explain_session_value(&root, competing).unwrap();
+            search
+                .persist_explain_session_value(&root, competing)
+                .unwrap();
             let (after_competitor, _) = search
                 .explain_returned_hits(&cx, &payload, Some(&fingerprint))
                 .await;
@@ -61121,7 +61285,11 @@ mod tests {
                 session.complete_generation,
                 Some(super::CompleteExplainGeneration::from_generation(&first))
             );
-            assert!(FsfsRuntime::load_complete_explain_session_at_root(first.path()).unwrap().is_none());
+            assert!(
+                FsfsRuntime::load_complete_explain_session_at_root(first.path())
+                    .unwrap()
+                    .is_none()
+            );
             let session_path = root.join(super::FSFS_COMPLETE_EXPLAIN_SESSION_FILE);
             let saved = fs::read(&session_path).unwrap();
             let hit = session.hits.first().expect("search found fixture");
@@ -61208,10 +61376,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(
-                fs::read(&session_path).unwrap(),
-                saved
-            );
+            assert_eq!(fs::read(&session_path).unwrap(), saved);
             for query in ["alpha", "   "] {
                 let mut cancel_phase = |_: &SearchPayload| {
                     cx.set_cancel_requested(true);
@@ -61336,7 +61501,11 @@ mod tests {
             );
             assert_eq!(store.active(&cx).unwrap(), Some(second.clone()));
             for generation in [first, second] {
-                assert!(FsfsRuntime::load_complete_explain_session_at_root(generation.path()).unwrap().is_none());
+                assert!(
+                    FsfsRuntime::load_complete_explain_session_at_root(generation.path())
+                        .unwrap()
+                        .is_none()
+                );
             }
         });
     }
@@ -61387,7 +61556,11 @@ mod tests {
                     .persist_explain_session(store.root(), "wrong", SearchOutputPhase::Initial, &[])
                     .is_err()
             );
-            assert!(FsfsRuntime::load_complete_explain_session_at_root(store.root()).unwrap().is_none());
+            assert!(
+                FsfsRuntime::load_complete_explain_session_at_root(store.root())
+                    .unwrap()
+                    .is_none()
+            );
             runtime
                 .persist_explain_session(
                     generation.path(),
@@ -61481,7 +61654,12 @@ mod tests {
             );
             assert!(output.is_empty());
             assert!(!generation.path().join("last_search_session.json").exists());
-            assert!(!generation.path().join("last_complete_search_session.json").exists());
+            assert!(
+                !generation
+                    .path()
+                    .join("last_complete_search_session.json")
+                    .exists()
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
 
             // The final context file is independently no-follow on read.
@@ -65823,13 +66001,20 @@ mod tests {
             .expect("a refused uninstall must not disturb the live holder");
         drop(live_writer);
 
-        let compactor = crate::lifecycle::CompactorLease::acquire(&index_root)
-            .expect("live idle compactor");
+        let compactor =
+            crate::lifecycle::CompactorLease::acquire(&index_root).expect("live idle compactor");
         let entry = FsfsRuntime::apply_uninstall_target(&target, false, false);
         assert_eq!(entry.status, "error", "{entry:?}");
-        assert!(entry.detail.as_deref().is_some_and(|detail| detail.contains("compactor lease")));
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("compactor lease"))
+        );
         assert!(index_root.join("vector/index.fsvi").is_file());
-        compactor.fence("post-refused-uninstall").expect("retained compactor");
+        compactor
+            .fence("post-refused-uninstall")
+            .expect("retained compactor");
         drop(compactor);
 
         // A lock file and owner record left behind by a dead holder are not a
@@ -69263,7 +69448,10 @@ mod tests {
                 "runtime::tests::daemon_stop_clears_a_stale_pid_file_and_terminates_a_live_daemon",
             ])
             .env(STOP_TEST_INDEX_ROOT, index_root)
-            .env("FSFS_TEST_STOP_WRITER_ONLY", if writer_only { "1" } else { "0" })
+            .env(
+                "FSFS_TEST_STOP_WRITER_ONLY",
+                if writer_only { "1" } else { "0" },
+            )
             .spawn()
             .expect("spawn compactor lease holder");
         let started = Instant::now();
@@ -69294,7 +69482,8 @@ mod tests {
         if let Some(root) = std::env::var_os(STOP_TEST_INDEX_ROOT) {
             let root = PathBuf::from(root);
             if std::env::var("FSFS_TEST_STOP_WRITER_ONLY").as_deref() == Ok("1") {
-                let _lease = crate::lifecycle::PublicationLease::acquire(&root).expect("writer lease");
+                let _lease =
+                    crate::lifecycle::PublicationLease::acquire(&root).expect("writer lease");
                 fs::write(root.join("stop-test-ready"), b"").expect("announce writer ownership");
                 std::thread::sleep(Duration::from_secs(30));
                 return;
@@ -69358,7 +69547,9 @@ mod tests {
 
         let stopped = FsfsRuntime::stop_compaction_daemon(&contents, &pid_path, budget, poll);
         let cleared = if matches!(&stopped, Ok(false)) {
-            Some(FsfsRuntime::stop_compaction_daemon(&contents, &pid_path, budget, poll))
+            Some(FsfsRuntime::stop_compaction_daemon(
+                &contents, &pid_path, budget, poll,
+            ))
         } else {
             let _ = child.kill();
             None
@@ -69394,8 +69585,10 @@ mod tests {
         let _ = child.kill();
         child.wait().expect("reap other owner");
         assert!(still_running);
-        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
-            if field == "daemon.pid_file" && reason.contains("compactor lock")));
+        assert!(
+            matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
+            if field == "daemon.pid_file" && reason.contains("compactor lock"))
+        );
         assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 
@@ -69404,7 +69597,10 @@ mod tests {
     fn compactor_stop_does_not_signal_a_pid_from_a_different_host() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_path = temp.path().join(super::FSFS_DAEMON_PID_FILE);
-        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         let mut contents = crate::lifecycle::PidFileContents::current("test");
         contents.pid = child.id();
         contents.hostname.push_str("-foreign");
@@ -69421,7 +69617,9 @@ mod tests {
         let _ = child.kill();
         child.wait().expect("reap owned child");
         assert!(still_running);
-        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, .. }) if field == "daemon.pid_file"));
+        assert!(
+            matches!(stopped, Err(SearchError::InvalidConfig { field, .. }) if field == "daemon.pid_file")
+        );
         assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 
@@ -69445,9 +69643,14 @@ mod tests {
         let still_running = child.try_wait().expect("poll writer").is_none();
         let _ = child.kill();
         child.wait().expect("reap writer");
-        assert!(still_running, "a writer must not be signalled as a compactor");
-        assert!(matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
-            if field == "daemon.pid_file" && reason.contains("compactor lock")));
+        assert!(
+            still_running,
+            "a writer must not be signalled as a compactor"
+        );
+        assert!(
+            matches!(stopped, Err(SearchError::InvalidConfig { field, reason, .. })
+            if field == "daemon.pid_file" && reason.contains("compactor lock"))
+        );
         assert_eq!(fs::read(pid_path).unwrap(), recorded);
     }
 

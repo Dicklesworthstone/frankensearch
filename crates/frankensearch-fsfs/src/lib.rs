@@ -58,6 +58,7 @@ pub mod redaction;
 pub mod repro;
 pub mod root_discovery;
 pub mod runtime {
+    mod authority_search;
     pub mod deferred_quality;
     pub mod retained_batch;
     pub(crate) mod storage_admission;

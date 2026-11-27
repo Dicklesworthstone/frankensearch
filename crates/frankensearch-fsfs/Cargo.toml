@@ -82,6 +82,7 @@ path = "tests/search_quality_harness.rs"
 required-features = ["embedded-models"]
 
 [dependencies]
+frankensearch = { path = "../../frankensearch", version = "0.8.0", default-features = false, features = ["quill"] }
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
 frankensearch-fusion = { workspace = true }

@@ -172,6 +172,18 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
         initialize_store: bool,
     ) -> SearchResult<()> {
+        if self.cli_input.authority_selection_requested() {
+            self.cli_input.validate_authority_selection()?;
+            if mode != InterfaceMode::Cli {
+                return Err(complete_cli_error(
+                    "authority_receipt",
+                    "trusted authority receipt search requires CLI mode",
+                ));
+            }
+            let _cancellation_scope =
+                Self::bind_foreground_cli_cancellation(cx, CliCommand::Search, shutdown)?;
+            return Box::pin(self.run_authority_search(cx)).await;
+        }
         let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
         let effective_command = if dashboard {
             CliCommand::Tui
@@ -194,7 +206,8 @@ impl FsfsRuntime {
             && self.cli_input.recover_source.is_none()
             && self.cli_input.generation_id.is_none()
             && CompleteGenerationStore::legacy_migration_pending(&root)?
-            && Self::read_index_sentinel(&root)?.is_some_and(|sentinel| sentinel.generation_complete)
+            && Self::read_index_sentinel(&root)?
+                .is_some_and(|sentinel| sentinel.generation_complete)
         {
             // An in-flight foreground read may finish on the legacy index. Do
             // not start or reuse a daemon that could keep serving that layout
@@ -3028,7 +3041,11 @@ mod tests {
             assert_eq!(reader.generation(), &successor);
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
-            assert!(FsfsRuntime::load_complete_explain_session_at_root(&root).unwrap().is_none());
+            assert!(
+                FsfsRuntime::load_complete_explain_session_at_root(&root)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -3130,7 +3147,11 @@ mod tests {
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
             assert_eq!(fs::read(&selection_path).unwrap(), valid_selection);
-            assert!(FsfsRuntime::load_complete_explain_session_at_root(&root).unwrap().is_none());
+            assert!(
+                FsfsRuntime::load_complete_explain_session_at_root(&root)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -5662,7 +5683,11 @@ mod tests {
                 current.id(),
                 second_receipt["data"]["generation_id"].as_str().unwrap()
             );
-            assert!(FsfsRuntime::load_complete_explain_session_at_root(current.path()).unwrap().is_none());
+            assert!(
+                FsfsRuntime::load_complete_explain_session_at_root(current.path())
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -5732,12 +5757,16 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            let historical = path.with_file_name(format!(
-                "{}.json",
-                FsfsRuntime::search_cache_key_hash(&key),
-            ));
+            let historical =
+                path.with_file_name(format!("{}.json", FsfsRuntime::search_cache_key_hash(&key),));
             fs::rename(&path, &historical).unwrap();
-            assert!(reader.runtime.try_load_search_payload_cache(&key, &fingerprint).unwrap().is_some());
+            assert!(
+                reader
+                    .runtime
+                    .try_load_search_payload_cache(&key, &fingerprint)
+                    .unwrap()
+                    .is_some()
+            );
             fs::rename(&historical, &path).unwrap();
             // Keep the key and index fingerprint exact so only the complete
             // bundle binding can reject a legacy, foreign or revised record.
@@ -5845,7 +5874,10 @@ mod tests {
                 .unwrap();
             let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
             assert_eq!(recovered["data"]["hits"], cold["data"]["hits"]);
-            assert!(!recorded.lock().unwrap().is_empty(), "live retrieval must rebuild the answer");
+            assert!(
+                !recorded.lock().unwrap().is_empty(),
+                "live retrieval must rebuild the answer"
+            );
             assert!(fs::symlink_metadata(&path).unwrap().is_file());
             assert_eq!(fs::read(&historical).unwrap(), bytes);
             assert_eq!(sealed_inventory(reader.generation.path()), sealed);

@@ -357,6 +357,13 @@ impl PressureProfile {
         self.contract().scheduler_mode
     }
 
+    /// Whether this profile permits quality inference. Request flags cannot
+    /// raise this capability ceiling.
+    #[must_use]
+    pub(crate) const fn quality_enabled(self) -> bool {
+        self.contract().quality_enabled
+    }
+
     /// Maximum simultaneously executing model workers for this profile.
     ///
     /// This is a cooperative blocking-pool limit, not an OS thread or CPU cap.

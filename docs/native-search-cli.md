@@ -11,6 +11,79 @@ new indexing engine, runtime library, or model download service. The retrieval
 engines are native; the standard quality embedder uses ONNX Runtime. The explicit
 `hybrid-native` profile below uses the existing native transformer instead.
 
+## Search fixed-authority generations with fsfs
+
+The ordinary `fsfs search` command accepts an explicit trusted native selection
+receipt through `--authority-receipt`. It uses the same receipt validation and
+retained-generation admission as `frankensearch-native`.
+
+```sh
+fsfs search "retry timeout" \
+  --authority-receipt /absolute/path/to/native-receipts/g1.json \
+  --authority-mode lexical --format json
+
+fsfs search "retry failed network requests" \
+  --authority-receipt /absolute/path/to/native-receipts/g1.json \
+  --authority-mode full --format json
+```
+
+The receipt supplies the root, expected current authority, immutable generation,
+and independent producer identities. It must identify the current selection
+when the request opens. Advancing the authority requires a new current receipt
+for subsequent requests; a query already admitted retains its original
+generation through retrieval and source hydration.
+
+| Authority mode | Required topology and work |
+|---|---|
+| `lexical` | Any admitted topology; searches retained Quill data without loading an embedding model. |
+| `fast` | A fast primary tier; invokes only the fast provider. |
+| `quality` | A standalone quality tier or complete progressive generation; invokes only the quality provider. |
+| `full` | Complete progressive coverage; retrieves both independently bound tiers. |
+| `partial` | Explicit partial-quality topology; refines the complete fast corpus with its stored quality subset. |
+
+Without `--authority-mode`, the selected topology determines the mode:
+fast-only and partial-quality generations use fast retrieval, quality-only uses
+quality retrieval, and a full progressive generation uses both tiers. Partial
+coverage remains explicit in the result evidence and cannot satisfy a full or
+quality-only request. Use `--authority-mode` to select a tier on this route;
+the ordinary `--fast-only` and `--quality-only` aliases are refused. If a
+configuration file enables `search.fast_only`, `--no-fast-only` allows an
+explicit quality, full, or partial request to override that policy.
+
+Semantic requests use the independently configured fsfs fast and quality models.
+Each selected model must match the generation's frozen producer identity;
+matching dimensions alone are insufficient. Missing or different producers
+return an error without switching tiers. Lexical mode still admits the complete
+stored generation, but loads neither model.
+
+Native documents are identified by their retained document IDs. Result metadata
+and source hydration come from the same retained generation as the vector and
+lexical readers. The output includes the selected authority, generation and
+topology so consumers can associate results with the receipt they supplied.
+The ordinary `--limit` controls the number of returned results.
+
+Opening a retained generation has a default 256 MiB image budget; source
+hydration has a separate 16 MiB budget. `--authority-max-image-bytes` and
+`--authority-max-source-bytes` accept positive byte counts to change these
+bounds. They require `--authority-receipt`, as does `--authority-mode`.
+
+`search.quality_timeout_ms` supplies one quality budget covering model loading
+and every required query phase. Full and partial native queries admit both
+producers before Initial, so their Initial work also consumes this budget. The
+default is 500 ms; increase it in the configuration when cold quality loading
+needs more time. Expiration returns an error before any success payload.
+
+This route is for current-selection search. Native publication, updates,
+historical selection and recovery remain available through
+`frankensearch-native`. Unsupported ordinary fsfs options are refused before
+model work, including `--stream`, daemon transport, filesystem filters, query
+expansion and reranking. JSON, JSONL and TOON return the native result payload
+inside the normal fsfs envelope; table and CSV use the generic envelope
+rendering. The existing `fsfs explain` command is not a native rank-explanation
+adapter: the native fused result does not yet expose the original per-arm rank
+evidence needed by that command. The native CLI remains available for streaming,
+source scopes and retained-source reranking.
+
 ## Query exclusions
 
 Native search supports `-term`, `-"exact phrase"`, and `NOT "exact phrase"`.
