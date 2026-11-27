@@ -384,6 +384,10 @@ impl TierSource {
         }
     }
 
+    fn admitted_witness(&self) -> Option<&crate::FsviV2Witness> {
+        self.admitted_owner().map(ValidatedFsviBytes::witness)
+    }
+
     /// Share this exact admitted allocation with a retained native graph.
     fn admitted_owner_arc(&self) -> Option<&Arc<ValidatedFsviBytes>> {
         match self {
@@ -687,6 +691,31 @@ impl TwoTierIndex {
         fast_binding: &FsviV2IdentityBinding,
         quality_binding: Option<&FsviV2IdentityBinding>,
     ) -> SearchResult<Self> {
+        Self::open_admitted_v2_candidate(paths, config, fast_binding, quality_binding, None)
+    }
+
+    fn open_admitted_v2_candidate(
+        paths: &TwoTierIndexPaths,
+        config: TwoTierConfig,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+        incumbent: Option<&Self>,
+    ) -> SearchResult<Self> {
+        let current_generation = incumbent
+            .and_then(Self::fast_admitted_binding)
+            .map(FsviV2IdentityBinding::generation);
+        let next = fast_binding.generation();
+        if let Some(current) = current_generation
+            && (next.sequence < current.sequence
+                || (next.sequence == current.sequence && next != current))
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "two_tier.replace_admitted_v2.generation".to_owned(),
+                value: "conflicting-sequence".to_owned(),
+                reason: "replacement must advance the sequence or replay the installed generation"
+                    .to_owned(),
+            });
+        }
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
         let fast_source = TierSource::AdmittedV2 {
@@ -719,6 +748,29 @@ impl TwoTierIndex {
                 });
             }
         };
+        if let Some(quality) = quality_source.as_ref() {
+            fast_source.validate_pair_contract(quality, "two_tier.v2")?;
+        }
+        // Compare the retained whole-image witnesses before assembly can read
+        // or persist an ANN sidecar for a candidate that will be refused.
+        if let Some(current) = incumbent
+            && current_generation == Some(next)
+            && (current.fast_source.admitted_witness() != fast_source.admitted_witness()
+                || current
+                    .quality_source
+                    .as_ref()
+                    .and_then(TierSource::admitted_witness)
+                    != quality_source
+                        .as_ref()
+                        .and_then(TierSource::admitted_witness))
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "two_tier.replace_admitted_v2.content".to_owned(),
+                value: "same-generation".to_owned(),
+                reason: "a replay must retain the same artifact content and tier coverage"
+                    .to_owned(),
+            });
+        }
         Self::assemble_opened(fast_source, quality_source, &paths, config)
     }
 
@@ -736,9 +788,6 @@ impl TwoTierIndex {
         paths: &TwoTierIndexPaths,
         config: TwoTierConfig,
     ) -> SearchResult<Self> {
-        if let Some(quality) = quality_source.as_ref() {
-            fast_source.validate_pair_contract(quality, "two_tier.v2")?;
-        }
         let fast_index = fast_source.index();
         let mut quality_alignment = QualityAlignment::None;
 
@@ -1430,6 +1479,11 @@ impl TwoTierIndex {
     /// deleted rows require a full build. A reuse error or cancellation never
     /// triggers a rebuild and leaves both incumbent tiers installed.
     ///
+    /// Once a v2 generation is installed, a replacement may advance its
+    /// sequence or replay the identical tier artifacts. To restore previous
+    /// content, publish it at a higher sequence. Historical generations can
+    /// still be opened independently.
+    ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::open_admitted_v2_with_paths`] and of any
@@ -1442,11 +1496,12 @@ impl TwoTierIndex {
         quality_binding: Option<&FsviV2IdentityBinding>,
     ) -> SearchResult<()> {
         tier_checkpoint(cx, "two_tier.replace_admitted_v2")?;
-        let mut candidate = match Self::open_admitted_v2_with_paths(
+        let mut candidate = match Self::open_admitted_v2_candidate(
             paths,
             self.config.clone(),
             fast_binding,
             quality_binding,
+            Some(self),
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -8122,6 +8177,92 @@ mod tests {
             writer.write_record(doc_id, vector).expect("write v2 row");
         }
         writer.finish().expect("finish v2 fixture");
+    }
+
+    #[test]
+    fn admitted_v2_replacement_enforces_immutable_generation_order() {
+        let root = tempfile::tempdir().unwrap();
+        let fast_path = root.path().join("fast.fsvi");
+        let quality_path = root.path().join("quality.fsvi");
+        let fast_only = TwoTierIndexPaths::new(&fast_path);
+        let pair = fast_only.clone().with_quality_index(&quality_path);
+        let (binding, identity) = fsvi_v2_binding("replacement", 2, 7);
+        let rows: &[(&str, &[f32])] = &[("retained", &[1.0, 0.0])];
+        write_v2_tier(&fast_path, &binding, rows);
+        write_v2_tier(&quality_path, &binding, rows);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &pair,
+            TwoTierConfig::default(),
+            &binding,
+            Some(&binding),
+        )
+        .unwrap();
+        let cx = Cx::for_testing();
+        index
+            .try_replace_admitted_v2(&cx, &pair, &binding, Some(&binding))
+            .unwrap();
+        let original_fast = Arc::clone(index.fast_source.admitted_owner_arc().unwrap());
+        let original_quality = Arc::clone(
+            index
+                .quality_source
+                .as_ref()
+                .unwrap()
+                .admitted_owner_arc()
+                .unwrap(),
+        );
+
+        // These candidates are correctly encoded and individually admissible.
+        // The retained generation is what makes installing them invalid.
+        for generation in [
+            ArtifactGenerationIdentityV1::new(6, [0x4d; 16]).unwrap(),
+            ArtifactGenerationIdentityV1::new(7, [0xff; 16]).unwrap(),
+        ] {
+            let conflict =
+                FsviV2IdentityBinding::new(generation, identity.freeze().unwrap()).unwrap();
+            let path = root.path().join("conflict.fsvi");
+            write_v2_tier(&path, &conflict, rows);
+            let candidate = TwoTierIndexPaths::new(path);
+            assert!(matches!(
+                index.try_replace_admitted_v2(&cx, &candidate, &conflict, None),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "two_tier.replace_admitted_v2.generation"
+            ));
+        }
+        assert!(matches!(
+            index.try_replace_admitted_v2(&cx, &fast_only, &binding, None),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "two_tier.replace_admitted_v2.content"
+        ));
+        for path in [&quality_path, &fast_path] {
+            // Keep IDs, dimensions, identity, count and generation identical.
+            let original_bytes = fs::read(path).unwrap();
+            write_v2_tier(path, &binding, &[("retained", &[0.0, 1.0])]);
+            assert!(matches!(
+                index.try_replace_admitted_v2(&cx, &pair, &binding, Some(&binding)),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "two_tier.replace_admitted_v2.content"
+            ));
+            fs::write(path, original_bytes).unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            index.fast_source.admitted_owner_arc().unwrap(),
+            &original_fast
+        ));
+        assert!(Arc::ptr_eq(
+            index
+                .quality_source
+                .as_ref()
+                .unwrap()
+                .admitted_owner_arc()
+                .unwrap(),
+            &original_quality,
+        ));
+
+        // A deliberate higher-sequence restoration can change tier topology.
+        let (successor, _) = fsvi_v2_binding("replacement", 2, 8);
+        write_v2_tier(&fast_path, &successor, rows);
+        index
+            .try_replace_admitted_v2(&cx, &fast_only, &successor, None)
+            .unwrap();
+        assert_eq!(index.fast_admitted_binding(), Some(&successor));
+        assert!(index.quality_admitted_owner().is_none());
     }
 
     #[test]
