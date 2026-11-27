@@ -457,7 +457,7 @@ impl CompleteGenerationStore {
                 {
                     return Ok(current.clone());
                 }
-                store.open_retained(cx, id, digest)
+                store.open_retained_from(cx, id, digest, Some(directory))
             },
         )
     }
@@ -1285,6 +1285,23 @@ fn open_existing_pin_read_only(root: &Path, id: &str) -> std::io::Result<File> {
         .custom_flags(pin_open_flags()?)
         .open(directory.join(pin_name(id)))?;
     require_regular_pin(file)
+}
+
+/// Keep the reader lock on the same store whose selection was sampled, even
+/// when another copy with identical bundle bytes temporarily occupies its path.
+#[cfg(unix)]
+fn open_existing_pin_at(root: &File, id: &str) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let directory = openat(root, READER_PINS, flags | OFlags::DIRECTORY, Mode::empty())?;
+    let pin = openat(
+        directory,
+        pin_name(id),
+        flags | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    require_regular_pin(File::from(pin))
 }
 
 /// The pin file handle a reader or collector locks: read-write (creating it)
@@ -2144,6 +2161,58 @@ fn invalid(path: &Path, detail: &str) -> SearchError {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+
+    #[test]
+    fn live_admission_pins_the_original_store_during_path_replacement() {
+        run_test_with_cx(|cx| async move {
+            let workspace = tempfile::tempdir().unwrap();
+            let root = workspace.path().join("store");
+            let relocated = workspace.path().join("original");
+            let copy = workspace.path().join("copy");
+            let store = CompleteGenerationStore::create(&cx, &root).unwrap();
+            let id = publish(&store, &cx, "first").id().to_owned();
+            let held = File::open(&root).unwrap();
+            let live = CompleteGenerationStore::open_with_profile(
+                &cx,
+                &root,
+                GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+            )
+            .unwrap();
+
+            // Give the replacement identical bundle bytes and an independent
+            // pin inode. Digest verification alone cannot tell them apart.
+            fs::rename(&root, &relocated).unwrap();
+            let bundle = root.join(GENERATIONS).join(&id);
+            fs::create_dir_all(&bundle).unwrap();
+            write_bundle(&bundle, "first");
+            fs::copy(
+                relocated
+                    .join(GENERATIONS)
+                    .join(&id)
+                    .join(COMPLETE_GENERATION_MANIFEST),
+                bundle.join(COMPLETE_GENERATION_MANIFEST),
+            )
+            .unwrap();
+            drop(open_pin_file(&root, &id).unwrap());
+            let reader = live
+                .active_for_live_reader(&cx, &held, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.id(), id);
+            assert!(exclusive_pin(&root, &id).unwrap().is_some());
+
+            fs::rename(&root, &copy).unwrap();
+            fs::rename(&relocated, &root).unwrap();
+            drop(publish(&store, &cx, "successor"));
+            assert!(store.collect_retained(&cx, 0).unwrap().removed.is_empty());
+            assert_eq!(
+                fs::read(reader.path().join("content.txt")).unwrap(),
+                b"first"
+            );
+            drop(reader);
+            assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [id]);
+        });
+    }
 
     #[test]
     fn active_retries_when_publication_and_collection_win_before_the_pin() {

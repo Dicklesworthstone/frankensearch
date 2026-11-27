@@ -256,6 +256,16 @@ impl CompleteGenerationStore {
         id: &str,
         manifest_sha256: &str,
     ) -> SearchResult<PublishedGeneration> {
+        self.open_retained_from(cx, id, manifest_sha256, None)
+    }
+
+    pub(super) fn open_retained_from(
+        &self,
+        cx: &Cx,
+        id: &str,
+        manifest_sha256: &str,
+        root_directory: Option<&File>,
+    ) -> SearchResult<PublishedGeneration> {
         checkpoint(cx)?;
         self.require_profile_admissible()?;
         // Bound untrusted strings before constructing either a path or pointer.
@@ -274,7 +284,7 @@ impl CompleteGenerationStore {
         // Pin before admission: a retention pass that already removed this
         // generation leaves nothing to admit, and one that has not yet can no
         // longer remove it.
-        let pin = self.pin_retained_reader(id)?;
+        let pin = self.pin_retained_reader(id, root_directory)?;
         let bytes =
             read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
         if digest(&bytes) != manifest_sha256 {
@@ -306,14 +316,23 @@ impl CompleteGenerationStore {
         })
     }
 
-    fn pin_retained_reader(&self, id: &str) -> SearchResult<Option<Arc<super::GenerationPin>>> {
+    fn pin_retained_reader(
+        &self,
+        id: &str,
+        root_directory: Option<&File>,
+    ) -> SearchResult<Option<Arc<super::GenerationPin>>> {
+        #[cfg(not(unix))]
+        let _ = root_directory;
         #[cfg(unix)]
         if self.security_profile()
             == frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored
         {
             // The profile applies even to a store this user owns. Opening with
             // create before falling back to read-only would mutate older stores.
-            let file = super::open_existing_pin_read_only(&self.root, id)?;
+            let file = match root_directory {
+                Some(directory) => super::open_existing_pin_at(directory, id)?,
+                None => super::open_existing_pin_read_only(&self.root, id)?,
+            };
             rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
                 .map_err(io::Error::from)?;
             return Ok(Some(Arc::new(super::GenerationPin { _file: file })));
