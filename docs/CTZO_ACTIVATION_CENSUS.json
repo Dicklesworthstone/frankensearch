@@ -54,6 +54,24 @@
     },
     {
       "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "symbol": "async fn run_phase1",
+      "kind": "async-fast-retrieval",
+      "consumes": ["TieredQueryEmbeddings", "ActivatedTierSearch"],
+      "slice": "4a (C1)",
+      "note": "The single fast activation admits the actual response and serves native or explicitly requested full-width retrieval."
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "symbol": "async fn reconcile_refinement_vectors",
+      "kind": "async-fast-refill",
+      "consumes": ["BoundQueryEmbedding", "ActivatedTierSearch"],
+      "slice": "4a (C1)",
+      "note": "A fast refill after revocation uses the original bound query and the same activated retrieval policy as Phase 1."
+    },
+    {
+      "crate": "frankensearch-fusion",
       "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
       "symbol": "fn admit_tier_query",
       "kind": "pre-read-identity-admission",
@@ -79,8 +97,8 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": "activate_owner_backed_search",
-      "count": 6,
-      "note": "run_phase1 admits the fast response and activates its retained retrieval. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation. 5ba13f72 kept filtered reconciliation and coverage inside the final quality activation, removing the separate replay constructor. eea0715d adds a fast-only activation in reconcile_refinement_vectors when metadata revokes a candidate and Phase 1 used the native fast owner. The refill uses the original bound query and explicit scan parameters."
+      "count": 5,
+      "note": "run_phase1 reuses the activation that admitted the fast response. reconcile_refinement_vectors activates the original fast query for native or explicit exact refills. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",

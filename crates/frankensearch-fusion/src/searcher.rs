@@ -1058,11 +1058,10 @@ impl TwoTierSearcher {
 
     /// Override brute-force vector-search parallelism parameters for every tier.
     ///
-    /// An explicit override selects exact owner-backed scanning instead of an
-    /// opted-in native graph, including quality refinement and exclusion
-    /// refills; the actual bound query is still admitted. Coverage uses the
-    /// same retrieval policy as the candidates it describes.
-    /// Legacy ANN dispatch retains its existing parameter behavior.
+    /// An explicit override selects full-width exact scans for activated v2
+    /// owners, including refinement and exclusion refills. Coverage uses the
+    /// same retrieval policy as the candidates it describes. Legacy retrieval
+    /// follows the index's ANN and dimension-truncation precedence.
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
@@ -3335,17 +3334,21 @@ impl TwoTierSearcher {
             Err(error) if terminal_query_embedding_error(&error) => return Err(error),
             result => result,
         };
-        let native_embeddings = match &fast_embed_result {
+        let owner_embeddings = match &fast_embed_result {
             Ok((values, Some(identity))) if self.index.fast_admitted_binding().is_some() => {
                 let bound = BoundQueryEmbedding::new(values.clone(), identity.clone())?;
-                let embeddings = TieredQueryEmbeddings::fast_only(bound);
-                // Exact and native retrieval both admit the actual response
-                // before touching retained vector bytes or invoking filters.
-                self.index.activate_owner_backed_search(cx, &embeddings)?;
-                cancellation_checkpoint(cx, "fast_activation_to_search")?;
-                self.index.has_native_fast_hnsw().then_some(embeddings)
+                Some(TieredQueryEmbeddings::fast_only(bound))
             }
             _ => None,
+        };
+        // Admit the actual response before touching retained vector bytes or
+        // invoking filters. Reuse the activation when it owns retrieval.
+        let owner_activation = if let Some(embeddings) = owner_embeddings.as_ref() {
+            let activated = self.index.activate_owner_backed_search(cx, embeddings)?;
+            cancellation_checkpoint(cx, "fast_activation_to_search")?;
+            Some(activated)
+        } else {
+            None
         };
 
         // Exclusions must fill an eligible candidate budget, not just remove
@@ -3491,12 +3494,11 @@ impl TwoTierSearcher {
                 // check before any backend can manufacture tied zero scores.
                 let search_start = Instant::now();
                 let zero_fast_query = query_vec.iter().all(|&value| value == 0.0);
-                let activated_fast = native_embeddings
+                let activated_fast = owner_activation
                     .as_ref()
-                    .map(|embeddings| self.index.activate_owner_backed_search(cx, embeddings))
-                    .transpose()?;
+                    .filter(|_| self.uses_activated_fast_retrieval());
                 let retrieve_fast = |limit| -> SearchResult<_> {
-                    let classified = activated_fast.as_ref().map_or_else(
+                    let classified = activated_fast.map_or_else(
                         || {
                             self.index.search_fast_classified_with_params(
                                 &query_vec,
@@ -3674,7 +3676,7 @@ impl TwoTierSearcher {
                 // eligible pool only after those observations are reconciled.
                 if self.search_params.is_none()
                     && index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
-                    && let Some(activated) = activated_fast.as_ref()
+                    && let Some(activated) = activated_fast
                 {
                     let coverage_start = Instant::now();
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
@@ -3966,13 +3968,10 @@ impl TwoTierSearcher {
                         "semantic",
                         &mut fast_revoked,
                         |limit| {
-                            // Mirror Phase 1's policy: only its native owner
-                            // branch activates native retrieval. Exact, legacy
-                            // ANN, dimension truncation and explicit scan
-                            // parameters keep the original dispatch.
+                            // A refill uses the same backend as the initial
+                            // retrieval that produced the retained fast pool.
                             let classified = if let Some(evidence) = pools.fast_evidence.as_ref()
-                                && self.index.fast_admitted_binding().is_some()
-                                && self.index.has_native_fast_hnsw()
+                                && self.uses_activated_fast_retrieval()
                             {
                                 let embeddings =
                                     TieredQueryEmbeddings::fast_only(evidence.query.clone());
@@ -5188,6 +5187,13 @@ impl TwoTierSearcher {
         if let Some(exporter) = self.config.metrics_exporter.as_ref() {
             exporter.on_error(error);
         }
+    }
+
+    /// An owner without a native graph or exact override uses the configured
+    /// fast candidate generator.
+    fn uses_activated_fast_retrieval(&self) -> bool {
+        self.index.fast_admitted_binding().is_some()
+            && (self.search_params.is_some() || self.index.has_native_fast_hnsw())
     }
 
     /// Whether quality refinement should run.
@@ -13643,6 +13649,131 @@ mod tests {
                     assert_eq!(metrics.coverage.is_some(), !exact_override);
                 }
                 assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
+            }
+        });
+    }
+
+    fn fast_override_owner_index(
+        fast_rows: &[(&str, &[f32])],
+        quality_rows: &[(&str, &[f32])],
+    ) -> (OwnerBackedDir, Arc<TwoTierIndex>, TwoTierConfig) {
+        let dir = owner_backed_dir("fast-exact-override");
+        let fast_path = dir.join("vector.fast.idx");
+        let quality_path = dir.join("vector.quality.idx");
+        let fast_binding = artifact_binding("response-fast", 4, 95);
+        let quality_binding = artifact_binding("response-quality", 6, 95);
+        write_v2_tier(&fast_path, &fast_binding, fast_rows);
+        write_v2_tier(&quality_path, &quality_binding, quality_rows);
+        let config = TwoTierConfig {
+            candidate_multiplier: 1,
+            mrl_search_dims: 1,
+            mrl_rescore_top_k: 1,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &frankensearch_index::TwoTierIndexPaths::new(&fast_path)
+                .with_quality_index(&quality_path),
+            config.clone(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .unwrap();
+        (dir, Arc::new(index), config)
+    }
+
+    #[test]
+    fn fast_owner_exact_override_selects_full_width_winner_without_graph() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index, config) = fast_override_owner_index(
+                &[
+                    ("prefix-winner", &[1.0, 0.0, 0.0, 0.0]),
+                    ("exact-winner", &[0.0, 1.0, 0.0, 0.0]),
+                ],
+                &[("exact-winner", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0])],
+            );
+            assert!(!index.has_native_fast_hnsw());
+            let mut fast = query_admission_embedder("fast");
+            fast.vector = vec![0.25, 1.0, 0.0, 0.0];
+            let fast = Arc::new(fast);
+            for (exact_override, expected) in [(false, "prefix-winner"), (true, "exact-winner")] {
+                let mut searcher =
+                    TwoTierSearcher::new(index.clone(), fast.clone(), config.clone());
+                if exact_override {
+                    searcher = searcher.with_search_params(SearchParams::default());
+                }
+                let (results, _) = searcher.search_collect(&cx, "needle", 1).await.unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(
+                    results[0].doc_id, expected,
+                    "exact override {exact_override}"
+                );
+                assert!(results[0].fast_score.is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn fast_owner_exact_override_selects_full_width_refill_after_revocation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index, config) = fast_override_owner_index(
+                &[
+                    ("initial-a", &[1.0, 1.0, 0.0, 0.0]),
+                    ("prefix-tail", &[0.9, 0.0, 0.0, 0.0]),
+                    ("exact-tail", &[0.0, 0.9, 0.0, 0.0]),
+                ],
+                &[("initial-a", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0])],
+            );
+            let filter = AsyncTestFilter(|_: &str, metadata: Option<&serde_json::Value>| {
+                metadata.is_none_or(|value| value["allowed"] == true)
+            });
+            for (exact_override, expected) in [(false, "prefix-tail"), (true, "exact-tail")] {
+                let mut fast = query_admission_embedder("fast");
+                fast.vector = vec![0.25, 1.0, 0.0, 0.0];
+                let fast = Arc::new(fast);
+                let lexical = Arc::new(AsyncLateFastMetadata {
+                    revoke_initial: true,
+                    cancel_fast_tail: false,
+                    lookups: AtomicU64::new(0),
+                });
+                let mut searcher =
+                    TwoTierSearcher::new(index.clone(), fast.clone(), config.clone())
+                        .with_lexical(lexical.clone())
+                        .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                if exact_override {
+                    searcher = searcher.with_search_params(SearchParams::default());
+                }
+                let mut phases = Vec::new();
+                searcher
+                    .search_with_filter(
+                        &cx,
+                        "needle",
+                        1,
+                        Some(&filter),
+                        |_| None,
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .unwrap();
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                    SearchPhase::Refined {
+                        results: refined, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("expected Initial and Refined: {phases:?}");
+                };
+                assert_eq!(initial[0].doc_id, "initial-a");
+                assert_eq!(
+                    refined[0].doc_id, expected,
+                    "exact override {exact_override}"
+                );
+                assert_eq!(refined[0].metadata.as_deref().unwrap()["allowed"], true);
+                assert!(refined[0].fast_score.is_some());
+                assert_eq!(fast.embed_count(), 1, "refill reuses the bound fast query");
+                assert!(lexical.lookups.load(Ordering::Relaxed) >= 3);
             }
         });
     }
