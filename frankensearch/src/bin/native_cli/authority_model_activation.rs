@@ -236,8 +236,8 @@ impl AuthoritySession {
         };
         let selected = Receipt::read(&request.receipt);
         checkpoint(cx)?;
-        let selected =
-            selected.map_err(|error| bounded_error(error, "model_activation_invalid_receipt"))?;
+        let selected = selected
+            .map_err(|error| bounded_error(error.into(), "model_activation_invalid_receipt"))?;
         if selected.root != self.receipt.root
             || selected.root_id != self.receipt.root_id
             || selected.profile != self.receipt.profile
@@ -303,9 +303,10 @@ impl AuthoritySession {
         // its pathname now names a copied root or no longer exists.
         let snapshot = selected.open_on_root(cx, &self.root, self.max_image_bytes);
         checkpoint(cx)?;
-        let snapshot = Arc::new(
-            snapshot.map_err(|error| bounded_error(error, "model_activation_admission_failed"))?,
-        );
+        let snapshot =
+            Arc::new(snapshot.map_err(|error| {
+                bounded_error(error.into(), "model_activation_admission_failed")
+            })?);
         if restores_rollback {
             let action = match snapshot.retained_snapshot().manifest() {
                 ActivationManifest::V1(manifest) => manifest.action,
@@ -503,8 +504,8 @@ impl AuthoritySession {
         // keeping the originally admitted immutable reader and scope together.
         let current = selected.open_on_root(cx, &self.root, self.max_image_bytes);
         checkpoint(cx)?;
-        let current =
-            current.map_err(|error| bounded_error(error, "model_activation_head_changed"))?;
+        let current = current
+            .map_err(|error| bounded_error(error.into(), "model_activation_head_changed"))?;
         if current.retained_snapshot().authority_pair()
             != snapshot.retained_snapshot().authority_pair()
         {

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,14 +21,17 @@ use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
 use frankensearch::native_ann::{
+    NativeGenerationReceipt as Receipt, NativeGenerationSavedAttempt as SavedAttempt,
     NativeGenerationSnapshot, NativeGenerationTopology, NativeSearchPhase,
 };
 use frankensearch::{
     Cx, Embedder, GenerationActivationV1, GenerationCandidateV1, GenerationPublisherV1,
     IndexableDocument, ScoredResult, SearchError,
 };
+#[cfg(test)]
+use frankensearch_core::generation::AuthoritySlotV1;
 use frankensearch_core::generation::{
-    ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
+    ArtifactGenerationIdentityV1, AuthorityRefV1, CommitRange, EmbedderTierTag,
     FrozenEmbeddingIdentityBundleV1, GenerationAuthorityActionV1, GenerationRootSecurityProfileV1,
     QuantizationFormat,
 };
@@ -46,8 +49,7 @@ use frankensearch_index::generation_root::{
 };
 use frankensearch_index::native_hnsw::HnswParams;
 use frankensearch_index::vector_cohort::VectorCohortCoverage;
-use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -57,7 +59,7 @@ use super::{
     update as mutations, validate_query, value,
 };
 
-const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
+const RECEIPT_SCHEMA: &str = Receipt::EXACT_SCHEMA;
 
 #[path = "authority_model_activation.rs"]
 mod model_activation;
@@ -74,13 +76,14 @@ mod repair;
 #[path = "authority_query.rs"]
 mod query_controls;
 
-const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
-const PARTIAL_QUALITY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v4";
-const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
+const PROGRESSIVE_RECEIPT_SCHEMA: &str = Receipt::PROGRESSIVE_SCHEMA;
+const PARTIAL_QUALITY_RECEIPT_SCHEMA: &str = Receipt::PARTIAL_QUALITY_SCHEMA;
+#[cfg(test)]
+const SELECTION_ONLY_RECEIPT_SCHEMA: &str = Receipt::SELECTION_ONLY_SCHEMA;
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_AUTHORITY_MUTATIONS: usize = 1_000;
-const MAX_HISTORY_HOPS: u64 = 1_024;
-const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
+const MAX_HISTORY_HOPS: u64 = Receipt::MAX_HISTORY_HOPS;
+const PROFILE: GenerationRootSecurityProfileV1 = Receipt::PROFILE;
 const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or partial topology)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
       --tier fast|quality|full|partial --source-low N --source-high N --cooperative-local\n\
@@ -1188,229 +1191,13 @@ fn annotate_snapshot_retrieval(
     }
 }
 
-/// Inputs recorded before publication, never an assertion about its outcome.
-/// Root and candidate are pinned by the enclosing selection receipt. The
-/// original physical slot pair is preserved in full for aborted-attempt proof.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SavedAttempt {
-    writer_id: [u8; 16],
-    attempt_id: [u8; 16],
-    expected_first: Option<Vec<u8>>,
-    expected_second: Option<Vec<u8>>,
-    idempotency_key: [u8; 16],
-    requires_floor: bool,
+// Query modes are a CLI policy; receipt validation and retained admission are
+// shared with facade consumers such as fsfs.
+trait ReceiptQueryMode {
+    fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode>;
 }
 
-impl SavedAttempt {
-    fn from_permit(permit: &AttemptPermitV1, requires_floor: bool) -> Self {
-        Self {
-            writer_id: permit.writer_id,
-            attempt_id: permit.attempt_id,
-            expected_first: permit
-                .expected
-                .first
-                .map(|slot| slot.authority.canonical_bytes().to_vec()),
-            expected_second: permit
-                .expected
-                .second
-                .map(|slot| slot.authority.canonical_bytes().to_vec()),
-            idempotency_key: permit.idempotency_key,
-            requires_floor,
-        }
-    }
-
-    fn restore(&self, root_id: [u8; 16], candidate: AuthorityRefV1) -> Result<AttemptPermitV1> {
-        let decode = |bytes: &Option<Vec<u8>>, index| -> Result<Option<AuthoritySlotV1>> {
-            bytes
-                .as_ref()
-                .map(|bytes| {
-                    let authority = AuthorityRefV1::from_canonical_bytes(bytes)?;
-                    AuthoritySlotV1::new(index, root_id, authority).map_err(Into::into)
-                })
-                .transpose()
-        };
-        AttemptPermitV1::new(
-            root_id,
-            self.writer_id,
-            self.attempt_id,
-            candidate,
-            ExpectedAuthorityPairV1 {
-                first: decode(&self.expected_first, 0)?,
-                second: decode(&self.expected_second, 1)?,
-            },
-            self.idempotency_key,
-        )
-        .map_err(Into::into)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Receipt {
-    schema: String,
-    root: PathBuf,
-    root_id: [u8; 16],
-    profile: String,
-    authority: Vec<u8>,
-    generation: ArtifactGenerationIdentityV1,
-    identity: FrozenEmbeddingIdentityBundleV1,
-    tier: EmbedderTierTag,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quality_identity: Option<FrozenEmbeddingIdentityBundleV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quality_documents: Option<u64>,
-    documents: u64,
-    image_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attempt: Option<SavedAttempt>,
-}
-
-impl Receipt {
-    fn read(path: &Path) -> Result<Self> {
-        if !fs::symlink_metadata(path)?.is_file() {
-            return Err(bad(
-                "the authority receipt must be a regular non-symlink file",
-            ));
-        }
-        let mut bytes = Vec::new();
-        File::open(path)?
-            .take(MAX_RECEIPT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_RECEIPT_BYTES {
-            return Err(bad("authority receipt exceeds 64 KiB"));
-        }
-        let receipt: Self = serde_json::from_slice(&bytes)
-            .map_err(|_| bad("invalid authority selection receipt"))?;
-        receipt.validate()?;
-        Ok(receipt)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if !self.root.is_absolute()
-            || self.root_id == [0; 16]
-            || self.profile != PROFILE.as_str()
-            || self.documents > MAX_DOCUMENTS as u64
-            || self.image_bytes == 0
-        {
-            return Err(bad("invalid authority receipt contract"));
-        }
-        let authority = self.authority()?;
-        match (
-            self.schema.as_str(),
-            self.attempt.as_ref(),
-            self.quality_identity.as_ref(),
-        ) {
-            (RECEIPT_SCHEMA, Some(attempt), None)
-            | (
-                PROGRESSIVE_RECEIPT_SCHEMA | PARTIAL_QUALITY_RECEIPT_SCHEMA,
-                Some(attempt),
-                Some(_),
-            ) => {
-                // This CLI never supplies an external floor. A saved attempt
-                // requiring one cannot be downgraded during a process restart.
-                if attempt.requires_floor {
-                    return Err(bad(
-                        "the recorded attempt requires an unavailable anti-rollback floor",
-                    ));
-                }
-                attempt.restore(self.root_id, authority)?;
-            }
-            (SELECTION_ONLY_RECEIPT_SCHEMA, None, None) => {}
-            _ => {
-                return Err(bad(
-                    "authority receipt schema and prepared attempt disagree",
-                ));
-            }
-        }
-        match (self.schema.as_str(), self.quality_documents) {
-            (PARTIAL_QUALITY_RECEIPT_SCHEMA, Some(count))
-                if count > 0 && count < self.documents => {}
-            (PARTIAL_QUALITY_RECEIPT_SCHEMA, _) | (_, Some(_)) => {
-                return Err(bad(
-                    "partial quality receipt requires a nonempty proper quality subset",
-                ));
-            }
-            _ => {}
-        }
-        if self.quality_identity.is_some() && self.tier != EmbedderTierTag::Fast {
-            return Err(bad(
-                "a full authority receipt must bind fast and quality independently",
-            ));
-        }
-        if self.image_bytes < authority.manifest_len {
-            return Err(bad("authority receipt image length is inconsistent"));
-        }
-        self.binding()?;
-        self.quality_binding()?;
-        Ok(())
-    }
-
-    fn recovery_attempt(&self) -> Result<AttemptPermitV1> {
-        self.validate()?;
-        self.attempt
-            .as_ref()
-            .ok_or_else(|| bad("this selection-only receipt has no durable publication attempt"))?
-            .restore(self.root_id, self.authority()?)
-    }
-
-    fn authority(&self) -> Result<AuthorityRefV1> {
-        AuthorityRefV1::from_canonical_bytes(&self.authority).map_err(Into::into)
-    }
-
-    fn binding(&self) -> Result<FsviV2IdentityBinding> {
-        FsviV2IdentityBinding::new(self.generation, self.identity.clone()).map_err(Into::into)
-    }
-
-    fn quality_binding(&self) -> Result<Option<FsviV2IdentityBinding>> {
-        self.quality_identity
-            .as_ref()
-            .map(|identity| {
-                FsviV2IdentityBinding::new(self.generation, identity.clone()).map_err(Into::into)
-            })
-            .transpose()
-    }
-
-    fn topology(&self) -> NativeGenerationTopology {
-        self.quality_documents.map_or_else(
-            || {
-                if self.quality_identity.is_some() {
-                    NativeGenerationTopology::FullProgressive
-                } else if self.tier == EmbedderTierTag::Quality {
-                    NativeGenerationTopology::QualityOnly
-                } else {
-                    NativeGenerationTopology::FastOnly
-                }
-            },
-            |quality_documents| NativeGenerationTopology::PartialQuality {
-                quality_documents,
-                total_documents: self.documents,
-                coverage_ppm: u32::try_from(
-                    quality_documents.saturating_mul(1_000_000) / self.documents.max(1),
-                )
-                .unwrap_or(u32::MAX),
-            },
-        )
-    }
-
-    fn topology_name(&self) -> &'static str {
-        match self.topology() {
-            NativeGenerationTopology::FastOnly => "fast_only",
-            NativeGenerationTopology::QualityOnly => "quality_only",
-            NativeGenerationTopology::FullProgressive => "full_progressive",
-            NativeGenerationTopology::PartialQuality { .. } => "partial_quality",
-        }
-    }
-
-    // Coverage counts belong to an individual admitted generation. Selection
-    // transitions preserve the tier shape while allowing an authenticated
-    // predecessor/successor to have a different number of live documents.
-    fn same_topology(&self, other: &Self) -> bool {
-        self.tier == other.tier
-            && self.quality_identity.is_some() == other.quality_identity.is_some()
-            && self.quality_documents.is_some() == other.quality_documents.is_some()
-    }
-
+impl ReceiptQueryMode for Receipt {
     fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode> {
         let default = match self.topology() {
             NativeGenerationTopology::FastOnly => QueryMode::Fast,
@@ -1436,145 +1223,37 @@ impl Receipt {
             Err(serve_refused("query_tier_unavailable"))
         }
     }
-
-    fn open(&self, cx: &Cx, max_image_bytes: usize) -> Result<NativeGenerationSnapshot> {
-        self.validate()?;
-        checkpoint(cx)?;
-        let root = admit_root(&self.root)?;
-        self.open_on_root(cx, &root, max_image_bytes)
-    }
-
-    // Rebuild uses the same qualified capability for selection and publication.
-    // Reopening the root path between those steps could admit a different root
-    // inode containing a copied authority pair.
-    fn open_on_root(
-        &self,
-        cx: &Cx,
-        root: &QualifiedGenerationRoot,
-        max_image_bytes: usize,
-    ) -> Result<NativeGenerationSnapshot> {
-        self.validate()?;
-        checkpoint(cx)?;
-        let budget = u64::try_from(max_image_bytes)?.min(self.image_bytes);
-        let opened = root.open_expected_generation_snapshot_with_budget(
-            self.root_id,
-            PROFILE,
-            None,
-            self.authority()?,
-            budget,
-        )?;
-        checkpoint(cx)?;
-        let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
-            if matches!(opened, SnapshotOpenOutcomeV1::Refused(
-                frankensearch_index::generation_root::generation_reader::SnapshotRefusalV1::ExpectedCurrentChanged
-            )) {
-                return Err(bad("the fixed authority head differs from the trusted receipt"));
-            }
-            return Err(bad(&format!(
-                "authority snapshot admission refused: {opened:?}"
-            )));
-        };
-        self.admit_opened(cx, opened, usize::try_from(budget)?)
-    }
-
-    fn admit_opened(
-        &self,
-        cx: &Cx,
-        opened: Arc<
-            frankensearch_index::generation_root::generation_reader::OpenedGenerationSnapshotV1,
-        >,
-        max_image_bytes: usize,
-    ) -> Result<NativeGenerationSnapshot> {
-        if opened.root_id() != self.root_id || opened.head().authority != self.authority()? {
-            return Err(bad(
-                "the fixed authority head differs from the trusted receipt",
-            ));
-        }
-        let snapshot = if let Some(quality) = self.quality_binding()? {
-            let admit = if self.quality_documents.is_some() {
-                NativeGenerationSnapshot::admit_partial_quality
-            } else {
-                NativeGenerationSnapshot::admit_progressive
-            };
-            admit(
-                cx,
-                opened,
-                &self.binding()?,
-                &quality,
-                DEFAULT_SCHEMA,
-                QuillConfig::default(),
-                max_image_bytes,
-            )?
-        } else {
-            NativeGenerationSnapshot::admit_exact(
-                cx,
-                opened,
-                &self.binding()?,
-                DEFAULT_SCHEMA,
-                QuillConfig::default(),
-                max_image_bytes,
-            )?
-        };
-        if snapshot.topology() != self.topology()
-            || snapshot.metadata().total_documents != self.documents
-        {
-            return Err(bad(
-                "the retained generation differs from the selected tier or document count",
-            ));
-        }
-        Ok(snapshot)
-    }
 }
 
-/// Admit one explicit read selection through a single qualified physical root.
-/// A historical target is authorized by the complete current closure, fixed
-/// authority pair and exact manifest ancestry, never by an old receipt alone.
+/// Preserve the executable's stable history-refusal protocol while delegating
+/// the entire trusted selection and snapshot admission to the shared facade.
 fn open_read_selection(
     cx: &Cx,
     receipt: &Receipt,
     current_receipt: Option<&Path>,
     max_image_bytes: usize,
 ) -> Result<(QualifiedGenerationRoot, Arc<NativeGenerationSnapshot>)> {
-    checkpoint(cx)?;
-    receipt.validate()?;
-    let current = current_receipt.map(Receipt::read).transpose()?;
-    if let Some(current) = &current {
-        if current.root != receipt.root
-            || current.root_id != receipt.root_id
-            || current.profile != receipt.profile
-        {
-            return Err(serve_refused("historical_root_mismatch"));
-        }
-        if current.authority()? == receipt.authority()? {
-            return Err(serve_refused("historical_target_is_current"));
-        }
-    }
-    let root = admit_root(&receipt.root)?;
-    let Some(current) = current else {
-        let snapshot = receipt.open_on_root(cx, &root, max_image_bytes)?;
-        return Ok((root, Arc::new(snapshot)));
-    };
-    // Current and target are simultaneously retained during admission. Charge
-    // actual authenticated image lengths, not the receipt's upper bound, and
-    // count shared images in each independently admitted closure.
-    let current = current.open_on_root(cx, &root, max_image_bytes)?;
-    let retained = current.retained_snapshot();
-    let remaining = history_image_budget(&current, max_image_bytes)?;
-    let target_budget = remaining.min(receipt.image_bytes);
-    checkpoint(cx)?;
-    let opened = root.open_historical_generation_snapshot_with_budget(
-        retained,
-        receipt.authority()?,
-        MAX_HISTORY_HOPS,
-        remaining,
-    )?;
-    checkpoint(cx)?;
-    let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
-        return Err(serve_refused("historical_target_unavailable"));
-    };
-    let snapshot = receipt.admit_opened(cx, opened, usize::try_from(target_budget)?)?;
-    checkpoint(cx)?;
-    Ok((root, Arc::new(snapshot)))
+    receipt
+        .open_read_selection(cx, current_receipt, max_image_bytes)
+        .map_err(|error| {
+            if let SearchError::InvalidConfig { field, value, .. } = &error {
+                if field == "native_ann.receipt.selection" {
+                    let code = match value.as_str() {
+                        "historical_root_mismatch" => Some("historical_root_mismatch"),
+                        "historical_target_is_current" => Some("historical_target_is_current"),
+                        "historical_image_budget_exceeded" => {
+                            Some("historical_image_budget_exceeded")
+                        }
+                        "historical_target_unavailable" => Some("historical_target_unavailable"),
+                        _ => None,
+                    };
+                    if let Some(code) = code {
+                        return serve_refused(code);
+                    }
+                }
+            }
+            Box::new(error) as Box<dyn Error + Send + Sync>
+        })
 }
 
 fn history_image_budget(current: &NativeGenerationSnapshot, max_image_bytes: usize) -> Result<u64> {
@@ -4710,11 +4389,8 @@ impl AuthoritySession {
             .receipt
             .open_on_root(cx, &self.root, self.max_image_bytes)
             .map_err(|error| {
-                if error
-                    .downcast_ref::<SearchError>()
-                    .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
-                {
-                    error
+                if matches!(error, SearchError::Cancelled { .. }) {
+                    Box::new(error) as Box<dyn Error + Send + Sync>
                 } else {
                     serve_refused("update_base_not_current")
                 }

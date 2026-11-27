@@ -42,6 +42,8 @@ mod generation;
 mod hybrid;
 #[cfg(feature = "quill")]
 mod quill;
+#[cfg(feature = "quill")]
+mod receipt;
 mod shards;
 
 #[cfg(test)]
@@ -54,6 +56,8 @@ pub use generation::{
 };
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;
+#[cfg(feature = "quill")]
+pub use receipt::{NativeGenerationReceipt, NativeGenerationSavedAttempt};
 
 use fallback::NativeBackend;
 pub use fallback::{NativeExactReason, NativeRetrievalMode};

@@ -453,7 +453,7 @@ impl AuthoritySession {
             .receipt
             .open_on_root(cx, &self.root, self.max_image_bytes)
             .map_err(|error| {
-                model_activation::bounded_error(error, "quality_completion_base_not_current")
+                model_activation::bounded_error(error.into(), "quality_completion_base_not_current")
             })?;
         if current.retained_snapshot().authority_pair()
             != self.snapshot.retained_snapshot().authority_pair()
@@ -557,7 +557,9 @@ impl AuthoritySession {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, MAX_DOCUMENTS, NativeBuildRetrieval, is_command};
+    use super::super::{
+        Command, MAX_DOCUMENTS, NativeBuildRetrieval, ReceiptQueryMode, is_command,
+    };
     use super::*;
 
     fn arguments() -> Vec<String> {

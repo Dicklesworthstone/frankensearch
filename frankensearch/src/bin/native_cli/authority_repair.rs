@@ -22,11 +22,11 @@ use super::{
     Arc, BlockingPoolHandle, Cx, Embedder, EmbedderTierTag, FrozenEmbeddingIdentityBundleV1,
     FsviV2IdentityBinding, GenerationAuthorityActionV1, MAX_RECORD_BYTES, Models,
     NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder, Options, PROFILE,
-    PreparedPublication, PublicationOptions, QualifiedGenerationRoot, QueryMode, Receipt, Result,
-    SCHEMA, Write, WriterIdentityV1, admit_root, annotate_retrieval, bad, checkpoint, emit,
-    execution_context, load_authority_models, new_generation, new_path, publication_error,
-    rebuild_identity, rebuild_precision, separate_destinations, stage_prepared_and_publish,
-    validate_retained_documents,
+    PreparedPublication, PublicationOptions, QualifiedGenerationRoot, QueryMode, Receipt,
+    ReceiptQueryMode, Result, SCHEMA, Write, WriterIdentityV1, admit_root, annotate_retrieval, bad,
+    checkpoint, emit, execution_context, load_authority_models, new_generation, new_path,
+    publication_error, rebuild_identity, rebuild_precision, separate_destinations,
+    stage_prepared_and_publish, validate_retained_documents,
 };
 
 #[derive(Debug, Default)]
