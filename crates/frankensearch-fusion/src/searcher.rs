@@ -3974,60 +3974,26 @@ impl TwoTierSearcher {
                     &mut retrieve_quality,
                 )
                 .await?;
-            let fast_replaced = if let Some(pools) = pools {
-                request_filter
-                    .reconcile_vectors_with_history(
-                        cx,
-                        lexical_source,
-                        LexicalRevalidation {
-                            query: lexical_pool.query,
-                            target: lexical_pool.target,
-                            results: &mut *lexical_pool.results,
-                            context: &mut *lexical_pool.context,
-                        },
-                        fast_hits,
-                        pools.semantic_budget,
-                        &mut fast_limit,
-                        self.index.fast_candidate_upper_bound(),
-                        exclusions,
-                        text_fn,
-                        "semantic",
-                        &mut fast_revoked,
-                        |limit| {
-                            // A refill uses the same backend as the initial
-                            // retrieval that produced the retained fast pool.
-                            let classified = if let Some(evidence) = pools.fast_evidence.as_ref()
-                                && self.uses_activated_fast_retrieval()
-                            {
-                                let embeddings =
-                                    TieredQueryEmbeddings::fast_only(evidence.query.clone());
-                                let activated =
-                                    self.index.activate_owner_backed_search(cx, &embeddings)?;
-                                activated
-                                    .search_fast_classified_with_params(limit, self.search_params)?
-                            } else {
-                                self.index.search_fast_classified_with_params(
-                                    &pools.fast_query,
-                                    limit,
-                                    self.search_params,
-                                )?
-                            };
-                            cancellation_checkpoint(cx, "refined_fast_search_to_filter")?;
-                            Ok(classified.hits)
-                        },
-                    )
-                    .await?
-            } else {
-                // Direct internal refinement callers may supply only Initial
-                // results, without an admitted fast retrieval to replay.
-                request_filter.retain_vectors(cx, fast_hits)?;
-                false
-            };
-            if fast_replaced {
-                replacement_evidence = Some(fast_hits.clone());
-                self.apply_score_calibration_to_hits(fast_hits);
-                *fast_hits = self.correct_phase1_pool(std::mem::take(fast_hits));
-            }
+            let fast_replaced = self
+                .reconcile_refinement_fast(
+                    cx,
+                    lexical_source,
+                    LexicalRevalidation {
+                        query: lexical_pool.query,
+                        target: lexical_pool.target,
+                        results: &mut *lexical_pool.results,
+                        context: &mut *lexical_pool.context,
+                    },
+                    pools,
+                    fast_hits,
+                    &mut fast_limit,
+                    exclusions,
+                    text_fn,
+                    request_filter,
+                    &mut fast_revoked,
+                    &mut replacement_evidence,
+                )
+                .await?;
             #[cfg(feature = "graph")]
             let graph_replaced = self
                 .reconcile_refinement_graph(
@@ -4050,6 +4016,86 @@ impl TwoTierSearcher {
                 return Ok(replacement_evidence);
             }
         }
+    }
+
+    /// Replay the original fast retrieval when a later observation revokes a
+    /// row. Independent quality retrieval and positional rescoring must use
+    /// the same fast window, scan policy, and single calibration pass.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_refinement_fast(
+        &self,
+        cx: &Cx,
+        lexical_source: Option<&dyn LexicalRead>,
+        lexical_pool: LexicalRevalidation<'_>,
+        pools: Option<&RefinementPools>,
+        fast_hits: &mut Vec<VectorHit>,
+        limit: &mut usize,
+        exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        request_filter: &mut RequestFilter<'_>,
+        revoked: &mut AHashSet<DocId>,
+        replacement_evidence: &mut Option<Vec<VectorHit>>,
+    ) -> SearchResult<bool> {
+        if !request_filter.is_active() {
+            return Ok(false);
+        }
+        let Some(pools) = pools else {
+            // Internal callers without an original retrieval can validate
+            // their supplied candidates but cannot replay that retrieval.
+            request_filter
+                .revalidate_lexical(
+                    cx,
+                    lexical_source,
+                    lexical_pool.query,
+                    lexical_pool.target,
+                    lexical_pool.results,
+                    lexical_pool.context,
+                    exclusions,
+                    text_fn,
+                )
+                .await?;
+            let previous = fast_hits.len();
+            request_filter.retain_vectors(cx, fast_hits)?;
+            return Ok(previous != fast_hits.len());
+        };
+        let replaced = request_filter
+            .reconcile_vectors_with_history(
+                cx,
+                lexical_source,
+                lexical_pool,
+                fast_hits,
+                pools.semantic_budget,
+                limit,
+                self.index.fast_candidate_upper_bound(),
+                exclusions,
+                text_fn,
+                "semantic",
+                revoked,
+                |limit| {
+                    let classified = if let Some(evidence) = pools.fast_evidence.as_ref()
+                        && self.uses_activated_fast_retrieval()
+                    {
+                        let embeddings = TieredQueryEmbeddings::fast_only(evidence.query.clone());
+                        let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
+                        activated.search_fast_classified_with_params(limit, self.search_params)?
+                    } else {
+                        self.index.search_fast_classified_with_params(
+                            &pools.fast_query,
+                            limit,
+                            self.search_params,
+                        )?
+                    };
+                    cancellation_checkpoint(cx, "refined_fast_search_to_filter")?;
+                    Ok(classified.hits)
+                },
+            )
+            .await?;
+        if replaced {
+            *replacement_evidence = Some(fast_hits.clone());
+            self.apply_score_calibration_to_hits(fast_hits);
+            *fast_hits = self.correct_phase1_pool(std::mem::take(fast_hits));
+        }
+        Ok(replaced)
     }
 
     /// A retained graph signal stays unchanged unless its seeds or eligibility
@@ -4458,25 +4504,31 @@ impl TwoTierSearcher {
             }
             SemanticAdmission::OwnerBacked { quality: false }
             | SemanticAdmission::LegacyUnidentified => {
+                let mut fast_limit = pools.map_or(0, |pools| pools.fast_retrieval_limit);
+                let mut fast_revoked = AHashSet::new();
                 #[cfg(feature = "graph")]
                 let mut graph_revoked = AHashSet::new();
                 loop {
-                    request_filter
-                        .revalidate_lexical(
+                    let fast_replaced = self
+                        .reconcile_refinement_fast(
                             cx,
                             lexical_source,
-                            &lexical_query,
-                            lexical_budget,
-                            &mut filtered_lexical,
-                            &mut refreshed_lexical_context,
+                            LexicalRevalidation {
+                                query: &lexical_query,
+                                target: lexical_budget,
+                                results: &mut filtered_lexical,
+                                context: &mut refreshed_lexical_context,
+                            },
+                            pools,
+                            &mut fast_hits,
+                            &mut fast_limit,
                             exclusions,
                             text_fn,
+                            request_filter,
+                            &mut fast_revoked,
+                            &mut replacement_fast_evidence,
                         )
                         .await?;
-                    #[cfg(feature = "graph")]
-                    let previous_fast_count = fast_hits.len();
-                    // Membership must settle before producing positional scores.
-                    request_filter.retain_vectors(cx, &mut fast_hits)?;
                     #[cfg(feature = "graph")]
                     let graph_replaced = self
                         .reconcile_refinement_graph(
@@ -4486,7 +4538,7 @@ impl TwoTierSearcher {
                             &fast_hits,
                             &mut graph_candidates,
                             quality_budget,
-                            fast_hits.len() != previous_fast_count,
+                            fast_replaced,
                             exclusions,
                             text_fn,
                             request_filter,
@@ -4495,7 +4547,7 @@ impl TwoTierSearcher {
                         .await?;
                     #[cfg(not(feature = "graph"))]
                     let graph_replaced = false;
-                    if !graph_replaced {
+                    if !fast_replaced && !graph_replaced {
                         break;
                     }
                 }
@@ -22927,6 +22979,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn async_filter_legacy_rescoring_refills_the_eligible_fast_window() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = build_test_index_with_quality(4);
+            for replacement in [Some("doc-1"), None] {
+                let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let searcher = TwoTierSearcher::new(
+                    index.clone(),
+                    Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone())),
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(Arc::new(CountingEmbedder::new(
+                    "quality",
+                    4,
+                    quality_calls.clone(),
+                )));
+                let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                    if quality_calls.load(Ordering::Relaxed) == 0 {
+                        id == "doc-0"
+                    } else {
+                        Some(id) == replacement
+                    }
+                });
+                let mut phases = Vec::new();
+                let metrics = searcher
+                    .search_with_filter(
+                        &cx,
+                        "query",
+                        1,
+                        Some(&filter),
+                        |_| None,
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .unwrap();
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                    SearchPhase::Refined {
+                        results: refined, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("expected initial and positional quality results: {phases:?}");
+                };
+                assert_eq!(initial[0].doc_id, "doc-0");
+                if let Some(id) = replacement {
+                    assert_eq!(refined.len(), 1);
+                    assert_eq!(refined[0].doc_id.as_str(), id);
+                    assert_eq!(refined[0].fast_score, Some(0.0));
+                    assert_eq!(refined[0].quality_score, Some(0.0));
+                    assert_eq!(metrics.zero_signal, None);
+                } else {
+                    assert!(refined.is_empty());
+                    assert_eq!(
+                        metrics.zero_signal,
+                        Some(ZeroSignalReason::FilterEliminatedAll)
+                    );
+                }
+                assert_eq!(fast_calls.load(Ordering::Relaxed), 1);
+                assert_eq!(quality_calls.load(Ordering::Relaxed), 1);
+            }
+        });
     }
 
     #[test]
