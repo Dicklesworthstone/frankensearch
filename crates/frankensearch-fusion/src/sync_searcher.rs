@@ -870,6 +870,12 @@ impl SyncTwoTierSearcher {
     /// semantic-only candidates. A snapshot-capable lexical source is pinned
     /// once for both phases and every refill. Unknown metadata is still passed
     /// as `None` to the caller's predicate; hydration errors are not unknowns.
+    /// Built-in metadata filters can opt into
+    /// [`MissingMetadataPolicy::Reject`](frankensearch_core::filter::MissingMetadataPolicy::Reject)
+    /// with `on_missing_metadata`. They then reject a document whose selected
+    /// metadata is unavailable, including every vector-only candidate when no
+    /// metadata source is attached. With a source, metadata is resolved before
+    /// that rejection and selective filters refill the eligible result budget.
     /// When a later lookup resolves an unknown observation, both lexical and
     /// semantic candidate pools are revalidated and refilled before publishing.
     /// Predicates must remain stable for the same document and observation;
@@ -6532,6 +6538,150 @@ mod tests {
             "known lexical rejection applies to semantic hits; unknown metadata stays permissive",
         );
         assert!(results.iter().all(|hit| hit.metadata.is_none()));
+    }
+
+    #[test]
+    fn strict_metadata_filters_refill_one_percent_tail_in_every_sync_phase() {
+        use frankensearch_core::filter::{
+            DateRangeFilter, DocTypeFilter, FilterChain, FilterMode, MissingMetadataPolicy,
+        };
+
+        struct CorpusMetadata {
+            lexical_active_matches: bool,
+        }
+        impl SyncLexicalSearch for CorpusMetadata {
+            fn search_sync(&self, _: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+                let count = if self.lexical_active_matches {
+                    1_000
+                } else {
+                    990
+                };
+                Ok((0..count.min(limit))
+                    .map(|rank| lexical_result(&format!("doc-{rank:04}"), (1_000 - rank) as f32))
+                    .collect())
+            }
+
+            fn metadata_for_documents(
+                &self,
+                ids: &[&str],
+            ) -> SearchResult<Vec<Option<Arc<serde_json::Value>>>> {
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        let rank = id.strip_prefix("doc-")?.parse::<usize>().ok()?;
+                        (rank < 1_000).then(|| {
+                            Arc::new(serde_json::json!({
+                                "doc_type": if rank < 990 { "archived" } else { "active" },
+                                "created_at": if rank < 990 { 1 } else { 200 },
+                            }))
+                        })
+                    })
+                    .collect())
+            }
+        }
+
+        let rows: Vec<_> = (0..=1_000)
+            .map(|rank| {
+                let id = if rank == 0 {
+                    "metadata-unavailable".to_owned()
+                } else {
+                    format!("doc-{:04}", rank - 1)
+                };
+                let score = 1.0 - rank as f32 * 0.0004;
+                let other = (1.0 - score * score).sqrt();
+                (id, vec![score, other], vec![0.0, score, other])
+            })
+            .collect();
+        let fast_rows: Vec<_> = rows
+            .iter()
+            .map(|(id, fast, _)| (id.as_str(), fast.as_slice()))
+            .collect();
+        let quality_rows: Vec<_> = rows
+            .iter()
+            .map(|(id, _, quality)| (id.as_str(), quality.as_slice()))
+            .collect();
+        let directory = temp_dir("strict-metadata-tail");
+        let (fast, fast_identity) =
+            attested_tier(directory.path(), "fast.fsvi", "strict-fast", 1, &fast_rows);
+        let (quality, quality_identity) = attested_tier(
+            directory.path(),
+            "quality.fsvi",
+            "strict-quality",
+            1,
+            &quality_rows,
+        );
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).unwrap());
+        let fast_query = BoundQueryEmbedding::new(vec![1.0, 0.0], fast_identity).unwrap();
+        let quality_query =
+            BoundQueryEmbedding::new(vec![0.0, 1.0, 0.0], quality_identity).unwrap();
+        let queries = [
+            TieredQueryEmbeddings::fast_only(fast_query.clone()),
+            TieredQueryEmbeddings::quality_only(quality_query.clone()),
+            TieredQueryEmbeddings::progressive(fast_query, quality_query),
+        ];
+        let types =
+            DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let dates =
+            DateRangeFilter::between(100, 300).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let both = FilterChain::new(FilterMode::All)
+            .with(Box::new(types.clone()))
+            .with(Box::new(dates));
+        let config = TwoTierConfig {
+            candidate_multiplier: 1,
+            ..TwoTierConfig::default()
+        };
+        let without_metadata = SyncTwoTierSearcher::new(Arc::clone(&index), config.clone());
+        for query in &queries {
+            for filter in [&types as &dyn SearchFilter, &dates, &both] {
+                let (hits, _) = without_metadata
+                    .search_collect_with_filter(query, 5, Some(filter))
+                    .unwrap();
+                assert!(
+                    hits.is_empty(),
+                    "strict filters cannot authorize unknown rows"
+                );
+            }
+            let (permissive, _) = without_metadata
+                .search_collect_with_filter(query, 5, Some(&DocTypeFilter::new(["active"])))
+                .unwrap();
+            assert_eq!(permissive.len(), 5, "missing-metadata rejection is opt-in");
+            assert_eq!(permissive[0].doc_id, "metadata-unavailable");
+        }
+
+        for lexical_active_matches in [false, true] {
+            let searcher = SyncTwoTierSearcher::new(Arc::clone(&index), config.clone())
+                .with_nqc_dense_downweight_disabled()
+                .with_lexical(Arc::new(CorpusMetadata {
+                    lexical_active_matches,
+                }));
+            for query in &queries {
+                for filter in [&types as &dyn SearchFilter, &dates, &both] {
+                    let assert_hits = |hits: &[ScoredResult]| {
+                        assert_eq!(hits.len(), 5, "the eligible tail must fill top-k");
+                        assert!(hits.iter().all(|hit| {
+                            hit.metadata.as_deref().is_some_and(|metadata| {
+                                metadata["doc_type"] == "active" && metadata["created_at"] == 200
+                            }) && hit.lexical_score.is_some() == lexical_active_matches
+                        }));
+                    };
+                    let (hits, _) = searcher
+                        .search_collect_with_filter(query, 5, Some(filter))
+                        .unwrap();
+                    assert_hits(&hits);
+                    let phases: Vec<_> = searcher
+                        .search_iter_with_filter(query, 5, Some(filter))
+                        .collect();
+                    assert!(!phases.is_empty());
+                    for phase in phases {
+                        match phase {
+                            SearchPhase::Initial { results, .. }
+                            | SearchPhase::Refined { results, .. } => assert_hits(&results),
+                            other => panic!("unexpected strict-filter phase: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
