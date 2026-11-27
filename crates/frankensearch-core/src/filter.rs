@@ -4,11 +4,12 @@
 //! scores) in vector search, enabling early-exit when the filter is selective.
 //! This avoids computing dot products for non-matching records.
 //!
-//! [`DocTypeFilter`] and [`DateRangeFilter`] accept missing metadata by default.
-//! Use [`MissingMetadataPolicy::Reject`] to require a known matching value.
-//! Searchers with a stored metadata source can evaluate candidates after
-//! hydration. A direct vector scan with no metadata rejects every candidate
-//! when either strict filter is applied on its own.
+//! When `metadata` is `None` (e.g., during vector search where metadata is not
+//! stored alongside vectors), built-in metadata filters are permissive by
+//! default. Select [`MissingMetadataPolicy::Reject`] for strict filtering:
+//! unavailable metadata cannot satisfy that predicate. Searchers can use
+//! [`SearchFilter::requires_metadata`] to resolve metadata before selecting
+//! vector candidates, so eligible documents are not lost at the top-k cutoff.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -22,8 +23,26 @@ pub trait SearchFilter: Send + Sync {
     ///
     /// * `doc_id` — The document identifier (always available).
     /// * `metadata` — Document metadata, if available at this pipeline stage.
-    ///   `None` during vector search; `Some` after fusion or from stored fields.
+    ///   `None` in metadata-less vector scans; `Some` after hydration from stored
+    ///   fields. Implementations decide how missing metadata affects matching.
     fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool;
+
+    /// Whether metadata should be resolved before selecting candidate documents.
+    ///
+    /// Strict metadata predicates return `true`, allowing searchers to hydrate
+    /// metadata before the vector top-k scan rather than rejecting eligible
+    /// documents because their metadata was not available yet. If metadata
+    /// cannot be resolved, scanners still call [`Self::matches`] (or the hash
+    /// fast path) with `None`; strict predicates must reject it themselves.
+    ///
+    /// This is a conservative planning hint, not a blanket rejection rule:
+    /// an OR chain containing a strict metadata predicate and an ID predicate
+    /// may still accept an ID without metadata. Composite filters propagate
+    /// this hint whenever any child requires metadata, preserving their normal
+    /// Boolean matching semantics.
+    fn requires_metadata(&self) -> bool {
+        false
+    }
 
     /// Optional fast path for hash-addressable filters.
     ///
@@ -130,6 +149,10 @@ impl SearchFilter for ExcludeDocIdsFilter<'_> {
             && self
                 .inner
                 .is_none_or(|inner| inner.matches(doc_id, metadata))
+    }
+
+    fn requires_metadata(&self) -> bool {
+        self.inner.is_some_and(SearchFilter::requires_metadata)
     }
 
     fn matches_doc_id_hash(
@@ -330,6 +353,10 @@ impl SearchFilter for FilterChain {
         }
     }
 
+    fn requires_metadata(&self) -> bool {
+        self.filters.iter().any(|filter| filter.requires_metadata())
+    }
+
     fn matches_doc_id_hash(
         &self,
         doc_id_hash: u64,
@@ -418,10 +445,10 @@ impl fmt::Debug for FilterChain {
 
 // ─── Built-in Filters ────────────────────────────────────────────────────────
 
-/// How a built-in metadata filter evaluates a document with no metadata.
+/// How a metadata predicate handles unavailable document metadata (`None`).
 ///
-/// When metadata is present, the required field must exist, have the expected
-/// type, and satisfy the filter under either policy.
+/// Present metadata with a missing or malformed required field is rejected
+/// under either policy. This policy controls only unavailable metadata.
 ///
 /// ```
 /// use frankensearch_core::{DocTypeFilter, MissingMetadataPolicy, SearchFilter};
@@ -433,16 +460,24 @@ impl fmt::Debug for FilterChain {
 /// ```
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum MissingMetadataPolicy {
-    /// Include the document when metadata is unavailable.
+    /// Include the document when metadata is unavailable (the default).
+    ///
+    /// This permissive mode is appropriate only when a later stage hydrates
+    /// metadata and rechecks the filter, or when best-effort filtering is enough.
     #[default]
     Allow,
-    /// Exclude the document when metadata is unavailable.
+    /// Reject documents whose metadata is unavailable.
+    ///
+    /// Metadata-less vector calls return no matches for this predicate. Hybrid
+    /// searchers can resolve metadata before scoring to retain eligible hits.
     Reject,
 }
 
 /// Matches documents whose `doc_type` metadata field is in a given set.
 ///
-/// Use [`Self::on_missing_metadata`] to change the default permissive policy.
+/// Permits unavailable metadata by default. Use [`Self::new_strict`] or
+/// [`Self::on_missing_metadata`] with [`MissingMetadataPolicy::Reject`] when
+/// documents without metadata must not match.
 #[derive(Debug, Clone)]
 pub struct DocTypeFilter {
     allowed_types: HashSet<String>,
@@ -459,7 +494,16 @@ impl DocTypeFilter {
         }
     }
 
-    /// Set how documents without metadata are evaluated.
+    /// Create a filter that requires a matching `doc_type` in available metadata.
+    #[must_use]
+    pub fn new_strict(types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::new(types).on_missing_metadata(MissingMetadataPolicy::Reject)
+    }
+
+    /// Choose how unavailable metadata affects matching.
+    ///
+    /// Missing or non-string `doc_type` fields in present metadata are always
+    /// rejected, regardless of this policy.
     #[must_use]
     pub const fn on_missing_metadata(mut self, policy: MissingMetadataPolicy) -> Self {
         self.missing_metadata = policy;
@@ -476,6 +520,10 @@ impl SearchFilter for DocTypeFilter {
             return false;
         };
         self.allowed_types.contains(doc_type)
+    }
+
+    fn requires_metadata(&self) -> bool {
+        self.missing_metadata == MissingMetadataPolicy::Reject
     }
 
     fn matches_doc_id_hash(
@@ -497,7 +545,9 @@ impl SearchFilter for DocTypeFilter {
 /// falls within a given range.
 ///
 /// Either bound may be `None` for an open-ended range.
-/// Use [`Self::on_missing_metadata`] to change the default permissive policy.
+/// Permits unavailable metadata by default. Use [`Self::new_strict`] or
+/// [`Self::on_missing_metadata`] with [`MissingMetadataPolicy::Reject`] when
+/// documents without metadata must not match, including for unbounded ranges.
 #[derive(Debug, Clone, Copy)]
 pub struct DateRangeFilter {
     min_timestamp: Option<i64>,
@@ -516,7 +566,16 @@ impl DateRangeFilter {
         }
     }
 
-    /// Set how documents without metadata are evaluated.
+    /// Create an inclusive range filter that rejects unavailable metadata.
+    #[must_use]
+    pub const fn new_strict(min: Option<i64>, max: Option<i64>) -> Self {
+        Self::new(min, max).on_missing_metadata(MissingMetadataPolicy::Reject)
+    }
+
+    /// Choose how unavailable metadata affects matching.
+    ///
+    /// Missing or non-integer `created_at` fields in present metadata are always
+    /// rejected, regardless of this policy.
     #[must_use]
     pub const fn on_missing_metadata(mut self, policy: MissingMetadataPolicy) -> Self {
         self.missing_metadata = policy;
@@ -561,6 +620,10 @@ impl SearchFilter for DateRangeFilter {
             return false;
         }
         true
+    }
+
+    fn requires_metadata(&self) -> bool {
+        self.missing_metadata == MissingMetadataPolicy::Reject
     }
 
     fn matches_doc_id_hash(
@@ -934,6 +997,73 @@ mod tests {
     }
 
     #[test]
+    fn strict_doc_type_rejects_missing_and_malformed_metadata() {
+        let filter = DocTypeFilter::new_strict(["active"]);
+        assert!(filter.requires_metadata());
+        assert!(!filter.matches("active-looking-id", None));
+        assert_eq!(filter.matches_doc_id_hash(0, None), Some(false));
+        for metadata in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"doc_type": null}),
+            json!({"doc_type": ["active"]}),
+            json!({"doc_type": true}),
+            json!({"doc_type": 1}),
+            json!({"doc_type": "archived"}),
+        ] {
+            assert!(!filter.matches("doc", Some(&metadata)), "{metadata}");
+            assert_eq!(filter.matches_doc_id_hash(0, Some(&metadata)), Some(false));
+        }
+        let accepted = json!({"doc_type": "active"});
+        assert!(filter.matches("doc", Some(&accepted)));
+        assert_eq!(filter.matches_doc_id_hash(0, Some(&accepted)), Some(true));
+
+        let empty = DocTypeFilter::new_strict(std::iter::empty::<&str>());
+        assert!(!empty.matches("doc", None));
+        assert!(!empty.matches("doc", Some(&accepted)));
+    }
+
+    #[test]
+    fn metadata_policy_changes_only_unavailable_metadata() {
+        assert_eq!(
+            MissingMetadataPolicy::default(),
+            MissingMetadataPolicy::Allow
+        );
+        let valid = json!({"doc_type": "active", "created_at": 1500});
+        let missing_fields = json!({});
+        for policy in [MissingMetadataPolicy::Allow, MissingMetadataPolicy::Reject] {
+            let filters: [Box<dyn SearchFilter>; 2] = [
+                Box::new(DocTypeFilter::new_strict(["active"]).on_missing_metadata(policy)),
+                Box::new(
+                    DateRangeFilter::new_strict(Some(1000), Some(2000)).on_missing_metadata(policy),
+                ),
+            ];
+            for filter in filters {
+                assert_eq!(
+                    filter.matches("doc", None),
+                    policy == MissingMetadataPolicy::Allow
+                );
+                assert_eq!(
+                    filter.requires_metadata(),
+                    policy == MissingMetadataPolicy::Reject
+                );
+                assert!(filter.matches("doc", Some(&valid)));
+                assert!(!filter.matches("doc", Some(&missing_fields)));
+            }
+        }
+        assert!(!DocTypeFilter::new(["active"]).requires_metadata());
+        assert!(!DateRangeFilter::between(1000, 2000).requires_metadata());
+        assert!(
+            DocTypeFilter::new(["active"])
+                .on_missing_metadata(MissingMetadataPolicy::Reject)
+                .requires_metadata()
+        );
+    }
+
+    // --- DateRangeFilter ---
+
+    #[test]
     fn strict_filters_require_known_matching_fields_on_both_scan_paths() {
         let types =
             DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
@@ -972,7 +1102,55 @@ mod tests {
         }
     }
 
-    // --- DateRangeFilter ---
+    #[test]
+    fn strict_date_ranges_keep_inclusive_bounds_and_require_an_integer() {
+        const STRICT: DateRangeFilter = DateRangeFilter::new_strict(Some(1000), Some(2000));
+        assert!(STRICT.requires_metadata());
+        assert!(!STRICT.matches("doc", None));
+        for (timestamp, accepted) in [
+            (i64::MIN, false),
+            (999, false),
+            (1000, true),
+            (1500, true),
+            (2000, true),
+            (2001, false),
+            (i64::MAX, false),
+        ] {
+            let metadata = json!({"created_at": timestamp});
+            assert_eq!(STRICT.matches("doc", Some(&metadata)), accepted);
+            assert_eq!(
+                STRICT.matches_doc_id_hash(0, Some(&metadata)),
+                Some(accepted)
+            );
+        }
+        for metadata in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"created_at": null}),
+            json!({"created_at": "1500"}),
+            json!({"created_at": 1500.5}),
+            json!({"created_at": true}),
+            json!({"created_at": u64::MAX}),
+        ] {
+            assert!(!STRICT.matches("doc", Some(&metadata)), "{metadata}");
+            assert_eq!(STRICT.matches_doc_id_hash(0, Some(&metadata)), Some(false));
+        }
+        for filter in [
+            DateRangeFilter::new_strict(None, None),
+            DateRangeFilter::after(i64::MIN).on_missing_metadata(MissingMetadataPolicy::Reject),
+            DateRangeFilter::before(i64::MAX).on_missing_metadata(MissingMetadataPolicy::Reject),
+        ] {
+            assert!(filter.requires_metadata());
+            assert!(!filter.matches("doc", None));
+            assert!(!filter.matches("doc", Some(&json!({}))));
+            for timestamp in [i64::MIN, 0, i64::MAX] {
+                assert!(filter.matches("doc", Some(&json!({"created_at": timestamp}))));
+            }
+        }
+        let inverted = DateRangeFilter::new_strict(Some(2000), Some(1000));
+        assert!(!inverted.matches("doc", Some(&json!({"created_at": 1500}))));
+    }
 
     #[test]
     fn date_range_filter_within_range() {
@@ -1113,6 +1291,64 @@ mod tests {
         assert!(chain.matches("doc-a", None));
         assert!(chain.matches("doc-b", None));
         assert!(!chain.matches("doc-c", None));
+    }
+
+    #[test]
+    fn strict_metadata_hint_preserves_nested_boolean_semantics() {
+        let metadata = json!({"doc_type": "active"});
+        for mode in [FilterMode::All, FilterMode::Any] {
+            let inner = FilterChain::new(mode)
+                .with(Box::new(DocTypeFilter::new_strict(["active"])))
+                .with(Box::new(BitsetFilter::from_doc_ids(["included"])));
+            let chain = FilterChain::new(FilterMode::All).with(Box::new(inner));
+            assert!(chain.requires_metadata());
+            assert!(chain.candidate_hashes().is_none());
+            assert!(chain.immutable_candidate_hashes().is_none());
+            for (id, meta, all_matches, any_matches) in [
+                ("included", None, false, true),
+                ("outside", None, false, false),
+                ("included", Some(&metadata), true, true),
+                ("outside", Some(&metadata), false, true),
+            ] {
+                let expected = match mode {
+                    FilterMode::All => all_matches,
+                    FilterMode::Any => any_matches,
+                };
+                assert_eq!(chain.matches(id, meta), expected);
+                assert_eq!(
+                    chain.matches_doc_id_hash(fnv1a_hash(id.as_bytes()), meta),
+                    Some(expected)
+                );
+            }
+        }
+        for mode in [FilterMode::All, FilterMode::Any] {
+            assert!(!FilterChain::new(mode).requires_metadata());
+            let permissive = FilterChain::new(mode)
+                .with(Box::new(DocTypeFilter::new(["active"])))
+                .with(Box::new(PredicateFilter::new("id", |id| id == "included")));
+            assert!(!permissive.requires_metadata());
+        }
+    }
+
+    #[test]
+    fn strict_metadata_hint_and_exact_candidates_survive_exclusion() {
+        let strict = FilterChain::new(FilterMode::All)
+            .with(Box::new(IncludeDocIdsFilter::new(["keep", "excluded"])))
+            .with(Box::new(DocTypeFilter::new_strict(["active"])));
+        let filter = ExcludeDocIdsFilter::new(Some(&strict), ["excluded"]);
+        assert!(filter.requires_metadata());
+        assert_eq!(filter.candidate_doc_ids(), strict.candidate_doc_ids());
+        assert!(!filter.matches("keep", None));
+        assert_eq!(
+            filter.matches_doc_id_hash(fnv1a_hash(b"keep"), None),
+            Some(false)
+        );
+        let metadata = json!({"doc_type": "active"});
+        assert!(filter.matches("keep", Some(&metadata)));
+        assert!(!filter.matches("excluded", Some(&metadata)));
+        assert!(!filter.matches("outside", Some(&metadata)));
+        assert!(!ExcludeDocIdsFilter::new(None, ["excluded"]).requires_metadata());
+        assert!(!BitsetFilter::from_doc_ids(["keep"]).requires_metadata());
     }
 
     #[test]
@@ -1448,9 +1684,14 @@ mod tests {
         let filters: Vec<Box<dyn SearchFilter>> = vec![
             Box::new(DocTypeFilter::new(["tweet"])),
             Box::new(DocTypeFilter::new(std::iter::empty::<&str>())),
+            Box::new(DocTypeFilter::new_strict(["tweet"])),
+            Box::new(DocTypeFilter::new_strict(std::iter::empty::<&str>())),
             Box::new(DateRangeFilter::between(1000, 2000)),
             Box::new(DateRangeFilter::new(None, None)),
             Box::new(DateRangeFilter::between(i64::MAX, i64::MIN)),
+            Box::new(DateRangeFilter::new_strict(Some(1000), Some(2000))),
+            Box::new(DateRangeFilter::new_strict(None, None)),
+            Box::new(DateRangeFilter::new_strict(Some(i64::MAX), Some(i64::MIN))),
         ];
         let metadata = [
             json!({"doc_type": "tweet", "created_at": 1500}),

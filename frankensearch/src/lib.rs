@@ -287,6 +287,12 @@ pub use frankensearch_core::error::{SearchError, SearchResult};
 // Configuration
 pub use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
 
+// Search-time document filters and explicit missing-metadata policy.
+pub use frankensearch_core::filter::{
+    BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode, IncludeDocIdsFilter,
+    MissingMetadataPolicy, PredicateFilter, SearchFilter,
+};
+
 // Search result types
 pub use frankensearch_core::types::{
     FusedHit, IndexableDocument, PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource,
@@ -486,6 +492,18 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_filters_accessible_from_facade() {
+        let filter = FilterChain::new(FilterMode::All)
+            .with(Box::new(DocTypeFilter::new_strict(["active"])))
+            .with(Box::new(
+                DateRangeFilter::after(1000).on_missing_metadata(MissingMetadataPolicy::Reject),
+            ));
+        let erased: &dyn SearchFilter = &filter;
+        assert!(erased.requires_metadata());
+        assert!(!erased.matches("doc", None));
+    }
 
     #[test]
     fn core_types_accessible() {
