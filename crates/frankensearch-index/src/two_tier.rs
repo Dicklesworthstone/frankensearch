@@ -375,6 +375,18 @@ impl TierSource {
         }
     }
 
+    fn open_admitted(
+        path: &Path,
+        binding: &FsviV2IdentityBinding,
+        tier: &str,
+    ) -> SearchResult<Self> {
+        Ok(Self::AdmittedV2 {
+            owner: Arc::new(admit_v2_tier(path, binding, tier)?),
+            binding: binding.clone(),
+            source_path: path.to_path_buf(),
+        })
+    }
+
     /// The retained sealed admission owner, when this tier came from exact
     /// FSVI v2 admission.
     fn admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
@@ -418,47 +430,6 @@ impl TierSource {
         }
     }
 
-    /// Join retained generation and document semantics without requiring the
-    /// tiers to share a model, dimension, input instructions, or row coverage.
-    fn validate_pair_contract(&self, quality: &Self, field_prefix: &str) -> SearchResult<()> {
-        let ((fast_owner, fast_binding), (quality_owner, quality_binding)) = match (
-            self.admitted_pair(),
-            quality.admitted_pair(),
-        ) {
-            (None, None) => return Ok(()),
-            (Some(fast), Some(quality)) => (fast, quality),
-            _ => {
-                return Err(SearchError::InvalidConfig {
-                        field: format!("{field_prefix}.source_identity"),
-                        value: "mixed-admission".to_owned(),
-                        reason: "fast and quality tiers must both retain exact FSVI v2 admission or both use legacy sources"
-                            .to_owned(),
-                    });
-            }
-        };
-        if fast_owner.witness().generation != quality_owner.witness().generation {
-            return Err(SearchError::InvalidConfig {
-                field: format!("{field_prefix}.generation"),
-                value: "mismatch".to_owned(),
-                reason: "fast and quality tiers must share one complete artifact generation"
-                    .to_owned(),
-            });
-        }
-        let fast_identity = &fast_binding.frozen_identity().identity;
-        let quality_identity = &quality_binding.frozen_identity().identity;
-        if fast_identity.input.doc_id_semantics != quality_identity.input.doc_id_semantics
-            || fast_identity.space.kind != quality_identity.space.kind
-        {
-            return Err(SearchError::InvalidConfig {
-                field: format!("{field_prefix}.tier_contract"),
-                value: "mismatch".to_owned(),
-                reason: "fast and quality tiers require one document-ID contract and semantic/control kind"
-                    .to_owned(),
-            });
-        }
-        Ok(())
-    }
-
     /// The on-disk artifact this tier serves.
     fn artifact_path(&self) -> &Path {
         match self {
@@ -466,6 +437,35 @@ impl TierSource {
             Self::AdmittedV2 { source_path, .. } => source_path,
         }
     }
+}
+
+/// Each artifact is admitted independently against its caller-held binding.
+/// Validate the shared parts of the two bindings before opening either image.
+fn validate_v2_pair_contract(
+    fast: &FsviV2IdentityBinding,
+    quality: &FsviV2IdentityBinding,
+    field_prefix: &str,
+) -> SearchResult<()> {
+    if fast.generation() != quality.generation() {
+        return Err(SearchError::InvalidConfig {
+            field: format!("{field_prefix}.generation"),
+            value: "mismatch".to_owned(),
+            reason: "fast and quality tiers must share one complete artifact generation".to_owned(),
+        });
+    }
+    let fast_identity = &fast.frozen_identity().identity;
+    let quality_identity = &quality.frozen_identity().identity;
+    if fast_identity.input.doc_id_semantics != quality_identity.input.doc_id_semantics
+        || fast_identity.space.kind != quality_identity.space.kind
+    {
+        return Err(SearchError::InvalidConfig {
+            field: format!("{field_prefix}.tier_contract"),
+            value: "mismatch".to_owned(),
+            reason: "fast and quality tiers require one document-ID contract and semantic/control kind"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Explicit tier retrieval policy and its current owner's built or loaded graph.
@@ -488,9 +488,8 @@ impl NativeTierHnsw {
     ) -> SearchResult<Self> {
         let graph = match owner {
             Some(owner) => {
-                // This container does not select publication authority. Keep
-                // its existing full-build behavior for an explicitly admitted
-                // reopen or rollback; incremental reuse requires a successor.
+                // Incremental reuse requires a successor. An identical replay
+                // or a tier without an installed graph uses a full build.
                 let reused = if let Some(previous) = &self.graph
                     && owner.witness().generation.sequence
                         > previous.owner_witness().generation.sequence
@@ -609,8 +608,8 @@ impl TwoTierIndex {
     ///
     /// Unlike [`Self::open`], this constructor performs no filename discovery.
     /// A supplied quality path is required to exist; omit it to open a
-    /// fast-only index. The fast-tier ANN sidecar is used only when explicitly
-    /// configured on [`TwoTierIndexPaths`].
+    /// fast-only index. Selected tiers must belong to the same publication.
+    /// The fast-tier ANN sidecar is used only when explicitly configured on [`TwoTierIndexPaths`].
     ///
     /// # Errors
     ///
@@ -636,6 +635,24 @@ impl TwoTierIndex {
         let fast_source = TierSource::PathOpened(fast_index);
         let quality_source = match paths.quality_index() {
             Some(quality_path) => match VectorIndex::open_read_only(quality_path) {
+                Ok(quality_index)
+                    if quality_index.publication_nonce()
+                        != fast_source.index().publication_nonce() =>
+                {
+                    if !degrade_discovered_quality_errors {
+                        return Err(SearchError::InvalidConfig {
+                            field: "two_tier.quality_publication".to_owned(),
+                            value: "mismatch".to_owned(),
+                            reason: "the explicitly selected fast and quality indexes belong to different publications".to_owned(),
+                        });
+                    }
+                    warn!(
+                        fast_nonce = fast_source.index().publication_nonce(),
+                        quality_nonce = quality_index.publication_nonce(),
+                        "discovered quality index belongs to another publication; degrading to fast-only"
+                    );
+                    None
+                }
                 Ok(quality_index) => {
                     warn_if_wal_rows_replayed("quality", quality_path, &quality_index);
                     Some(TierSource::PathOpened(quality_index))
@@ -717,18 +734,11 @@ impl TwoTierIndex {
             });
         }
         let paths = paths.clone().into_absolute()?;
-        validate_index_paths(&paths)?;
-        let fast_source = TierSource::AdmittedV2 {
-            owner: Arc::new(admit_v2_tier(paths.fast_index(), fast_binding, "fast")?),
-            binding: fast_binding.clone(),
-            source_path: paths.fast_index().to_path_buf(),
-        };
-        let quality_source = match (paths.quality_index(), quality_binding) {
-            (Some(path), Some(binding)) => Some(TierSource::AdmittedV2 {
-                owner: Arc::new(admit_v2_tier(path, binding, "quality")?),
-                binding: binding.clone(),
-                source_path: path.to_path_buf(),
-            }),
+        let quality = match (paths.quality_index(), quality_binding) {
+            (Some(path), Some(binding)) => {
+                validate_v2_pair_contract(fast_binding, binding, "two_tier.v2")?;
+                Some((path, binding))
+            }
             (None, None) => None,
             (Some(path), None) => {
                 return Err(SearchError::InvalidConfig {
@@ -748,9 +758,11 @@ impl TwoTierIndex {
                 });
             }
         };
-        if let Some(quality) = quality_source.as_ref() {
-            fast_source.validate_pair_contract(quality, "two_tier.v2")?;
-        }
+        validate_index_paths(&paths)?;
+        let fast_source = TierSource::open_admitted(paths.fast_index(), fast_binding, "fast")?;
+        let quality_source = quality
+            .map(|(path, binding)| TierSource::open_admitted(path, binding, "quality"))
+            .transpose()?;
         // Compare the retained whole-image witnesses before assembly can read
         // or persist an ANN sidecar for a candidate that will be refused.
         if let Some(current) = incumbent
@@ -790,28 +802,6 @@ impl TwoTierIndex {
     ) -> SearchResult<Self> {
         let fast_index = fast_source.index();
         let mut quality_alignment = QualityAlignment::None;
-
-        // Legacy pairs use their publication nonces to detect a crash between
-        // per-tier installs and degrade to fast-only (bd-miio8). Pre-nonce
-        // pairs still read 0 == 0. Admitted v2 tiers were joined above using
-        // their complete generation; the legacy u16 nonce is not its authority.
-        let quality_source = quality_source.filter(|source| {
-            if source.admitted_owner().is_some() {
-                return true;
-            }
-            let quality_nonce = source.index().publication_nonce();
-            if quality_nonce == fast_index.publication_nonce() {
-                true
-            } else {
-                warn!(
-                    fast_nonce = fast_index.publication_nonce(),
-                    quality_nonce,
-                    "fast/quality publication identities disagree (mixed-generation pair, \
-                     likely a crash between tier installs); degrading to fast-only"
-                );
-                false
-            }
-        });
 
         let quality_index = if let Some(quality) = quality_source.as_ref().map(TierSource::index) {
             if quality.record_count() != fast_index.record_count() {
@@ -1420,17 +1410,19 @@ impl TwoTierIndex {
     /// Join the complete retained generation and cross-tier contracts before
     /// any graph reads vectors. Legacy publication nonces are insufficient.
     fn validate_native_hnsw_tiers(&self, requested_tier: &str) -> SearchResult<()> {
-        self.fast_source
-            .admitted_pair()
+        let fast = self
+            .fast_source
+            .admitted_binding()
             .ok_or_else(|| SearchError::InvalidConfig {
                 field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
                 value: "legacy-fast".to_owned(),
                 reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
             })?;
         match self.quality_source.as_ref() {
-            Some(quality @ TierSource::AdmittedV2 { .. }) => {
-                self.fast_source.validate_pair_contract(
-                    quality,
+            Some(TierSource::AdmittedV2 { binding, .. }) => {
+                validate_v2_pair_contract(
+                    fast,
+                    binding,
                     &format!("two_tier.native_{requested_tier}_hnsw"),
                 )?;
             }
@@ -4855,10 +4847,10 @@ mod tests {
 
     /// A crash between the two per-tier installs leaves a mixed-generation
     /// pair (new fast + old quality). The pair's publication nonces disagree,
-    /// and open must degrade to fast-only instead of silently blending tiers
-    /// from different publications (bd-miio8).
+    /// so discovery omits quality and an explicitly required pair fails
+    /// before ANN construction (bd-miio8).
     #[test]
-    fn open_degrades_to_fast_only_when_tier_publication_identities_disagree() {
+    fn mixed_publication_degrades_discovery_but_refuses_an_explicit_quality_tier() {
         let dir = temp_index_dir("mixed-pair-degrade");
         let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
         builder
@@ -4884,6 +4876,29 @@ mod tests {
             .expect("write doc-b");
         writer.finish().expect("finish staging");
         VectorIndex::install_replacement(&fast_path, &staging).expect("install fast tier only");
+
+        let fast_only = TwoTierIndexPaths::new(&fast_path);
+        let pair = fast_only
+            .clone()
+            .with_quality_index(dir.join(VECTOR_INDEX_QUALITY_FILENAME));
+        #[cfg(feature = "ann")]
+        let pair = pair.with_fast_ann(dir.join("rejected.hnsw"));
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            ..TwoTierConfig::default()
+        };
+        let error = TwoTierIndex::open_with_paths(&pair, config)
+            .expect_err("an explicitly selected tier cannot silently disappear");
+        assert!(matches!(
+            error, SearchError::InvalidConfig { field, .. } if field == "two_tier.quality_publication"
+        ));
+        #[cfg(feature = "ann")]
+        assert!(!dir.join("rejected.hnsw").exists());
+        assert!(
+            !TwoTierIndex::open_with_paths(&fast_only, TwoTierConfig::default())
+                .unwrap()
+                .has_quality_index()
+        );
 
         let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open mixed pair");
         assert!(
@@ -8572,33 +8587,48 @@ mod tests {
     }
 
     #[test]
-    fn admitted_v2_open_requires_binding_for_quality_path() {
+    fn admitted_v2_open_validates_tier_bindings_before_artifact_io() {
         let dir = temp_index_dir("admitted-v2-missing-binding");
         fs::create_dir_all(&dir).expect("create temp dir");
         let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
         let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
         let (fast_binding, _) = fsvi_v2_binding("binding-gap-fast", 4, 1);
         let (quality_binding, _) = fsvi_v2_binding("binding-gap-quality", 4, 1);
-        let rows: [(&str, &[f32]); 1] = [("doc-a", &[1.0, 0.0, 0.0, 0.0])];
-        write_v2_tier(&fast_path, &fast_binding, &rows);
-        write_v2_tier(&quality_path, &quality_binding, &rows);
-
-        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
-        let error = TwoTierIndex::open_admitted_v2_with_paths(
-            &paths,
+        let fast_only = TwoTierIndexPaths::new(&fast_path);
+        let pair = fast_only.clone().with_quality_index(&quality_path);
+        let (foreign, _) = fsvi_v2_binding("binding-gap-quality", 4, 2);
+        // Both paths are absent. A contract refusal must precede artifact I/O.
+        for (paths, binding, expected_field) in [
+            (&pair, None, "two_tier.quality_v2_admission"),
+            (
+                &fast_only,
+                Some(&quality_binding),
+                "two_tier.quality_v2_admission",
+            ),
+            (&pair, Some(&foreign), "two_tier.v2.generation"),
+        ] {
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
+                paths,
+                TwoTierConfig::default(),
+                &fast_binding,
+                binding,
+            )
+            .expect_err("incoherent tier selection must fail before opening the fast path");
+            assert!(matches!(
+                error, SearchError::InvalidConfig { field, .. } if field == expected_field
+            ));
+        }
+        let rows: &[(&str, &[f32])] = &[("doc-a", &[1.0, 0.0, 0.0, 0.0])];
+        write_v2_tier(&fast_path, &fast_binding, rows);
+        write_v2_tier(&quality_path, &quality_binding, rows);
+        let opened = TwoTierIndex::open_admitted_v2_with_paths(
+            &pair,
             TwoTierConfig::default(),
             &fast_binding,
-            None,
+            Some(&quality_binding),
         )
-        .expect_err("a quality path without its binding must be refused");
-        assert!(
-            matches!(
-                error,
-                SearchError::InvalidConfig { ref field, .. }
-                    if field == "two_tier.quality_v2_admission"
-            ),
-            "got {error:?}"
-        );
+        .expect("a coherent request still admits both files");
+        assert_eq!(opened.quality_admitted_binding(), Some(&quality_binding));
     }
 
     #[test]
