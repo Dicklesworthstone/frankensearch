@@ -21,7 +21,8 @@ use super::{
     BundleManifest, COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER,
     CompleteGenerationStore, GENERATIONS, GenerationBuild, GenerationPublication,
     MAX_MANIFEST_BYTES, MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease,
-    PublishedGeneration, checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular,
+    PublishedGeneration, RecoverySelection, checkpoint, decode_pointer, digest, hex, invalid,
+    inventory, open_regular,
     pin_generation, read_bounded_regular, reject_published_write, require_directory,
     stage_activation_pointer, sync_selected_activation, sync_tree, write_new_synced,
 };
@@ -115,12 +116,15 @@ impl fmt::Debug for PreparedGenerationRestore {
 }
 
 impl CompleteGenerationStore {
-    /// Check the existing recovery selection without creating a store or
-    /// retaining publication authority. Missing or malformed bounded text is
-    /// repairable; aliases, special files and oversized evidence are refused.
-    pub(crate) fn validate_recovery_selection(root: &Path) -> SearchResult<()> {
+    /// Observe the canonical store without taking a lease or creating it.
+    /// Missing and malformed bounded descriptors can authorize recovery while
+    /// their exact state persists. Aliases and special files are refused.
+    pub(crate) fn observe_recovery_selection(root: &Path) -> SearchResult<RecoverySelection> {
         super::require_supported_platform()?;
-        selection_evidence(root).map(|_| ())
+        Ok(RecoverySelection {
+            root: root.to_owned(),
+            descriptor: selection_evidence(root)?,
+        })
     }
 
     /// Begin an explicit independent rebuild when the current selection is damaged.
@@ -142,11 +146,25 @@ impl CompleteGenerationStore {
     /// inadmissible security profile or filesystem errors. Malformed bounded
     /// descriptor text and corrupt old artifacts do not prevent recovery.
     pub fn begin_recovery_rebuild(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
+        self.begin_recovery_rebuild_after(cx, None)
+    }
+
+    pub(crate) fn begin_recovery_rebuild_after(
+        &self,
+        cx: &Cx,
+        observed: Option<&RecoverySelection>,
+    ) -> SearchResult<GenerationBuild> {
         checkpoint(cx)?;
         self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation recovery rebuild entry")?;
         let predecessor = selection_evidence(&self.root)?;
+        if observed.is_some_and(|old| old.root != self.root || old.descriptor != predecessor) {
+            return Err(invalid(
+                &self.root,
+                "selection changed since source recovery was requested",
+            ));
+        }
         self.allocate_build(cx, lease, predecessor, false)
     }
 

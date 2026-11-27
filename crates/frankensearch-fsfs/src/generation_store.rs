@@ -96,6 +96,13 @@ pub struct CompleteGenerationStore {
     profile: GenerationRootSecurityProfileV1,
 }
 
+/// Bounded selection evidence observed before source-recovery provisioning.
+pub(crate) struct RecoverySelection {
+    root: PathBuf,
+    // Malformed descriptors are private comparison evidence, never diagnostics.
+    descriptor: Option<Vec<u8>>,
+}
+
 /// One admitted generation. Retaining it pins a directory, not a changing CURRENT.
 ///
 /// All reads for an operation must use this path. Do not resolve CURRENT again

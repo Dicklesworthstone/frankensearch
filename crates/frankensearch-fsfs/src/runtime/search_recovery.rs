@@ -18,10 +18,10 @@ use frankensearch_embed::{
 use frankensearch_index::generation_root::GENERATION_ROOT_AUTHORITY_FILE_NAME;
 
 use super::super::{
-    FSFS_RERANKER_MODEL_ID, FsfsRuntime, PreparedRetainedRecovery, RetainedSearchReader,
-    STORE_OVERLAP_REASON, SearchExecutionMode, canonical_store_root, degraded_search_mode,
-    retained_recovery_error, retained_search_checkpoint,
-    store_overlaps_source, validate_retained_catalog_path,
+    FSFS_RERANKER_MODEL_ID, FsfsRuntime, PreparedRetainedRecovery, RetainedRebuildStart,
+    RetainedSearchReader, STORE_OVERLAP_REASON, SearchExecutionMode, canonical_store_root,
+    degraded_search_mode, retained_recovery_error, retained_search_checkpoint, store_overlaps_source,
+    validate_retained_catalog_path,
 };
 #[cfg(feature = "semantic-support")]
 use super::super::{select_fast_model, select_quality_model};
@@ -264,13 +264,13 @@ impl FsfsRuntime {
                 reason: STORE_OVERLAP_REASON.to_owned(),
             });
         }
-        crate::generation_store::CompleteGenerationStore::validate_recovery_selection(
-            &canonical_root,
-        )?;
+        let selection =
+            crate::generation_store::CompleteGenerationStore::observe_recovery_selection(
+                &canonical_root,
+            )?;
         if self.cli_input.acquire_models {
-            // Provisioning is a standalone cache operation before the rebuild
-            // transaction. The rebuild captures its expected-old selection once
-            // provisioning completes, then retains it through preview/restore.
+            // Acquisition may await the network. A publication during that
+            // interval must win; it cannot become this request's predecessor.
             Box::pin(self.acquire_search_recovery_models(cx, query, limit)).await?;
         }
         let mut recovery = self.clone();
@@ -281,10 +281,15 @@ impl FsfsRuntime {
         recovery.cli_input.daemon_socket = None;
         recovery.config.indexing.offline = true;
 
-        // This existing flow validates source/store disjointness before staging
-        // and captures the incumbent selection before indexing. It builds fresh
-        // data, verifies every stored producer, and never trusts damaged bytes.
-        let mut prepared = Box::pin(recovery.prepare_retained_rebuild(cx, root)).await?;
+        // Compare the original observation under the publication lease before
+        // allocating a candidate. The same predecessor guards preview/restore.
+        let mut prepared = Box::pin(recovery.prepare_retained_rebuild_from_start(
+            cx,
+            root,
+            RetainedRebuildStart::Observed(selection),
+            |_| Ok(()),
+        ))
+        .await?;
         Box::pin(prepared.search(cx, query, limit)).await?;
         if prepared
             .reader
@@ -502,6 +507,44 @@ mod tests {
             );
             assert!(old.path().exists());
             assert!(!directory.path().join("missing-models").exists());
+        });
+    }
+
+    #[test]
+    fn source_recovery_rejects_concurrent_publication_before_allocating_a_candidate() {
+        on_runtime(|cx| async move {
+            for has_predecessor in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, source, root) = fixture(directory.path());
+                if has_predecessor {
+                    publish(&runtime, &cx, &root).await;
+                }
+                let canonical_root = canonical_store_root(&root).unwrap();
+                let selection =
+                    CompleteGenerationStore::observe_recovery_selection(&canonical_root).unwrap();
+                assert_eq!(root.exists(), has_predecessor);
+
+                // A separate publisher finishes while this request is provisioning.
+                fs::write(source.join("winner.md"), QUERY).unwrap();
+                let winner = publish(&runtime, &cx, &root).await;
+                let candidates = generation_count(&root);
+                let stale = Box::pin(runtime.prepare_retained_rebuild_from_start(
+                    &cx,
+                    &root,
+                    RetainedRebuildStart::Observed(selection),
+                    |_| Ok(()),
+                ))
+                .await
+                .unwrap_err();
+                assert!(stale.to_string().contains("selection changed"), "{stale}");
+                assert_eq!(generation_count(&root), candidates);
+                let active = CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(active, winner);
+            }
         });
     }
 

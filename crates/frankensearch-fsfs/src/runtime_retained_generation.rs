@@ -11,6 +11,7 @@ enum RetainedBuildKind {
 
 enum RetainedRebuildStart<'a> {
     Fresh,
+    Observed(crate::generation_store::RecoverySelection),
     Save(&'a mut (dyn FnMut(&RetainedRebuildCheckpoint) -> SearchResult<()> + Send)),
     Resume(&'a RetainedRebuildCheckpoint),
 }
@@ -904,6 +905,9 @@ impl FsfsRuntime {
         };
         let build = match &start {
             RetainedRebuildStart::Resume(receipt) => receipt.resume(cx, &store)?,
+            RetainedRebuildStart::Observed(selection) => {
+                store.begin_recovery_rebuild_after(cx, Some(selection))?
+            }
             _ => match kind {
                 RetainedBuildKind::Index => {
                     let admission = store.admit_build(cx)?;
