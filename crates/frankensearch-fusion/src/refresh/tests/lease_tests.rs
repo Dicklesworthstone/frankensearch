@@ -272,6 +272,82 @@ impl Wake for RefreshWake {
 }
 
 #[test]
+fn idle_worker_cancellation_wakes_before_its_poll_interval_without_consuming_work() {
+    for kind in [
+        asupersync::CancelKind::User,
+        asupersync::CancelKind::Timeout,
+        asupersync::CancelKind::Deadline,
+    ] {
+        for queued in [false, true] {
+            // Poll outside an ambient runtime: the worker must honor its
+            // explicit Cx even when the executor's current task differs.
+            let cx = Cx::for_testing();
+            let dir = temp_index_dir("idle-cancel-wake");
+            let queue = make_queue(2);
+            if queued {
+                submit(&queue, "a", "unpublished payload");
+            }
+            let cache = make_cache(&dir, DIMENSION);
+            let before = cache.current();
+            let fast = Arc::new(StubEmbedder::new("stub-fast", DIMENSION));
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_secs(3_600)),
+                queue.clone(),
+                fast.clone(),
+                cache.clone(),
+            );
+            let wake = Arc::new(RefreshWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut task = Context::from_waker(&waker);
+            let mut running = Box::pin(worker.run(&cx));
+            assert!(running.as_mut().poll(&mut task).is_pending());
+            let wakes_before = wake.0.load(Ordering::SeqCst);
+
+            cx.cancel_fast(kind);
+            assert!(
+                wake.0.load(Ordering::SeqCst) > wakes_before,
+                "cancellation must schedule the worker without waiting for its timer"
+            );
+            assert!(matches!(
+                running.as_mut().poll(&mut task),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(queue.pending_count(), usize::from(queued));
+            assert_eq!(queue.in_flight_count(), 0);
+            assert_eq!(fast.embed_invocations(), 0);
+            assert!(Arc::ptr_eq(&before, &cache.current()));
+            assert_eq!(worker.metrics().cycles.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.metrics().total_retryable.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[test]
+fn dropping_idle_worker_releases_its_cancellation_registration() {
+    let cx = Cx::for_testing();
+    let dir = temp_index_dir("idle-drop");
+    let queue = make_queue(1);
+    submit(&queue, "a", "unpublished payload");
+    let (mut worker, cache, fast) = make_worker(queue.clone(), &dir, DIMENSION);
+    worker.config.poll_interval = Duration::from_secs(3_600);
+    let before = cache.current();
+    let wake = Arc::new(RefreshWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut task = Context::from_waker(&waker);
+    let mut running = Box::pin(worker.run(&cx));
+    assert!(running.as_mut().poll(&mut task).is_pending());
+    drop(running);
+    let wakes_before = wake.0.load(Ordering::SeqCst);
+    cx.cancel_fast(asupersync::CancelKind::User);
+    assert_eq!(wake.0.load(Ordering::SeqCst), wakes_before);
+    assert_eq!(queue.pending_count(), 1);
+    assert_eq!(queue.in_flight_count(), 0);
+    assert_eq!(fast.embed_invocations(), 0);
+    assert!(Arc::ptr_eq(&before, &cache.current()));
+}
+
+#[test]
 fn cancellation_wakes_pending_refresh_and_restores_its_lease_before_return() {
     for quality_pending in [false, true] {
         asupersync::test_utils::run_test_with_cx(move |cx| async move {

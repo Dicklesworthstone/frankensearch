@@ -912,8 +912,25 @@ impl RefreshWorker {
                 return Ok(());
             }
 
-            // Cancel-aware sleep: Instant must come from this Cx, not wall_now().
-            asupersync::time::sleep(cx.now(), self.config.poll_interval).await;
+            // The timer uses this context's clock, but an idle wait must also
+            // register for this explicit context's cancellation. The ambient
+            // runtime task may differ, and deadlines must wake the worker too.
+            match with_cancellation(cx, "refresh.poll_interval", async {
+                asupersync::time::sleep(cx.now(), self.config.poll_interval).await;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(SearchError::Cancelled { .. }) => {
+                    info!(
+                        target: "frankensearch.refresh",
+                        "refresh worker shutting down (cancel requested)"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
 
             if cx.checkpoint().is_err() || cx.is_cancel_requested() {
                 info!(
