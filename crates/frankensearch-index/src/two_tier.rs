@@ -461,8 +461,9 @@ fn validate_v2_pair_contract(
         return Err(SearchError::InvalidConfig {
             field: format!("{field_prefix}.tier_contract"),
             value: "mismatch".to_owned(),
-            reason: "fast and quality tiers require one document-ID contract and semantic/control kind"
-                .to_owned(),
+            reason:
+                "fast and quality tiers require one document-ID contract and semantic/control kind"
+                    .to_owned(),
         });
     }
     Ok(())
@@ -1410,14 +1411,14 @@ impl TwoTierIndex {
     /// Join the complete retained generation and cross-tier contracts before
     /// any graph reads vectors. Legacy publication nonces are insufficient.
     fn validate_native_hnsw_tiers(&self, requested_tier: &str) -> SearchResult<()> {
-        let fast = self
-            .fast_source
-            .admitted_binding()
-            .ok_or_else(|| SearchError::InvalidConfig {
-                field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
-                value: "legacy-fast".to_owned(),
-                reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
-            })?;
+        let fast =
+            self.fast_source
+                .admitted_binding()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: format!("two_tier.native_{requested_tier}_hnsw.owner"),
+                    value: "legacy-fast".to_owned(),
+                    reason: "native retrieval requires an admitted FSVI v2 index".to_owned(),
+                })?;
         match self.quality_source.as_ref() {
             Some(TierSource::AdmittedV2 { binding, .. }) => {
                 validate_v2_pair_contract(

@@ -1222,7 +1222,6 @@ mod tests {
         assert!(!filter.matches("doc-1", Some(&meta)));
     }
 
-
     #[test]
     fn date_range_filter_accepts_indexed_timestamp_strings_without_precision_loss() {
         for timestamp in [i64::MIN, -1, 0, 1500, i64::MAX] {
@@ -1256,9 +1255,10 @@ mod tests {
             );
         }
         let unbounded = DateRangeFilter::new_strict(None, None);
-        assert!(unbounded.matches("dated", Some(&json!({
-            "created_at": "00000000000000000000"
-        }))));
+        assert!(unbounded.matches(
+            "dated",
+            Some(&json!({ "created_at": "00000000000000000000" }))
+        ));
     }
 
     #[test]

@@ -22,9 +22,9 @@ use super::{
     CompleteGenerationStore, GENERATIONS, GenerationBuild, GenerationPublication,
     MAX_MANIFEST_BYTES, MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease,
     PublishedGeneration, RecoverySelection, checkpoint, decode_pointer, digest, hex, invalid,
-    inventory, open_regular,
-    pin_generation, read_bounded_regular, reject_published_write, require_directory,
-    stage_activation_pointer, sync_selected_activation, sync_tree, write_new_synced,
+    inventory, open_regular, pin_generation, read_bounded_regular, reject_published_write,
+    require_directory, stage_activation_pointer, sync_selected_activation, sync_tree,
+    write_new_synced,
 };
 
 #[cfg(unix)]
