@@ -544,7 +544,10 @@ impl SearchFilter for DocTypeFilter {
 /// Matches documents whose `created_at` metadata field (unix timestamp, seconds)
 /// falls within a given range.
 ///
-/// Either bound may be `None` for an open-ended range.
+/// Either bound may be `None` for an open-ended range. Timestamps may be JSON
+/// integers or decimal integer strings of at most 20 bytes, as produced by
+/// `IndexableDocument` metadata. Parsing is exact and checked as `i64`: fractional,
+/// exponential, whitespace-padded, overflowing, and nonnumeric values are rejected.
 /// Permits unavailable metadata by default. Use [`Self::new_strict`] or
 /// [`Self::on_missing_metadata`] with [`MissingMetadataPolicy::Reject`] when
 /// documents without metadata must not match, including for unbounded ranges.
@@ -574,7 +577,7 @@ impl DateRangeFilter {
 
     /// Choose how unavailable metadata affects matching.
     ///
-    /// Missing or non-integer `created_at` fields in present metadata are always
+    /// Missing or malformed `created_at` fields in present metadata are always
     /// rejected, regardless of this policy.
     #[must_use]
     pub const fn on_missing_metadata(mut self, policy: MissingMetadataPolicy) -> Self {
@@ -606,7 +609,14 @@ impl SearchFilter for DateRangeFilter {
         let Some(meta) = metadata else {
             return self.missing_metadata == MissingMetadataPolicy::Allow;
         };
-        let Some(created_at) = meta.get("created_at").and_then(serde_json::Value::as_i64) else {
+        let Some(created_at) = meta.get("created_at").and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_str()
+                    .filter(|text| text.len() <= 20)
+                    .and_then(|text| text.parse::<i64>().ok())
+            })
+        }) else {
             return false;
         };
         if let Some(min) = self.min_timestamp
@@ -1076,7 +1086,7 @@ mod tests {
             (
                 Some(json!({"doc_type": 1, "created_at": "10"})),
                 false,
-                false,
+                true,
             ),
             (
                 Some(json!({"doc_type": "archived", "created_at": 20})),
@@ -1128,7 +1138,7 @@ mod tests {
             json!([]),
             json!({}),
             json!({"created_at": null}),
-            json!({"created_at": "1500"}),
+            json!({"created_at": "1500.5"}),
             json!({"created_at": 1500.5}),
             json!({"created_at": true}),
             json!({"created_at": u64::MAX}),
@@ -1210,6 +1220,75 @@ mod tests {
         let filter = DateRangeFilter::between(1000, 2000);
         let meta = json!({"source": "api"});
         assert!(!filter.matches("doc-1", Some(&meta)));
+    }
+
+
+    #[test]
+    fn date_range_filter_accepts_indexed_timestamp_strings_without_precision_loss() {
+        for timestamp in [i64::MIN, -1, 0, 1500, i64::MAX] {
+            let filter = DateRangeFilter::new_strict(Some(timestamp), Some(timestamp));
+            // IndexableDocument stores metadata in a string-valued map.
+            let indexed = serde_json::to_value(std::collections::HashMap::from([(
+                "created_at".to_owned(),
+                timestamp.to_string(),
+            )]))
+            .unwrap();
+            for metadata in [&indexed, &json!({"created_at": timestamp})] {
+                assert!(filter.matches("dated", Some(metadata)), "{metadata:?}");
+                assert_eq!(filter.matches_doc_id_hash(42, Some(metadata)), Some(true));
+            }
+        }
+        let filter = DateRangeFilter::between(1000, 2000);
+        for (timestamp, expected) in [
+            ("999", false),
+            ("1000", true),
+            ("1500", true),
+            ("2000", true),
+            ("2001", false),
+            ("+1500", true),
+            ("01500", true),
+        ] {
+            let metadata = json!({"created_at": timestamp});
+            assert_eq!(filter.matches("dated", Some(&metadata)), expected);
+            assert_eq!(
+                filter.matches_doc_id_hash(42, Some(&metadata)),
+                Some(expected)
+            );
+        }
+        let unbounded = DateRangeFilter::new_strict(None, None);
+        assert!(unbounded.matches("dated", Some(&json!({
+            "created_at": "00000000000000000000"
+        }))));
+    }
+
+    #[test]
+    fn date_range_filter_rejects_malformed_or_overflowing_timestamp_strings() {
+        for policy in [MissingMetadataPolicy::Allow, MissingMetadataPolicy::Reject] {
+            let filter = DateRangeFilter::new(None, None).on_missing_metadata(policy);
+            for value in [
+                json!(""),
+                json!(" "),
+                json!(" 1500"),
+                json!("1500 "),
+                json!("1.5"),
+                json!("1e3"),
+                json!("1500seconds"),
+                json!("9223372036854775808"),
+                json!("-9223372036854775809"),
+                json!("000000000000000000000"),
+                json!("１２３"),
+                json!(1500.5),
+                json!(u64::MAX),
+                json!(true),
+                json!(null),
+                json!([1500]),
+                json!({"value": 1500}),
+            ] {
+                let metadata = json!({"created_at": value});
+                assert!(!filter.matches("dated", Some(&metadata)), "{metadata:?}");
+                assert_eq!(filter.matches_doc_id_hash(42, Some(&metadata)), Some(false));
+            }
+        }
     }
 
     // --- BitsetFilter ---
