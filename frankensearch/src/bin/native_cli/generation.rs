@@ -234,9 +234,11 @@ routes require explicit --retrieval exact or hnsw; old images remain untouched.\
 With --reuse-vectors, repair instead requires intact authenticated vectors and\n\
 never loads models. It preserves exact vector values and Quill bytes without\n\
 exporting the corpus or running inference. This route preserves a partial subset\n\
-only when both vector owners authenticate. With --complete-quality, source-only\n\
-repair instead rebuilds full coverage from a partial source even when its vectors\n\
-are damaged. It authenticates the source without claiming the old subset survived.\n\
+only when both vector owners authenticate. Source-only partial repair instead\n\
+uses authenticated quality membership in metadata, embedding every fast document\n\
+and only the original quality subset. Historical metadata without membership\n\
+requires healthy --reuse-vectors or explicit --complete-quality. The latter\n\
+rebuilds full coverage even when the original partial vectors are damaged.\n\
 HNSW requires\n\
 --hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
 address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
@@ -1432,13 +1434,6 @@ impl Receipt {
         } else {
             Err(serve_refused("query_tier_unavailable"))
         }
-    }
-
-    fn require_complete_for_mutation(&self) -> Result<()> {
-        if self.quality_documents.is_some() {
-            return Err(serve_refused("partial_quality_mutation_unsupported"));
-        }
-        Ok(())
     }
 
     fn open(&self, cx: &Cx, max_image_bytes: usize) -> Result<NativeGenerationSnapshot> {

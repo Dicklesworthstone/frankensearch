@@ -191,16 +191,21 @@ mod lifecycle {
     use super::super::super::{
         CommitRange, DEFAULT_IMAGE_BYTES, HnswParams, IndexableDocument, MAX_INPUT_BYTES,
         NativeBuildPrecision, NativeGenerationSnapshot, NativeGenerationTopology,
-        PROGRESSIVE_RECEIPT_SCHEMA, PublicationFailure, SearchError, create_root, recover,
-        save_receipt, stage_and_publish, write_immutable,
+        PROGRESSIVE_RECEIPT_SCHEMA, PublicationFailure, SavedAttempt, SearchError, create_root,
+        publish_and_admit, recover, save_receipt, stage_and_publish, write_immutable,
     };
     use super::*;
+    use frankensearch::{GenerationCandidateV1, GenerationPublisherV1};
     use frankensearch_core::generation::{
-        ActivationManifest, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
-        EmbeddingSpaceKindV1, GenerationComponentRole, SourceCheckpointV1,
+        ActivationManifest, CanonicalDocsetV1, EmbeddingArtifactIdentityV1,
+        EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1, ExactComponentReceiptV1,
+        ExactGenerationComponentsV1, GenerationComponentRole, SourceCheckpointV1,
+        compute_manifest_hash,
     };
     use frankensearch_core::{ModelCategory, SearchFuture, SearchResult};
-    use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
+    use frankensearch_index::generation_root::generation_reader::{
+        activation_manifest_path_v1, component_object_name_v1, component_object_path_v1,
+    };
     use frankensearch_index::vector_cohort::ExactVectorCohortV1;
     use std::fs;
     use std::io;
@@ -500,6 +505,132 @@ mod lifecycle {
         }
     }
 
+    /// Publish a genuine historical partial manifest without the newer source
+    /// membership witness. All component bytes, metadata hashes, activation
+    /// receipts and the fixed authority are rebuilt consistently; this is not
+    /// a corrupted-current surrogate for backward compatibility.
+    fn without_source_membership(cx: &Cx, mut fixture: Fixture) -> Fixture {
+        let mut metadata = fixture.snapshot.metadata().clone();
+        assert!(
+            metadata
+                .metadata
+                .remove("native_quality_document_ids_v1")
+                .is_some()
+        );
+        metadata.manifest_hash = compute_manifest_hash(&metadata).unwrap();
+        let metadata_bytes: Arc<[u8]> = serde_json::to_vec(&metadata).unwrap().into();
+        let source = fixture
+            .snapshot
+            .source_documents(cx, MAX_INPUT_BYTES)
+            .unwrap();
+        let documents = CanonicalDocsetV1::from_ordered_live_documents(
+            source.iter().map(|document| document.id.as_str()),
+        )
+        .unwrap();
+        let manifest = fixture.snapshot.retained_snapshot().manifest();
+        assert_eq!(documents.digest(), manifest.document_set_sha256());
+        let retained_receipt = |role| {
+            let bytes = manifest
+                .components()
+                .iter()
+                .find_map(|(candidate, receipt)| (candidate == role).then_some(receipt))
+                .unwrap();
+            ExactComponentReceiptV1 {
+                role,
+                bytes,
+                docset_digest: documents.digest(),
+                live_document_count: metadata.total_documents,
+                source_checkpoint: manifest.source_checkpoint_sha256(),
+            }
+        };
+        let components = ExactGenerationComponentsV1::admit(
+            retained_receipt(GenerationComponentRole::Vector),
+            retained_receipt(GenerationComponentRole::Lexical),
+            manifest
+                .components()
+                .ann
+                .map(|_| retained_receipt(GenerationComponentRole::Ann)),
+            ExactComponentReceiptV1::for_metadata_manifest(&metadata, &metadata_bytes, &documents)
+                .unwrap(),
+        )
+        .unwrap();
+        let candidate = GenerationCandidateV1::new(
+            new_generation(1).unwrap().nonce,
+            None,
+            GenerationAuthorityActionV1::Activate,
+            fixture.selected.generation,
+            [0x51; 32],
+            &components,
+        )
+        .unwrap();
+        let root_path = fixture.parent.join("legacy-root");
+        let root = create_root(&root_path).unwrap();
+        let root_id = new_generation(1).unwrap().nonce;
+        let writer = WriterIdentityV1::for_current_process().unwrap();
+        let mut publisher =
+            GenerationPublisherV1::new(&root, root_id, writer.writer_id, PROFILE).unwrap();
+        let attempt = publisher
+            .prepare_attempt(
+                &candidate,
+                Default::default(),
+                new_generation(1).unwrap().nonce,
+                new_generation(1).unwrap().nonce,
+            )
+            .unwrap();
+        for (role, component) in candidate.manifest().components().iter() {
+            let bytes = if role == GenerationComponentRole::Metadata {
+                Arc::clone(&metadata_bytes)
+            } else {
+                fixture
+                    .snapshot
+                    .retained_snapshot()
+                    .closure()
+                    .bytes(role)
+                    .unwrap()
+            };
+            root.stage_immutable_file(
+                &component_object_path_v1(role, component.sha256).unwrap(),
+                &bytes,
+            )
+            .unwrap();
+        }
+        root.stage_immutable_file(
+            &activation_manifest_path_v1(candidate.authority().object_id).unwrap(),
+            candidate.manifest_bytes(),
+        )
+        .unwrap();
+        let mut receipt = fixture.selected.clone();
+        receipt.root = root_path;
+        receipt.root_id = root_id;
+        receipt.authority = candidate.authority().canonical_bytes().to_vec();
+        receipt.image_bytes = candidate.owned_image_bytes();
+        receipt.attempt = Some(SavedAttempt::from_permit(&attempt, false));
+        receipt.validate().unwrap();
+        fs::rename(
+            fixture.parent.join("selected.json"),
+            fixture.parent.join("selection-with-membership.json"),
+        )
+        .unwrap();
+        save_receipt(&receipt, &fixture.parent.join("selected.json")).unwrap();
+        let snapshot = publish_and_admit(
+            cx,
+            &mut publisher,
+            &candidate,
+            &attempt,
+            &receipt,
+            DEFAULT_IMAGE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(snapshot.topology(), partial_topology());
+        assert_eq!(
+            snapshot.partial_quality_document_ids(cx).unwrap(),
+            ["retry"]
+        );
+        fixture.selected = receipt;
+        fixture.snapshot = Arc::new(snapshot);
+        fixture
+    }
+
     fn damage(cx: &Cx, fixture: &Fixture, role: GenerationComponentRole, missing: bool) -> PathBuf {
         let receipts = fixture.snapshot.retained_snapshot().manifest().components();
         let receipt = receipts
@@ -563,7 +694,8 @@ mod lifecycle {
     #[test]
     fn partial_source_export_survives_graph_damage_and_refuses_missing_membership_proof() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let fixture =
+                without_source_membership(&cx, fixture(&cx, partial_topology(), true, false).await);
             let expected = fixture
                 .snapshot
                 .source_documents(&cx, MAX_INPUT_BYTES)
@@ -1335,10 +1467,208 @@ mod lifecycle {
     }
 
     #[test]
+    fn partial_source_repair_preserves_authenticated_membership_after_vector_and_graph_loss() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (repair_graph, missing) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let fixture = fixture(&cx, partial_topology(), true, false).await;
+                let vector = damage(&cx, &fixture, GenerationComponentRole::Vector, missing);
+                let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, !missing);
+                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                let quality = fixture.quality.as_ref().unwrap();
+                let quality_calls = quality.calls.load(Ordering::SeqCst);
+                let options = if repair_graph {
+                    let mut options = fixture.vector_options("preserved", Some(71), Some(73));
+                    options.repair_vectors.reuse_vectors = false;
+                    options
+                } else {
+                    fixture.options("preserved")
+                };
+                assert!(!options.complete_quality);
+                let mut loads = 0;
+                let mut output = Vec::new();
+                with_loader(&cx, &options, &mut output, |mode| {
+                    loads += 1;
+                    assert_eq!(
+                        mode,
+                        QueryMode::Full,
+                        "both retained producers are required"
+                    );
+                    Ok(fixture.models())
+                })
+                .await
+                .unwrap();
+                assert_eq!(loads, 1);
+                assert_eq!(
+                    fixture.primary.calls.load(Ordering::SeqCst),
+                    primary_calls + 2,
+                    "every fast document must be rebuilt from its authenticated source"
+                );
+                assert_eq!(
+                    quality.calls.load(Ordering::SeqCst),
+                    quality_calls + 1,
+                    "repair must not infer or complete the uncovered quality document"
+                );
+                let receipt = Receipt::read(&options.receipt).unwrap();
+                let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(reopened.topology(), partial_topology());
+                assert_eq!(receipt.schema, fixture.selected.schema);
+                assert_eq!(receipt.quality_documents, Some(1));
+                assert_eq!(receipt.identity, fixture.selected.identity);
+                assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
+                assert_repair_source_and_selection(&cx, &fixture, &receipt, &reopened);
+                let (primary_policy, quality_policy) =
+                    vector_policies(&options, &fixture.selected).unwrap();
+                assert_eq!(reopened.retrieval_configuration(), primary_policy);
+                assert_eq!(reopened.quality_retrieval_configuration(), quality_policy);
+                assert_eq!(
+                    reopened
+                        .retained_snapshot()
+                        .manifest()
+                        .components()
+                        .ann
+                        .is_some(),
+                    repair_graph
+                );
+                for retained in [fixture.snapshot.as_ref(), &reopened] {
+                    assert_eq!(
+                        retained.partial_quality_document_ids(&cx).unwrap(),
+                        ["retry"]
+                    );
+                    let hits = retained
+                        .search_progressive_with_partial_quality(
+                            &cx,
+                            fixture.primary.as_ref(),
+                            quality.as_ref(),
+                            "retry",
+                            2,
+                        )
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), 2);
+                    assert!(
+                        hits.iter()
+                            .find(|hit| hit.doc_id == "retry")
+                            .unwrap()
+                            .quality_score
+                            .is_some()
+                    );
+                    let uncovered = hits.iter().find(|hit| hit.doc_id == "garden").unwrap();
+                    assert!(uncovered.fast_score.is_some());
+                    assert!(uncovered.quality_score.is_none());
+                    assert!(
+                        retained
+                            .search_progressive_with_quality(
+                                &cx,
+                                fixture.primary.as_ref(),
+                                quality.as_ref(),
+                                "garden",
+                                2,
+                            )
+                            .is_err(),
+                        "subset-preserving repair cannot claim full progressive coverage"
+                    );
+                }
+                for (path, absent) in [(vector, missing), (graph, !missing)] {
+                    if absent {
+                        assert!(!path.exists());
+                    } else {
+                        assert_eq!(fs::read(path).unwrap(), b"damaged-component-evidence");
+                    }
+                }
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "repaired");
+                assert_eq!(report["publication"], "committed");
+                assert_eq!(report["quality_completed"], false);
+                assert_eq!(report["model_migrated"], false);
+                assert_eq!(report["vectors_reused"], false);
+                assert_eq!(report["selection"]["quality_documents"], 1);
+            }
+        });
+    }
+
+    #[test]
+    fn partial_source_preservation_failure_never_publishes_or_completes_coverage() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let vector = damage(&cx, &fixture, GenerationComponentRole::Vector, true);
+            let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, false);
+            let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+            for case in [
+                "missing-quality",
+                "inference-error",
+                "inference-cancel",
+                "drift",
+            ] {
+                let primary = Provider::new(false);
+                let quality = Provider::new(true);
+                match case {
+                    "inference-error" => quality.fault.store(1, Ordering::SeqCst),
+                    "inference-cancel" => quality.fault.store(2, Ordering::SeqCst),
+                    "drift" => quality.fault.store(3, Ordering::SeqCst),
+                    _ => {}
+                }
+                let options = fixture.options(case);
+                let mut output = Vec::new();
+                let error = with_loader(&cx, &options, &mut output, |mode| {
+                    assert_eq!(mode, QueryMode::Full);
+                    Ok(Models {
+                        fast: primary.clone(),
+                        quality: (case != "missing-quality")
+                            .then(|| quality.clone() as Arc<dyn Embedder>),
+                    })
+                })
+                .await
+                .unwrap_err();
+                if case == "inference-cancel" {
+                    assert!(matches!(
+                        error.downcast_ref::<SearchError>(),
+                        Some(SearchError::Cancelled { .. })
+                    ));
+                }
+                cx.set_cancel_requested(false);
+                if case == "missing-quality" {
+                    assert_eq!(primary.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                    assert!(!options.work.as_ref().unwrap().exists());
+                } else {
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1, "case {case}");
+                }
+                assert!(output.is_empty(), "case {case}");
+                assert!(!options.receipt.exists(), "case {case}");
+                assert!(!vector.exists());
+                assert_eq!(fs::read(&graph).unwrap(), b"damaged-component-evidence");
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    before
+                );
+                assert_eq!(
+                    fixture.snapshot.partial_quality_document_ids(&cx).unwrap(),
+                    ["retry"]
+                );
+            }
+        });
+    }
+
+    #[test]
     fn partial_source_repair_explicitly_completes_quality_after_vector_loss() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for (repair_graph, missing) in [(false, false), (true, true)] {
+            for (repair_graph, missing, legacy) in [
+                (false, false, false),
+                (true, true, false),
+                (false, true, true),
+                (true, false, true),
+            ] {
                 let fixture = fixture(&cx, partial_topology(), true, false).await;
+                let fixture = if legacy {
+                    without_source_membership(&cx, fixture)
+                } else {
+                    fixture
+                };
                 let damaged = damage(&cx, &fixture, GenerationComponentRole::Vector, missing);
                 assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
                 let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
@@ -1463,7 +1793,8 @@ mod lifecycle {
                     before
                 );
             }
-            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let fixture =
+                without_source_membership(&cx, fixture(&cx, partial_topology(), true, false).await);
             damage(&cx, &fixture, GenerationComponentRole::Vector, true);
             let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
             for case in [
@@ -1820,9 +2151,11 @@ mod lifecycle {
     }
 
     #[test]
-    fn partial_source_completion_and_migration_cannot_replace_a_concurrent_publication() {
+    fn partial_source_repairs_cannot_replace_a_concurrent_publication() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for migrate_model in [false, true] {
+            for (complete_quality, migrate_model) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let fixture = fixture(&cx, partial_topology(), true, false).await;
                 let winner = NativeIndexBuilder::new(
                     fixture.parent.join("completion-winner-work"),
@@ -1853,7 +2186,7 @@ mod lifecycle {
                 let root = admit_root(&fixture.selected.root).unwrap();
                 let original_pair = fixture.snapshot.retained_snapshot().authority_pair();
                 let mut options = fixture.options("stale-completion");
-                options.complete_quality = true;
+                options.complete_quality = complete_quality;
                 options.migrate_model = migrate_model;
                 let primary = if migrate_model {
                     Provider::replacement(false, "concurrent-primary", false)
@@ -1902,7 +2235,7 @@ mod lifecycle {
                 assert!(losing_receipt.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
                 assert!(!damaged.exists());
                 let mut retry = fixture.options("stale-completion-retry");
-                retry.complete_quality = true;
+                retry.complete_quality = complete_quality;
                 retry.migrate_model = migrate_model;
                 let mut loads = 0;
                 assert!(
@@ -1925,10 +2258,18 @@ mod lifecycle {
     #[test]
     fn partial_vector_repair_preserves_sparse_quality_bits_without_models_or_source_export() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for (primary_seed, quality_seed, missing) in
-                [(Some(41), Some(43), false), (None, None, true)]
-            {
+            for (primary_seed, quality_seed, missing, legacy) in [
+                (Some(41), Some(43), false, false),
+                (None, None, true, false),
+                (Some(41), Some(43), true, true),
+                (None, None, false, true),
+            ] {
                 let fixture = fixture(&cx, partial_topology(), true, false).await;
+                let fixture = if legacy {
+                    without_source_membership(&cx, fixture)
+                } else {
+                    fixture
+                };
                 let original = partial_cohort(&cx, &fixture.selected, &fixture.snapshot);
                 let lexical = fixture
                     .snapshot
@@ -1949,8 +2290,9 @@ mod lifecycle {
                 let source =
                     open_vector_source(&cx, &root, &fixture.selected, DEFAULT_IMAGE_BYTES).unwrap();
                 assert_eq!(source.source().topology(), partial_topology());
-                // Healthy vector membership authorizes this path. Source-only
-                // and ordinary complete admission must still refuse it.
+                // Healthy vector membership authorizes this path. Ordinary
+                // complete-coverage source and vector admission must still
+                // refuse the sparse cohort; partial source admission is explicit.
                 assert!(
                     NativeGenerationSource::admit(
                         &cx,
@@ -1995,6 +2337,15 @@ mod lifecycle {
                 let receipt = Receipt::read(&options.receipt).unwrap();
                 let reopened = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
                 assert_eq!(reopened.topology(), partial_topology());
+                assert_eq!(
+                    reopened
+                        .metadata()
+                        .metadata
+                        .get("native_quality_document_ids_v1")
+                        .map(String::as_str),
+                    Some("[\"retry\"]"),
+                    "retained-vector repair upgrades legacy source membership proof"
+                );
                 assert_eq!(receipt.quality_documents, Some(1));
                 assert_eq!(receipt.identity, fixture.selected.identity);
                 assert_eq!(receipt.quality_identity, fixture.selected.quality_identity);
@@ -2111,7 +2462,8 @@ mod lifecycle {
     #[test]
     fn partial_vector_repair_refuses_source_only_forged_coverage_and_unhealthy_vectors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fixture = fixture(&cx, partial_topology(), true, false).await;
+            let fixture =
+                without_source_membership(&cx, fixture(&cx, partial_topology(), true, false).await);
             let graph = damage(&cx, &fixture, GenerationComponentRole::Ann, false);
             let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
             for case in [
@@ -2284,21 +2636,69 @@ mod lifecycle {
                 };
                 let stale = build("stale-vector-work");
                 if matches!(topology, NativeGenerationTopology::PartialQuality { .. }) {
-                    // A vector-admitted source cannot authorize the source-only
-                    // repair route, even when the proposed subset is unchanged.
-                    assert!(
-                        prepare_repair(
-                            source.source(),
-                            &stale,
-                            DEFAULT_IMAGE_BYTES,
-                            NativeBuildRetrieval::Exact,
-                            quality_policy,
-                            false,
-                        )
-                        .is_err()
+                    // Either authenticated source metadata or retained vector
+                    // ownership can prove the exact subset before publication.
+                    // The reuse flag does not substitute for that proof.
+                    let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                    let quality = fixture.quality.as_ref().unwrap();
+                    let quality_calls = quality.calls.load(Ordering::SeqCst);
+                    prepare_repair(
+                        &cx,
+                        source.source(),
+                        &stale,
+                        DEFAULT_IMAGE_BYTES,
+                        NativeBuildRetrieval::Exact,
+                        quality_policy,
+                        false,
+                    )
+                    .unwrap();
+                    assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), primary_calls);
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls);
+                    let substituted = NativeIndexBuilder::new(
+                        fixture.parent.join("wrong-subset-work"),
+                        new_generation(2).unwrap(),
+                        fixture.primary.clone(),
+                    )
+                    .unwrap()
+                    .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .with_quality_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
+                    .unwrap()
+                    .add_documents(
+                        fixture
+                            .snapshot
+                            .source_documents(&cx, MAX_INPUT_BYTES)
+                            .unwrap(),
+                    )
+                    .build_partial_quality_generation(
+                        &cx,
+                        fixture.snapshot.metadata().commit_range.clone(),
+                        ["garden".to_owned()],
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        substituted.metadata().vector_artifacts[1].vector_count,
+                        stale.metadata().vector_artifacts[1].vector_count
                     );
+                    let result = prepare_repair(
+                        &cx,
+                        source.source(),
+                        &substituted,
+                        DEFAULT_IMAGE_BYTES,
+                        NativeBuildRetrieval::Exact,
+                        quality_policy,
+                        false,
+                    );
+                    assert!(matches!(
+                        result,
+                        Err(error) if error.to_string().contains("exact authenticated quality subset")
+                    ));
                 }
                 let stale_prepared = prepare_repair(
+                    &cx,
                     source.source(),
                     &stale,
                     DEFAULT_IMAGE_BYTES,
@@ -2309,6 +2709,7 @@ mod lifecycle {
                 .unwrap();
                 let winner = build("winning-vector-work");
                 let winning_prepared = prepare_repair(
+                    &cx,
                     source.source(),
                     &winner,
                     DEFAULT_IMAGE_BYTES,

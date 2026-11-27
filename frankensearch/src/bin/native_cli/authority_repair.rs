@@ -42,9 +42,9 @@ enum SourceRepair {
 }
 
 impl SourceRepair {
-    fn facts(&self) -> Result<RepairSourceFacts<'_>> {
+    fn facts(&self, cx: &Cx) -> Result<RepairSourceFacts<'_>> {
         match self {
-            Self::Preserve(source) => RepairSourceFacts::preserving(source, false),
+            Self::Preserve(source) => RepairSourceFacts::preserving(cx, source),
             Self::CompleteQuality(source) => Ok(RepairSourceFacts {
                 retained: source.retained_source(),
                 metadata: source.metadata(),
@@ -54,6 +54,7 @@ impl SourceRepair {
                 // This is the explicitly authorized successor coverage, never
                 // a claim that the damaged predecessor's subset was admitted.
                 coverage: VectorCohortCoverage::Complete,
+                quality_document_ids: None,
             }),
         }
     }
@@ -77,20 +78,17 @@ struct RepairSourceFacts<'a> {
     quality: Option<&'a FsviV2IdentityBinding>,
     tier: EmbedderTierTag,
     coverage: VectorCohortCoverage,
+    quality_document_ids: Option<Vec<String>>,
 }
 
 impl<'a> RepairSourceFacts<'a> {
-    fn preserving(source: &'a NativeGenerationSource, reuse_vectors: bool) -> Result<Self> {
-        let coverage = match source.topology() {
-            NativeGenerationTopology::PartialQuality { .. } if reuse_vectors => {
-                VectorCohortCoverage::PartialQuality
-            }
-            NativeGenerationTopology::PartialQuality { .. } => {
-                return Err(bad(
-                    "partial quality repair requires authenticated retained vectors or explicit completion",
-                ));
-            }
-            _ => VectorCohortCoverage::Complete,
+    fn preserving(cx: &Cx, source: &'a NativeGenerationSource) -> Result<Self> {
+        let (coverage, quality_document_ids) = match source.topology() {
+            NativeGenerationTopology::PartialQuality { .. } => (
+                VectorCohortCoverage::PartialQuality,
+                Some(source.partial_quality_document_ids(cx)?),
+            ),
+            _ => (VectorCohortCoverage::Complete, None),
         };
         Ok(Self {
             retained: source.retained_source(),
@@ -99,6 +97,7 @@ impl<'a> RepairSourceFacts<'a> {
             quality: source.quality_binding(),
             tier: source.tier(),
             coverage,
+            quality_document_ids,
         })
     }
 }
@@ -198,11 +197,6 @@ where
             "--complete-quality requires a partial-quality repair source",
         ));
     }
-    if !options.repair_vectors.reuse_vectors && !options.complete_quality {
-        // Source metadata alone does not authenticate the selected quality IDs.
-        // Only healthy retained vectors can preserve a partial quality subset.
-        selected.require_complete_for_mutation()?;
-    }
     options.quality.validate_usage(
         selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
     )?;
@@ -237,6 +231,7 @@ where
         checkpoint(cx)?;
         let built = built?;
         let prepared = prepare_repair(
+            cx,
             source.source(),
             &built,
             options.max_image_bytes,
@@ -258,11 +253,11 @@ where
         } else {
             SourceRepair::Preserve(open_source(cx, &root, &selected, options.max_image_bytes)?)
         };
-        let facts = source.facts()?;
+        let facts = source.facts(cx)?;
         facts.retained.head().authority.next_sequence()?;
         let documents = source.source_documents(cx, options.max_source_bytes)?;
         validate_retained_documents(cx, &documents)?;
-        let loaded = load_models(if options.complete_quality {
+        let loaded = load_models(if facts.quality.is_some() {
             QueryMode::Full
         } else {
             selected.query_mode(None)?
@@ -294,7 +289,15 @@ where
                 )?;
         }
         let source_cut = facts.metadata.commit_range.clone();
-        let built = if selected.quality_identity.is_some() {
+        let built = if let Some(quality_ids) = &facts.quality_document_ids {
+            Box::pin(builder.build_partial_quality_generation(
+                cx,
+                source_cut,
+                quality_ids.iter().cloned(),
+                options.max_image_bytes,
+            ))
+            .await
+        } else if selected.quality_identity.is_some() {
             Box::pin(builder.build_progressive_generation(cx, source_cut, options.max_image_bytes))
                 .await
         } else {
@@ -314,6 +317,7 @@ where
             return Err(bad("the repair providers changed after identity admission"));
         }
         let prepared = prepare_repair_with_identities(
+            cx,
             &facts,
             &built,
             options.max_image_bytes,
@@ -489,14 +493,28 @@ fn open_source(
     max_image_bytes: usize,
 ) -> Result<NativeGenerationSource> {
     let (opened, budget) = open_source_capability(cx, root, selected, max_image_bytes)?;
-    let source = NativeGenerationSource::admit(
-        cx,
-        opened,
-        &selected.binding()?,
-        selected.quality_binding()?.as_ref(),
-        selected.tier,
-        budget,
-    );
+    let primary = selected.binding()?;
+    let quality = selected.quality_binding()?;
+    let source = if selected.quality_documents.is_some() {
+        NativeGenerationSource::admit_partial_quality(
+            cx,
+            opened,
+            &primary,
+            quality
+                .as_ref()
+                .ok_or_else(|| bad("missing partial quality identity"))?,
+            budget,
+        )
+    } else {
+        NativeGenerationSource::admit(
+            cx,
+            opened,
+            &primary,
+            quality.as_ref(),
+            selected.tier,
+            budget,
+        )
+    };
     checkpoint(cx)?;
     let source = source?;
     if source.topology() != selected.topology()
@@ -588,6 +606,7 @@ fn admit_models(
 // into publication intent. Ordinary rebuild/activation still require complete
 // admitted snapshots and never bypass damaged derived-image admission.
 fn prepare_repair(
+    cx: &Cx,
     source: &NativeGenerationSource,
     built: &NativeBuiltExactGeneration,
     max_image_bytes: usize,
@@ -595,7 +614,7 @@ fn prepare_repair(
     quality_policy: Option<NativeBuildRetrieval>,
     reuse_vectors: bool,
 ) -> Result<PreparedPublication> {
-    let facts = RepairSourceFacts::preserving(source, reuse_vectors)?;
+    let facts = RepairSourceFacts::preserving(cx, source)?;
     let identities = RepairIdentities {
         primary: source.binding().frozen_identity().clone(),
         quality: source
@@ -603,6 +622,7 @@ fn prepare_repair(
             .map(|binding| binding.frozen_identity().clone()),
     };
     prepare_repair_with_identities(
+        cx,
         &facts,
         built,
         max_image_bytes,
@@ -613,6 +633,7 @@ fn prepare_repair(
 }
 
 fn prepare_repair_with_identities(
+    cx: &Cx,
     source: &RepairSourceFacts<'_>,
     built: &NativeBuiltExactGeneration,
     max_image_bytes: usize,
@@ -659,6 +680,14 @@ fn prepare_repair_with_identities(
         return Err(bad(
             "repair must preserve the complete authenticated document set and source checkpoint",
         ));
+    }
+    if let Some(quality_ids) = &source.quality_document_ids {
+        let preview = built.preview_candidate(cx, &candidate)?;
+        if preview.partial_quality_document_ids(cx)? != *quality_ids {
+            return Err(bad(
+                "repair must preserve the exact authenticated quality subset",
+            ));
+        }
     }
     if candidate
         .manifest()
