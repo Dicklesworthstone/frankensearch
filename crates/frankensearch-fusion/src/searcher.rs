@@ -3674,13 +3674,16 @@ impl TwoTierSearcher {
                 // A graph or lexical lookup can supply the first known
                 // metadata for a retained fast hit. Count and attest the
                 // eligible pool only after those observations are reconciled.
-                if self.search_params.is_none()
-                    && index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
+                if index_zero_signal != Some(ZeroSignalReason::ZeroNormQuery)
                     && let Some(activated) = activated_fast
                 {
                     let coverage_start = Instant::now();
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
-                    metrics.coverage = Some(activated.coverage(&fast_hits, fast_retrieval_limit)?);
+                    metrics.coverage = Some(activated.coverage_with_params(
+                        &fast_hits,
+                        fast_retrieval_limit,
+                        self.search_params,
+                    )?);
                     cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
                     // Include coverage replay without charging graph ranking
                     // to the vector-search timer.
@@ -10213,49 +10216,35 @@ mod tests {
                             quality.bound_embeds.load(Ordering::Relaxed),
                             u64::from(!fast_only)
                         );
-                        if let Some(coverage) = &metrics.coverage {
-                            if layout == "native-v2" && !exact_override {
-                                assert!(
-                                    matches!(
-                                        coverage.fast,
-                                        frankensearch_core::TierQueryCoverageV1::Witnessed {
-                                            live_count: 66,
-                                            contributed_candidates: 2,
-                                            ..
-                                        }
-                                    ),
-                                    "{coverage:?}"
-                                );
-                            } else {
-                                assert_eq!(
-                                    coverage.fast,
-                                    frankensearch_core::TierQueryCoverageV1::NotRequested
-                                );
-                            }
-                            if fast_only {
-                                assert_eq!(
-                                    coverage.quality,
-                                    frankensearch_core::TierQueryCoverageV1::NotRequested
-                                );
-                            } else {
-                                assert!(
-                                    matches!(
-                                        coverage.quality,
-                                        frankensearch_core::TierQueryCoverageV1::Witnessed {
-                                            live_count: 66,
-                                            contributed_candidates: 2,
-                                            ..
-                                        }
-                                    ),
-                                    "{coverage:?}"
-                                );
-                            }
-                        } else {
-                            assert!(
-                                layout == "stamped-v1"
-                                    || (fast_only && (layout != "native-v2" || exact_override))
-                            );
+                        let fast_witnessed = layout == "native-v2" || exact_override;
+                        if layout == "stamped-v1" || (fast_only && !fast_witnessed) {
+                            assert!(metrics.coverage.is_none());
+                            continue;
                         }
+                        let coverage = metrics.coverage.expect("v2 retrieval coverage");
+                        let tail_witness = frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 83,
+                            live_count: 66,
+                            contributed_candidates: 2,
+                        };
+                        assert_eq!(
+                            coverage.fast,
+                            if fast_witnessed {
+                                tail_witness.clone()
+                            } else {
+                                frankensearch_core::TierQueryCoverageV1::NotRequested
+                            },
+                            "{layout}, exact={exact_override}"
+                        );
+                        assert_eq!(
+                            coverage.quality,
+                            if fast_only {
+                                frankensearch_core::TierQueryCoverageV1::NotRequested
+                            } else {
+                                tail_witness
+                            },
+                            "{layout}, exact={exact_override}"
+                        );
                     }
                 }
             }
@@ -13557,18 +13546,19 @@ mod tests {
                 let (hits, metrics) = searcher.search_collect(&cx, "query", 1).await.unwrap();
                 assert!(hits.is_empty());
                 assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::NoUsableVectors));
-                if exact_override {
-                    assert!(metrics.coverage.is_none());
-                } else {
-                    assert_eq!(
-                        metrics.coverage.unwrap().fast,
-                        frankensearch_core::TierQueryCoverageV1::Witnessed {
-                            generation_sequence: 79,
-                            live_count: 1,
-                            contributed_candidates: 0,
-                        }
-                    );
-                }
+                let coverage = metrics.coverage.expect("activated hash-control coverage");
+                assert_eq!(
+                    coverage.topology,
+                    frankensearch_core::RetrievalTopology::HashControl
+                );
+                assert_eq!(
+                    coverage.fast,
+                    frankensearch_core::TierQueryCoverageV1::Witnessed {
+                        generation_sequence: 79,
+                        live_count: 1,
+                        contributed_candidates: 0,
+                    }
+                );
             }
         });
     }
@@ -13646,7 +13636,25 @@ mod tests {
                     assert!(metrics.coverage.is_none());
                 } else {
                     assert_eq!(hits[0].doc_id, ids[if exact_override { 3 } else { 0 }]);
-                    assert_eq!(metrics.coverage.is_some(), !exact_override);
+                    // The exact winner is outside the native graph's top-one
+                    // window. A native replay would count zero for that hit.
+                    let coverage = metrics.coverage.expect("activated fast coverage");
+                    assert_eq!(
+                        coverage.topology,
+                        frankensearch_core::RetrievalTopology::FastOnly
+                    );
+                    assert_eq!(
+                        coverage.fast,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 70,
+                            live_count: 4,
+                            contributed_candidates: 1,
+                        }
+                    );
+                    assert_eq!(
+                        coverage.quality,
+                        frankensearch_core::TierQueryCoverageV1::NotRequested
+                    );
                 }
                 assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 1);
             }
@@ -13701,13 +13709,36 @@ mod tests {
                 if exact_override {
                     searcher = searcher.with_search_params(SearchParams::default());
                 }
-                let (results, _) = searcher.search_collect(&cx, "needle", 1).await.unwrap();
+                let (results, metrics) = searcher.search_collect(&cx, "needle", 1).await.unwrap();
                 assert_eq!(results.len(), 1);
                 assert_eq!(
                     results[0].doc_id, expected,
                     "exact override {exact_override}"
                 );
                 assert!(results[0].fast_score.is_some());
+                if exact_override {
+                    let coverage = metrics
+                        .coverage
+                        .expect("exact fast coverage without a graph");
+                    assert_eq!(
+                        coverage.topology,
+                        frankensearch_core::RetrievalTopology::FastOnly
+                    );
+                    assert_eq!(
+                        coverage.fast,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 95,
+                            live_count: 2,
+                            contributed_candidates: 1,
+                        }
+                    );
+                    assert_eq!(
+                        coverage.quality,
+                        frankensearch_core::TierQueryCoverageV1::NotRequested
+                    );
+                } else {
+                    assert!(metrics.coverage.is_none());
+                }
             }
         });
     }
@@ -13872,13 +13903,26 @@ mod tests {
                     if layout == "stamped-v1" {
                         assert!(metrics.coverage.is_none(), "v1 cannot mint v2 coverage");
                     } else {
+                        let coverage = metrics.coverage.expect("progressive v2 coverage");
                         // Replaying the native graph for the exact winner
                         // would incorrectly report zero contributed candidates.
                         assert_eq!(
-                            metrics.coverage.unwrap().quality,
+                            coverage.quality,
                             frankensearch_core::TierQueryCoverageV1::Witnessed {
                                 generation_sequence: 79,
                                 live_count: 4,
+                                contributed_candidates: 1,
+                            }
+                        );
+                        assert_eq!(
+                            coverage.topology,
+                            frankensearch_core::RetrievalTopology::FullProgressive
+                        );
+                        assert_eq!(
+                            coverage.fast,
+                            frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                generation_sequence: 79,
+                                live_count: 1,
                                 contributed_candidates: 1,
                             }
                         );
@@ -21915,6 +21959,24 @@ mod tests {
                         }));
                         if mode != "progressive" {
                             assert_eq!(metrics.semantic_candidates, 2);
+                        }
+                        if mode == "fast"
+                            && layout != "stamped-v1"
+                            && (exact_override || layout == "native-v2")
+                        {
+                            assert_eq!(
+                                metrics
+                                    .coverage
+                                    .as_ref()
+                                    .expect("activated fast coverage")
+                                    .fast,
+                                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                    generation_sequence: 79,
+                                    live_count: u64::try_from(fast_rows.len()).unwrap(),
+                                    contributed_candidates: 2,
+                                },
+                                "fast coverage must use the final eligible retrieval window",
+                            );
                         }
                         if layout != "stamped-v1" && mode != "fast" {
                             assert_eq!(

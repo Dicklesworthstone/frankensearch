@@ -103,14 +103,14 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".coverage(",
-      "count": 1,
-      "note": "run_phase1 fast coverage."
+      "count": 0,
+      "note": "Owner-backed paths use the policy-aware method to replay the backend that served the candidates."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".coverage_with_params(",
-      "count": 2,
-      "note": "The direct quality-only and progressive quality paths each mint coverage after candidate reconciliation, using the original retained activation and the final retrieval limit."
+      "count": 3,
+      "note": "Phase 1 fast, direct quality-only, and progressive quality mint coverage after candidate reconciliation, using the retained activation, final retrieval limit, and selected search parameters."
     }
   ]
 }
