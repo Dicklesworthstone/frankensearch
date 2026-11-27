@@ -17473,6 +17473,8 @@ impl FsfsRuntime {
         let manifests = self.resolve_download_manifests()?;
         let operation = if self.cli_input.download_list {
             "list"
+        } else if self.cli_input.download_verify_loader {
+            "verify-loader"
         } else if self.cli_input.download_verify {
             "verify"
         } else {
@@ -17502,7 +17504,13 @@ impl FsfsRuntime {
             }
 
             // ubs:ignore -- public CLI operation tag, not secret material.
-            let (present, verified, verify_message) = if operation == "verify" {
+            let (present, verified, verify_message) = if operation == "verify-loader" {
+                let model = manifest.clone();
+                let path = destination.clone();
+                spawn_blocking(move || Self::verify_installed_loader(&model, &path)).await?;
+                Self::semantic_retry_checkpoint(cx, "download_models.verify_loader")?;
+                (true, Some(true), None)
+            } else if operation == "verify" {
                 verify_dir_and_record(&manifest, &destination)?;
                 (true, Some(true), None)
             } else {
@@ -17528,11 +17536,11 @@ impl FsfsRuntime {
                         verify_message,
                     )
                 }
-                "verify" => Self::download_model_entry(
+                "verify" | "verify-loader" => Self::download_model_entry(
                     &manifest,
                     &install_dir,
                     &destination,
-                    "verified",
+                    if operation == "verify-loader" { "loadable" } else { "verified" },
                     Some(true),
                     Self::path_bytes(&destination)?,
                     None,
@@ -20391,14 +20399,22 @@ impl FsfsRuntime {
 
     #[cfg(feature = "semantic-support")]
     fn probe_model_loader(status: &FsfsModelStatus, index_root: &Path) -> SearchResult<()> {
-        let model_path = Path::new(&status.cache_path);
-        if status.tier == "quality"
-            && let Some(native_model) = NativeQualityModel::from_name(&status.name)
+        let model =
+            Self::open_probe_model(&status.tier, &status.name, Path::new(&status.cache_path))?;
+        Self::validate_doctor_model_generation(index_root, &status.tier, model.as_ref())
+    }
+
+    #[cfg(feature = "semantic-support")]
+    fn open_probe_model(
+        tier: &str,
+        name: &str,
+        model_path: &Path,
+    ) -> SearchResult<Box<dyn Embedder>> {
+        if tier == "quality"
+            && let Some(native_model) = NativeQualityModel::from_name(name)
         {
             #[cfg(feature = "rerank")]
-            return native_model.load(model_path).and_then(|embedder| {
-                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
-            });
+            return Ok(Box::new(native_model.load(model_path)?));
             #[cfg(not(feature = "rerank"))]
             return Err(SearchError::EmbedderUnavailable {
                 model: native_model.manifest_id().to_owned(),
@@ -20406,7 +20422,7 @@ impl FsfsRuntime {
                     .to_owned(),
             });
         }
-        match status.tier.as_str() {
+        match tier {
             // Deliberately the UNSHARED loader, not `load_shared_with_name`.
             // This probe exists to prove the artifact still loads, and a
             // process-cache hit would answer from a model read minutes ago
@@ -20415,20 +20431,15 @@ impl FsfsRuntime {
             // point here, and `doctor` is not a hot path (GH #46). The
             // configured model selects which registered manifest admits the
             // directory (GH #50).
-            "fast" => select_fast_model(&status.name)
-                .and_then(|registration| {
-                    Model2VecEmbedder::load_registered(model_path, &registration)
-                })
-                .and_then(|embedder| {
-                    Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
-                }),
+            "fast" => Ok(Box::new(Model2VecEmbedder::load_registered(
+                model_path,
+                &select_fast_model(name)?,
+            )?)),
             #[cfg(feature = "semantic-loaders")]
-            "quality" => FastEmbedEmbedder::load_with_name(model_path, &status.name).and_then(|embedder| {
-                Self::validate_doctor_model_generation(index_root, &status.tier, &embedder)
-            }),
+            "quality" => Ok(Box::new(FastEmbedEmbedder::load_with_name(model_path, name)?)),
             #[cfg(not(feature = "semantic-loaders"))]
             "quality" => Err(SearchError::EmbedderUnavailable {
-                model: status.name.clone(),
+                model: name.to_owned(),
                 reason: "this fsfs build has no ONNX quality loader; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2, then run fsfs download-models and rebuild the index with that producer".to_owned(),
             }),
             other => Err(SearchError::InvalidConfig {
@@ -21315,6 +21326,21 @@ impl FsfsRuntime {
     }
 
     fn resolve_download_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
+        if self.cli_input.download_verify_loader {
+            let id = self.cli_input.model_name.as_deref().unwrap_or_default();
+            let mut catalog = ModelManifest::builtin_catalog().models;
+            catalog.extend(ModelManifest::opt_in_catalog().models);
+            let model = catalog
+                .into_iter()
+                .find(|manifest| manifest.id.eq_ignore_ascii_case(id))
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "cli.download.model".into(),
+                    value: id.to_owned(),
+                    reason: "--verify-loader requires an exact registered embedding model ID"
+                        .into(),
+                })?;
+            return Ok(vec![model]);
+        }
         #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
         if !self.cli_input.download_list && self.cli_input.model_name.is_none() {
             let fast = select_fast_model(&self.config.indexing.fast_model)?;
@@ -21386,6 +21412,35 @@ impl FsfsRuntime {
         })
     }
 
+    fn verify_installed_loader(manifest: &ModelManifest, path: &Path) -> SearchResult<()> {
+        #[cfg(not(feature = "semantic-support"))]
+        {
+            let _ = path;
+            Err(SearchError::EmbedderUnavailable {
+                model: manifest.id.clone(),
+                reason: "this fsfs build has no semantic embedding loader".into(),
+            })
+        }
+        #[cfg(feature = "semantic-support")]
+        {
+            use frankensearch_embed::model_manifest::ModelTier;
+            let tier = match manifest.tier {
+                Some(ModelTier::Fast) => "fast",
+                Some(ModelTier::Quality) => "quality",
+                _ => {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.download.model".into(),
+                        value: manifest.id.clone(),
+                        reason: "--verify-loader supports fast and quality embedding models".into(),
+                    });
+                }
+            };
+            verify_dir_and_record(manifest, path)?;
+            let model = Self::open_probe_model(tier, &manifest.id, path)?;
+            model.identity()?.validate()
+        }
+    }
+
     fn non_production_manifest_entry(
         manifest: &ModelManifest,
         install_dir: &str,
@@ -21398,7 +21453,7 @@ impl FsfsRuntime {
         }
 
         let message = Self::non_production_manifest_message(manifest);
-        if matches!(operation, "download") && explicit_request {
+        if matches!(operation, "download" | "verify-loader") && explicit_request {
             return Err(SearchError::InvalidConfig {
                 field: "cli.download.model".to_owned(),
                 value: manifest.id.clone(),
@@ -30687,6 +30742,7 @@ Commands:
   flush                     Publish pending lexical writes durably
   config <action>           Manage configuration
   download-models [model]   Download/verify embedding models
+                            --verify-loader checks files and opens the exact model offline
   doctor                    Run local health checks
   recover [options]         Inspect, prepare, restore or repair a receipted generation (see recover --help)
   update [--check]          Check/apply binary updates
@@ -34764,7 +34820,7 @@ fn render_download_models_table(payload: &FsfsDownloadModelsPayload, no_color: b
     let _ = writeln!(out);
     for model in &payload.models {
         let state_color = match model.state.as_str() {
-            "cached" | "verified" | "downloaded" => "32",
+            "cached" | "verified" | "loadable" | "downloaded" => "32",
             "missing" | "skipped" | "unavailable" => "33",
             "corrupt" | "mismatch" => "31",
             _ => "90",
@@ -65513,6 +65569,25 @@ mod tests {
             .resolve_download_manifests()
             .expect_err("unknown model");
         assert!(err.to_string().contains("unknown model"));
+    }
+
+    #[test]
+    fn loader_verification_requires_an_exact_manifest_id() {
+        let select = |id: &str| {
+            FsfsRuntime::new(FsfsConfig::default())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Download,
+                    download_verify: true,
+                    download_verify_loader: true,
+                    model_name: Some(id.to_owned()),
+                    ..CliInput::default()
+                })
+                .resolve_download_manifests()
+        };
+        assert!(select("potion").is_err());
+        let models = select("ALL-MINILM-L6-V2-NATIVE").unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "all-minilm-l6-v2-native");
     }
 
     /// Per-user dirs laid out like the Linux XDG defaults under

@@ -245,6 +245,8 @@ pub struct CliInput {
     pub download_list: bool,
     /// Whether `--verify` was requested (for download command).
     pub download_verify: bool,
+    /// Open one exact registered embedding model with this binary's loader.
+    pub download_verify_loader: bool,
     /// Optional output/cache root override (for download command).
     pub download_output_dir: Option<PathBuf>,
     /// Config subcommand (get/set/list/reset).
@@ -770,15 +772,16 @@ where
                 input.download_list = true;
                 idx += 1;
             }
-            "--verify" => {
+            "--verify" | "--verify-loader" => {
                 if command != CliCommand::Download {
                     return Err(SearchError::InvalidConfig {
                         field: "cli.flag".into(),
-                        value: "--verify".into(),
-                        reason: "--verify is only valid for the download command".into(),
+                        value: tokens[idx].clone(),
+                        reason: "model verification is only valid for the download command".into(),
                     });
                 }
                 input.download_verify = true;
+                input.download_verify_loader |= tokens[idx] == "--verify-loader";
                 idx += 1;
             }
             "--output" => {
@@ -1154,6 +1157,13 @@ fn validate_required_args(input: &CliInput) -> SearchResult<()> {
             reason: "use either --list or --verify, not both".into(),
         });
     }
+    if input.download_verify_loader && input.model_name.is_none() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.download.model".into(),
+            value: "--verify-loader".into(),
+            reason: "supply the exact embedding model ID to verify with this binary".into(),
+        });
+    }
     if input.command == CliCommand::Delete && input.delete_ids.is_empty() {
         return Err(SearchError::InvalidConfig {
             field: "cli.delete.ids".into(),
@@ -1401,6 +1411,7 @@ fn is_known_cli_flag(token: &str) -> bool {
                 | "--model"
                 | "--list"
                 | "--verify"
+                | "--verify-loader"
                 | "--output"
                 | "--force"
                 | "--full"
@@ -2834,6 +2845,24 @@ mod tests {
             Some(PathBuf::from("/tmp/models"))
         );
         assert!(input.full_reindex);
+    }
+
+    #[test]
+    fn verify_loader_requires_one_model_and_selects_local_verification() {
+        let input = parse_cli_args(["download-models", "potion-base-8m", "--verify-loader"])
+            .expect("exact model verification");
+        assert!(input.download_verify && input.download_verify_loader);
+        assert!(parse_cli_args(["download-models", "--verify-loader"]).is_err());
+        assert!(
+            parse_cli_args([
+                "download-models",
+                "potion-base-8m",
+                "--verify-loader",
+                "--list"
+            ])
+            .is_err()
+        );
+        assert!(parse_cli_args(["status", "--verify-loader"]).is_err());
     }
 
     #[test]

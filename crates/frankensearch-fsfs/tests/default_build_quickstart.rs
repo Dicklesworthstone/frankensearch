@@ -8896,6 +8896,17 @@ meta:
                 is_verification_cached(&manifest, &model_root.join(install_dir)),
                 "explicit CLI verification must refresh a current full-SHA receipt for {model_id}"
             );
+            let probe = fsfs.run(
+                temp.path(),
+                &format!("open-loader-{model_id}"),
+                ["download-models", model_id, "--offline", "--verify-loader", "--format", "json"],
+                QUICKSTART_TIMEOUT,
+            );
+            let opened = parse_success_envelope("offline model loader verification", &probe);
+            assert_eq!(opened["data"]["operation"], "verify-loader");
+            assert_eq!(opened["data"]["models"][0]["id"], model_id);
+            assert_eq!(opened["data"]["models"][0]["state"], "loadable");
+            assert_eq!(opened["data"]["models"][0]["verified"], true);
             let receipt_before = fs::read(&receipt_path).unwrap();
             let model_directories = || {
                 fs::read_dir(&model_root)
