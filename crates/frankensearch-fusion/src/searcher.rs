@@ -21733,6 +21733,7 @@ mod tests {
     struct FilterLookupLexical {
         pins: AtomicU64,
         lookups: AtomicU64,
+        pending_quality_lookups: AtomicU64,
         fault: Option<&'static str>,
     }
 
@@ -21754,6 +21755,7 @@ mod tests {
                         Ok(Vec::new())
                     }
                     Some("quality_pending") if ids.contains(&"doc-quality-only") => {
+                        self.pending_quality_lookups.fetch_add(1, Ordering::Relaxed);
                         std::future::pending().await
                     }
                     Some("quality_error") if ids.contains(&"doc-quality-only") => {
@@ -23169,7 +23171,10 @@ mod tests {
 
     #[test]
     fn async_filter_quality_circuit_counts_provider_failures_but_not_filter_work() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
+        // Poll without an ambient runtime clock so the zero-budget case gets
+        // to inspect the pending lookup before the deadline is observed.
+        let check = async {
+            let cx = Cx::for_testing();
             let (_dir, index) = query_admission_index("exact-v2");
             for fault in [
                 "quality_error",
@@ -23188,6 +23193,10 @@ mod tests {
                     quality.bound_action = Some(BoundResponseAction::Fail);
                 }
                 let quality = Arc::new(quality);
+                let lexical = Arc::new(FilterLookupLexical {
+                    fault: Some(fault),
+                    ..Default::default()
+                });
                 let searcher = TwoTierSearcher::new(
                     index.clone(),
                     Arc::new(query_admission_embedder("fast")),
@@ -23198,10 +23207,7 @@ mod tests {
                 )
                 .with_quality_embedder(quality.clone())
                 .with_circuit_breaker(breaker.clone())
-                .with_lexical(Arc::new(FilterLookupLexical {
-                    fault: Some(fault),
-                    ..Default::default()
-                }));
+                .with_lexical(lexical.clone());
                 let filter = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| true);
                 let mut failure = None;
                 searcher
@@ -23230,7 +23236,12 @@ mod tests {
                     | ("provider", Some(SearchError::EmbeddingFailed { .. })) => {}
                     observed => panic!("unexpected refinement outcome: {observed:?}"),
                 }
-                assert_eq!(breaker.is_open(), fault == "provider");
+                assert_eq!(
+                    lexical.pending_quality_lookups.load(Ordering::Relaxed),
+                    u64::from(fault == "quality_pending"),
+                    "{fault}"
+                );
+                assert_eq!(breaker.is_open(), fault == "provider", "{fault}");
                 let (_, metrics) = searcher.search_collect(&cx, "query", 3).await.unwrap();
                 if fault == "provider" {
                     assert_eq!(metrics.skip_reason.as_deref(), Some("circuit_breaker_open"));
@@ -23240,7 +23251,12 @@ mod tests {
                     assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 2);
                 }
             }
-        });
+        };
+        assert!(
+            std::pin::pin!(check)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
     }
 
     #[test]
