@@ -430,17 +430,47 @@ impl CompleteGenerationStore {
         self.active_with_opener(cx, Self::open_retained)
     }
 
-    fn active_with_opener<F>(
-        &self,
-        cx: &Cx,
-        mut open: F,
-    ) -> SearchResult<Option<PublishedGeneration>>
+    fn active_with_opener<F>(&self, cx: &Cx, open: F) -> SearchResult<Option<PublishedGeneration>>
     where
         F: FnMut(&Self, &Cx, &str, &str) -> SearchResult<PublishedGeneration>,
     {
+        self.resolve_active(cx, || read_pointer(&self.root), open)
+    }
+
+    /// Read selection relative to the directory the live reader actually
+    /// opened. A temporary replacement of its public pathname cannot nominate
+    /// another store's generation between the caller's identity checks.
+    pub(crate) fn active_for_live_reader(
+        &self,
+        cx: &Cx,
+        directory: &File,
+        current: Option<&PublishedGeneration>,
+    ) -> SearchResult<Option<PublishedGeneration>> {
+        self.resolve_active(
+            cx,
+            || read_pointer_at(directory, &self.root),
+            |store, cx, id, digest| {
+                if let Some(current) = current
+                    && current.id == id
+                    && current.manifest_sha256 == digest
+                    && current.path == store.root.join(GENERATIONS).join(id)
+                {
+                    return Ok(current.clone());
+                }
+                store.open_retained(cx, id, digest)
+            },
+        )
+    }
+
+    fn resolve_active(
+        &self,
+        cx: &Cx,
+        read_selection: impl Fn() -> SearchResult<Option<Vec<u8>>>,
+        mut open: impl FnMut(&Self, &Cx, &str, &str) -> SearchResult<PublishedGeneration>,
+    ) -> SearchResult<Option<PublishedGeneration>> {
         checkpoint(cx)?;
         self.require_profile_admissible()?;
-        let Some(mut pointer) = read_pointer(&self.root)? else {
+        let Some(mut pointer) = read_selection()? else {
             return Ok(None);
         };
         for _ in 0..MAX_ACTIVE_OPEN_ATTEMPTS {
@@ -459,7 +489,7 @@ impl CompleteGenerationStore {
                 return Err(error);
             }
             checkpoint(cx)?;
-            let Some(selected) = read_pointer(&self.root)? else {
+            let Some(selected) = read_selection()? else {
                 // Losing an observed selection is not an empty, healthy store.
                 return Err(error);
             };
@@ -1676,6 +1706,30 @@ fn read_pointer(root: &Path) -> SearchResult<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+#[cfg(unix)]
+fn read_pointer_at(directory: &File, root: &Path) -> SearchResult<Option<Vec<u8>>> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match openat(directory, COMPLETE_GENERATION_POINTER, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    };
+    let path = root.join(COMPLETE_GENERATION_POINTER);
+    let file = validate_regular_file(&path, file)?;
+    read_bounded_file(&path, file, MAX_POINTER_BYTES).map(Some)
+}
+
+#[cfg(not(unix))]
+fn read_pointer_at(_directory: &File, _root: &Path) -> SearchResult<Option<Vec<u8>>> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "directory-relative selection requires Unix",
+    )
+    .into())
+}
+
 fn decode_pointer(bytes: &[u8], root: &Path) -> SearchResult<GenerationSelection> {
     if bytes.len() as u64 > MAX_POINTER_BYTES {
         return Err(invalid(
@@ -1937,7 +1991,10 @@ fn hex(value: &str, length: usize) -> bool {
 }
 
 fn read_bounded_regular(path: &Path, limit: u64) -> SearchResult<Vec<u8>> {
-    let file = open_regular(path)?;
+    read_bounded_file(path, open_regular(path)?, limit)
+}
+
+fn read_bounded_file(path: &Path, file: File, limit: u64) -> SearchResult<Vec<u8>> {
     if file.metadata()?.len() > limit {
         return Err(invalid(path, "descriptor is not a bounded regular file"));
     }
@@ -1974,7 +2031,10 @@ fn open_regular(path: &Path) -> SearchResult<File> {
                 })?;
         options.custom_flags(flags);
     }
-    let file = options.open(path)?;
+    validate_regular_file(path, options.open(path)?)
+}
+
+fn validate_regular_file(path: &Path, file: File) -> SearchResult<File> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(invalid(path, "expected a regular file"));

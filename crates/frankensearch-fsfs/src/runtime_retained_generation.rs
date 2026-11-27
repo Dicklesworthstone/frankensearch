@@ -213,24 +213,27 @@ impl LiveRetainedSearchReader {
     pub async fn refresh(&mut self, cx: &Cx) -> SearchResult<bool> {
         retained_search_checkpoint(cx)?;
         self.validate_store_root()?;
-        let selected = self.store.is_selected(cx, self.reader.generation())?;
+        let selected = self.store.active_for_live_reader(
+            cx,
+            &self.root_directory,
+            Some(self.reader.generation()),
+        );
         self.validate_store_root()?;
-        if selected {
+        let generation = selected?.ok_or_else(|| missing_retained_selection(self.store.root()))?;
+        if generation == *self.reader.generation() {
             return Ok(false);
         }
         let replacement = self
             .reader
             .runtime
-            .open_retained_search(cx, self.store.root())
+            .open_retained_search_generation(cx, generation)
             .await;
         retained_search_checkpoint(cx)?;
         // Admission may yield while the store pathname is replaced. Check
         // even when that admission failed, before accepting any new reader.
         self.validate_store_root()?;
-        let replacement = replacement?;
-        let changed = replacement.generation() != self.reader.generation();
-        self.reader = replacement;
-        Ok(changed)
+        self.reader = replacement?;
+        Ok(true)
     }
 
     /// Refresh once, then execute the whole query against that retained reader.
@@ -276,6 +279,14 @@ fn retained_search_checkpoint(cx: &Cx) -> SearchResult<()> {
         phase: "fsfs.complete_generation.search".to_owned(),
         reason: "retained-generation search cancelled".to_owned(),
     })
+}
+
+fn missing_retained_selection(root: &Path) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "complete_generation.selection".to_owned(),
+        value: root.display().to_string(),
+        reason: "no complete generation has been published; rebuild the store first".to_owned(),
+    }
 }
 
 // Validate path components, not a string prefix: `{index_dir}/../shared.db`
@@ -466,7 +477,7 @@ impl FsfsRuntime {
         store_root: &Path,
     ) -> SearchResult<LiveRetainedSearchReader> {
         retained_search_checkpoint(cx)?;
-        validate_retained_catalog_path(&self.config.storage.db_path)?;
+        self.validate_retained_reader_config()?;
         let store = crate::generation_store::CompleteGenerationStore::open_with_profile(
             cx,
             store_root,
@@ -481,7 +492,10 @@ impl FsfsRuntime {
         }
         let root_directory = Arc::new(options.open(store.root())?);
         validate_live_store_root(store.root(), &root_directory)?;
-        let reader = self.open_retained_search(cx, store.root()).await;
+        let generation = store
+            .active_for_live_reader(cx, &root_directory, None)?
+            .ok_or_else(|| missing_retained_selection(store.root()))?;
+        let reader = self.open_retained_search_generation(cx, generation).await;
         retained_search_checkpoint(cx)?;
         validate_live_store_root(store.root(), &root_directory)?;
         Ok(LiveRetainedSearchReader {
@@ -544,6 +558,22 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
+        self.validate_retained_reader_config()?;
+        let store = CompleteGenerationStore::open_with_profile(
+            cx,
+            store_root,
+            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
+        let generation = match selection {
+            Some((id, digest)) => store.open_retained(cx, id, digest)?,
+            None => store
+                .active(cx)?
+                .ok_or_else(|| missing_retained_selection(store.root()))?,
+        };
+        self.open_retained_search_generation(cx, generation).await
+    }
+
+    fn validate_retained_reader_config(&self) -> SearchResult<()> {
         // Shadow observation persists artifacts beneath the opened index.
         // A retained reader must never create them inside its sealed bundle.
         if self.config.search.shadow_mode {
@@ -554,23 +584,14 @@ impl FsfsRuntime {
                     .to_owned(),
             });
         }
-        validate_retained_catalog_path(&self.config.storage.db_path)?;
-        let store = CompleteGenerationStore::open_with_profile(
-            cx,
-            store_root,
-            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
-        )?;
-        let generation = match selection {
-            Some((id, digest)) => store.open_retained(cx, id, digest)?,
-            None => store
-                .active(cx)?
-                .ok_or_else(|| SearchError::InvalidConfig {
-                    field: "complete_generation.selection".to_owned(),
-                    value: store.root().display().to_string(),
-                    reason: "no complete generation has been published; rebuild the store first"
-                        .to_owned(),
-                })?,
-        };
+        validate_retained_catalog_path(&self.config.storage.db_path)
+    }
+
+    async fn open_retained_search_generation(
+        &self,
+        cx: &Cx,
+        generation: crate::generation_store::PublishedGeneration,
+    ) -> SearchResult<RetainedSearchReader> {
         let mut runtime = self.clone();
         runtime.cli_input.index_dir = Some(generation.path().to_path_buf());
         // Retained readers never start a daemon or write a socket/cache under
@@ -4832,6 +4853,18 @@ mod retained_search_tests {
             let moved = directory.path().join("retained-original-store");
             fs::rename(&root, &moved).expect("retain original store at another path");
             fs::rename(&foreign_root, &root).expect("replace the store pathname");
+
+            // Exercise the selection read itself inside the substitution
+            // window. A check of the path before and after admission alone
+            // cannot distinguish a swap that is reversed between checks.
+            let held_selection = live
+                .store
+                .active_for_live_reader(&cx, &live.root_directory, Some(&first))
+                .expect("read the original directory")
+                .expect("original selection");
+            assert_eq!(held_selection, first);
+            let named_selection = live.store.active(&cx).unwrap().unwrap();
+            assert_ne!(named_selection.id(), held_selection.id());
 
             let mut delivered = 0;
             let mut sink = |_: &SearchPayload| {
