@@ -3105,15 +3105,12 @@ fn sync_fast_embedder_id(index: &InMemoryTwoTierIndex) -> &str {
     index.fast_embedder_id().unwrap_or("sync-fast-query")
 }
 
-/// Admission has already joined the query to this tier's space or complete
-/// producer fingerprint. Only unidentified legacy tiers need the name heuristic.
+/// Use the bound kind for a tier with a declared space or a persisted header.
+/// The v1 guard admits only explicit controls when that header has no stamp.
+/// Caller-built raw indexes retain their legacy classification.
 #[must_use]
 fn admitted_tier_is_hash_control(index: &InMemoryVectorIndex, query: &BoundQueryEmbedding) -> bool {
-    if index.space_fingerprint_hex().is_some()
-        || index
-            .embedder_revision()
-            .is_some_and(|revision| !revision.is_empty())
-    {
+    if index.space_fingerprint_hex().is_some() || index.embedder_revision().is_some() {
         query.identity().space.kind == EmbeddingSpaceKindV1::HashControl
     } else {
         frankensearch_core::is_hash_generation_id(index.embedder_id().unwrap_or_default())
@@ -5651,7 +5648,13 @@ mod tests {
 
     #[test]
     fn persisted_producer_kind_controls_progressive_search_despite_display_names() {
-        for (fast_hash, quality_hash) in [(true, false), (false, false), (false, true)] {
+        for (fast_hash, quality_hash, unstamped_control) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
             let identity = |hash| {
                 if hash {
                     EmbeddingIdentityBundleV1::explicit_test_model("looks-semantic", 2)
@@ -5667,8 +5670,12 @@ mod tests {
                     .unwrap();
             writer.set_fast_embedder_id(fast.space.logical_model_id.as_str());
             writer.set_quality_embedder_id(quality.space.logical_model_id.as_str());
-            writer.set_fast_identity(&fast).unwrap();
-            writer.set_quality_identity(&quality).unwrap();
+            if !(fast_hash && unstamped_control) {
+                writer.set_fast_identity(&fast).unwrap();
+            }
+            if !(quality_hash && unstamped_control) {
+                writer.set_quality_identity(&quality).unwrap();
+            }
             writer
                 .add_record("a", &[1.0, 0.0], Some(&[1.0, 0.0]))
                 .unwrap();
@@ -5693,6 +5700,12 @@ mod tests {
                     assert_eq!(metrics.hash_control_candidates, 1);
                     assert_eq!(metrics.semantic_candidates, 0);
                     assert_eq!(metrics.phase2_vectors_searched, 0);
+                    let phases = searcher.search_iter(&query, 1).collect::<Vec<_>>();
+                    assert!(matches!(
+                        phases.as_slice(),
+                        [SearchPhase::Initial { results, .. }]
+                            if results[0].source == ScoreSource::HashControl
+                    ));
                 } else {
                     assert_eq!(hits[0].source, ScoreSource::SemanticQuality);
                     assert_eq!(hits[0].quality_score, Some(1.0));
