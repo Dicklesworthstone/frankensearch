@@ -147,7 +147,7 @@ struct QueryEmbeddingIdentities {
 
 #[derive(Clone, Copy, Default)]
 struct FastRetrievalKind {
-    admitted: Option<EmbeddingSpaceKindV1>,
+    producer_kind: Option<EmbeddingSpaceKindV1>,
     hash_control: bool,
     // Unidentified legacy producers retain their name-based score labels.
     hash_scores: bool,
@@ -371,9 +371,6 @@ fn admit_legacy_tier_embedder(
     revision: &str,
     tier: &str,
 ) -> SearchResult<()> {
-    if revision.is_empty() && !embedder.is_semantic() {
-        return Ok(());
-    }
     let identity = match identity {
         Some(identity) => identity,
         None if revision.is_empty() => return Ok(()),
@@ -386,6 +383,9 @@ fn admit_legacy_tier_embedder(
         }
     };
     identity.validate()?;
+    if revision.is_empty() && identity.space.kind == EmbeddingSpaceKindV1::HashControl {
+        return Ok(());
+    }
     if revision != identity.fingerprint() {
         return Err(SearchError::InvalidConfig {
             field: format!("search_activation.{tier}.producer_revision"),
@@ -1222,13 +1222,10 @@ impl TwoTierSearcher {
             )?;
         }
         cancellation_checkpoint(cx, "fast_identity_admission")?;
-        // Trust the query kind once its producer joins the retained owner or
-        // the complete producer fingerprint stamped into a legacy index.
-        let admitted = fast
-            .as_ref()
-            .filter(|_| fast_binding.is_some() || !fast_revision.is_empty())
-            .map(|bundle| bundle.space.kind);
-        let (hash_control, hash_scores) = if let Some(kind) = admitted {
+        // Declared semantic producers have joined the tier by this point.
+        // An unstamped tier may still serve explicitly nonsemantic controls.
+        let producer_kind = fast.as_ref().map(|bundle| bundle.space.kind);
+        let (hash_control, hash_scores) = if let Some(kind) = producer_kind {
             let is_control = kind == EmbeddingSpaceKindV1::HashControl;
             (is_control, is_control)
         } else {
@@ -1250,25 +1247,16 @@ impl TwoTierSearcher {
             .map(|embedder| capture_query_identity(cx, embedder, "quality"))
             .transpose()?
             .flatten();
-        let identified_quality = if let Some(embedder) = quality_embedder {
+        if let Some(embedder) = quality_embedder {
             if let Some(binding) = quality_binding {
                 admit_tier_embedder(embedder, quality.as_ref(), binding, "quality")?;
-                true
             } else if fast_binding.is_none()
                 && let Some(revision) = self.index.quality_embedder_revision()
             {
                 admit_legacy_tier_embedder(embedder, quality.as_ref(), revision, "quality")?;
-                !revision.is_empty()
-            } else {
-                false
             }
-        } else {
-            false
-        };
-        let quality_kind = quality
-            .as_ref()
-            .filter(|_| identified_quality)
-            .map(|bundle| bundle.space.kind);
+        }
+        let quality_kind = quality.as_ref().map(|bundle| bundle.space.kind);
         if quality_kind == Some(EmbeddingSpaceKindV1::HashControl) {
             return Err(SearchError::InvalidConfig {
                 field: "search.quality_kind".to_owned(),
@@ -1289,7 +1277,7 @@ impl TwoTierSearcher {
                 fast,
                 quality,
                 fast_kind: FastRetrievalKind {
-                    admitted,
+                    producer_kind,
                     hash_control,
                     hash_scores,
                 },
@@ -1336,13 +1324,6 @@ impl TwoTierSearcher {
                     .to_owned(),
             }
         })?;
-        if identity.space.kind != EmbeddingSpaceKindV1::Semantic || !embedder.is_semantic() {
-            return Err(SearchError::InvalidConfig {
-                field: "search.quality_kind".to_owned(),
-                value: "non_semantic".to_owned(),
-                reason: "quality-only retrieval requires a semantic quality producer".to_owned(),
-            });
-        }
         let admission = if let Some(binding) = self.index.quality_admitted_binding() {
             admit_tier_embedder(embedder, Some(&identity), binding, "quality")?;
             SemanticAdmission::OwnerBacked { quality: true }
@@ -1360,6 +1341,13 @@ impl TwoTierSearcher {
             admit_legacy_tier_embedder(embedder, Some(&identity), revision, "quality")?;
             SemanticAdmission::LegacyUnidentified
         };
+        if identity.space.kind != EmbeddingSpaceKindV1::Semantic {
+            return Err(SearchError::InvalidConfig {
+                field: "search.quality_kind".to_owned(),
+                value: "non_semantic".to_owned(),
+                reason: "quality-only retrieval requires a semantic quality producer".to_owned(),
+            });
+        }
         Ok((
             admission,
             QueryEmbeddingIdentities {
@@ -3171,7 +3159,7 @@ impl TwoTierSearcher {
             candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
 
         let FastRetrievalKind {
-            admitted,
+            producer_kind,
             hash_control,
             hash_scores,
         } = identities.fast_kind;
@@ -3421,7 +3409,7 @@ impl TwoTierSearcher {
                     self.fast_embedder.as_ref(),
                     1,
                     metrics.fast_embed_ms,
-                    admitted,
+                    producer_kind,
                 );
                 if let Some(root_request_id) = root_request_id {
                     let _ = self.emit_embedding_telemetry(
@@ -3431,7 +3419,7 @@ impl TwoTierSearcher {
                         fast_embed_elapsed,
                         root_request_id,
                         None,
-                        admitted,
+                        producer_kind,
                     );
                 }
                 if hash_control && metrics.skip_reason.is_none() {
@@ -3447,7 +3435,7 @@ impl TwoTierSearcher {
                         lexical.len(),
                         k,
                         self.config.graph_ranking_enabled,
-                        admitted.map_or_else(
+                        producer_kind.map_or_else(
                             || self.fast_embedder.is_semantic(),
                             |kind| kind == EmbeddingSpaceKindV1::Semantic,
                         ),
@@ -3820,7 +3808,7 @@ impl TwoTierSearcher {
                         fast_embed_elapsed,
                         root_request_id,
                         None,
-                        admitted,
+                        producer_kind,
                     );
                 }
                 if matches!(embed_err, SearchError::Cancelled { .. }) {
@@ -7598,6 +7586,7 @@ mod tests {
         bound_response_values: Option<Vec<f32>>,
         async_bound_response: bool,
         category: ModelCategory,
+        reports_semantic: bool,
         expected_ambient: Option<Cx>,
         identity_calls: Arc<AtomicU64>,
         cancel_on_identity_call: Option<(Cx, u64)>,
@@ -7620,6 +7609,7 @@ mod tests {
                 bound_response_values: None,
                 async_bound_response: false,
                 category: ModelCategory::StaticEmbedder,
+                reports_semantic: true,
                 expected_ambient: None,
                 identity_calls: Arc::new(AtomicU64::new(0)),
                 cancel_on_identity_call: None,
@@ -7768,7 +7758,7 @@ mod tests {
         }
 
         fn is_semantic(&self) -> bool {
-            true
+            self.reports_semantic
         }
 
         fn category(&self) -> ModelCategory {
@@ -8328,6 +8318,86 @@ mod tests {
     }
 
     #[test]
+    fn async_unstamped_tier_refuses_declared_semantic_producer() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for unstamped_tier in ["fast", "quality"] {
+                let dir = owner_backed_dir("unstamped-semantic");
+                let fast_identity = query_admission_identity("semantic-fast", 4);
+                let mut writer = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+                if unstamped_tier == "quality" {
+                    writer.set_fast_identity(&fast_identity).unwrap();
+                }
+                let vector = vec![1.0, 0.0, 0.0, 0.0];
+                writer.add_record("doc-a", &vector, Some(&vector)).unwrap();
+                drop(writer.finish().unwrap());
+                let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap());
+
+                let mut fast = IdentityCountingEmbedder::new("fast", fast_identity, vector.clone());
+                fast.reports_semantic = unstamped_tier != "fast";
+                let fast = Arc::new(fast);
+                let mut quality = IdentityCountingEmbedder::new(
+                    "quality",
+                    query_admission_identity("semantic-quality", 4),
+                    vector,
+                );
+                quality.reports_semantic = false;
+                let quality = Arc::new(quality);
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality.clone());
+                let field_name = format!("search_activation.{unstamped_tier}.producer_revision");
+                for k in [0, 1] {
+                    let error = searcher
+                        .search(&cx, "query", k, |_| None, |_| panic!("refused request"))
+                        .await
+                        .expect_err("unstamped vectors cannot admit a declared semantic producer");
+                    assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                        if field == field_name));
+                    assert_eq!(fast.embed_count(), 0);
+                    assert_eq!(quality.embed_count(), 0);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn async_unstamped_hash_producer_only_serves_as_fast_control() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("unstamped-hash");
+            let identity = query_admission_identity("semantic-fast", 4);
+            let vector = vec![1.0, 0.0, 0.0, 0.0];
+            let mut writer = TwoTierIndex::create(&dir, TwoTierConfig::default()).unwrap();
+            writer.set_fast_identity(&identity).unwrap();
+            writer.add_record("doc-a", &vector, Some(&vector)).unwrap();
+            drop(writer.finish().unwrap());
+            let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap());
+            let hash = Arc::new(IdentityCountingEmbedder::new(
+                "looks-semantic",
+                hash_control_identity("hash-control", 4),
+                vector.clone(),
+            ));
+            let fast = Arc::new(IdentityCountingEmbedder::new("fast", identity, vector));
+            let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                .with_quality_embedder(hash.clone());
+            let error = searcher
+                .search(&cx, "query", 1, |_| None, |_| panic!("refused request"))
+                .await
+                .expect_err("nonsemantic controls cannot refine semantic results");
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "search.quality_kind"));
+            assert_eq!(fast.embed_count(), 0);
+            assert_eq!(hash.embed_count(), 0);
+
+            let (_dir, index) = build_test_index(4);
+            let searcher = TwoTierSearcher::new(index, hash.clone(), TwoTierConfig::default());
+            let (results, metrics) = searcher.search_collect(&cx, "query", 1).await.unwrap();
+            assert_eq!(results[0].source, ScoreSource::HashControl);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert!(metrics.hash_control_candidates > 0);
+            assert_eq!(hash.embed_count(), 1);
+        });
+    }
+
+    #[test]
     fn async_producer_kind_hash_skips_unused_quality_admission() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for owner_backed in [false, true] {
@@ -8842,6 +8912,39 @@ mod tests {
         .with_quality_embedder(quality);
         searcher.fast_embedder = Arc::new(UnrequestedFastEmbedder);
         searcher
+    }
+
+    #[test]
+    fn async_quality_only_uses_admitted_kind_with_conflicting_provider_flag() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for layout in ["exact-v2", "native-v2", "stamped-v1"] {
+                let (_dir, index) = query_admission_index(layout);
+                let mut quality = query_admission_embedder("quality");
+                quality.reports_semantic = false;
+                let quality = Arc::new(quality);
+                let searcher =
+                    quality_only_test_searcher(index, quality.clone(), TwoTierConfig::default());
+                let (empty, metrics) = searcher
+                    .search_quality_only_collect(&cx, "find relevant documents", 0)
+                    .await
+                    .expect("zero-limit admission should use the retained producer binding");
+                assert!(empty.is_empty());
+                assert_eq!(
+                    metrics.zero_signal,
+                    Some(ZeroSignalReason::CallerRequestedZeroK)
+                );
+                assert_eq!(quality.embed_count(), 0);
+
+                let (results, _) = searcher
+                    .search_quality_only_collect(&cx, "find relevant documents", 1)
+                    .await
+                    .expect("a verified semantic producer can retrieve from the quality tier");
+                assert_eq!(quality.embed_count(), 1);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, "doc-quality-only");
+                assert_eq!(results[0].source, ScoreSource::SemanticQuality);
+            }
+        });
     }
 
     #[test]
