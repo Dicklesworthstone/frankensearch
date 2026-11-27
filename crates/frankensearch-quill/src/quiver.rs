@@ -3893,6 +3893,26 @@ impl EncodedPositionList {
         positions: &[u32],
         limits: PositionListLimits,
     ) -> Result<Self, PositionCodecError> {
+        let mut bytes = Vec::new();
+        let (doc_freq, total_positions, block_count) =
+            Self::append_with_limits(&mut bytes, postings, positions, limits)?;
+        Ok(Self {
+            bytes,
+            doc_freq,
+            total_positions,
+            block_count,
+        })
+    }
+
+    /// Append a fresh term directly to a POSITIONS section. Directory offsets
+    /// are term-local even when the destination already holds earlier terms.
+    /// An error leaves the destination bytes intact.
+    pub(crate) fn append_with_limits(
+        bytes: &mut Vec<u8>,
+        postings: &[Posting],
+        positions: &[u32],
+        limits: PositionListLimits,
+    ) -> Result<(u32, u64, usize), PositionCodecError> {
         validate_encoder_input(postings)?;
         let doc_freq =
             u32::try_from(postings.len()).map_err(|_| PostingCodecError::TooManyPostings {
@@ -3906,7 +3926,8 @@ impl EncodedPositionList {
             });
         }
 
-        let mut payload = Vec::new();
+        let mut payload_len = 0_usize;
+        let mut block_start = 0_usize;
         let mut directory = Vec::new();
         let mut position_index = 0_usize;
         for (posting_index, posting) in postings.iter().enumerate() {
@@ -3932,7 +3953,7 @@ impl EncodedPositionList {
                 }
             })?;
             let run_len = validated_position_run_len(posting_ordinal, run)?;
-            let next_payload_len = payload.len().checked_add(run_len).ok_or(
+            let next_payload_len = payload_len.checked_add(run_len).ok_or(
                 PositionCodecError::ArithmeticOverflow {
                     field: "position payload length",
                 },
@@ -3944,20 +3965,8 @@ impl EncodedPositionList {
                 });
             }
 
-            let start_new_block = directory.last().is_none_or(|_| {
-                let current_start = usize::try_from(
-                    directory
-                        .last()
-                        .map_or(0, |block: &RawPositionBlock| block.block_offset),
-                )
-                .unwrap_or(usize::MAX);
-                payload
-                    .len()
-                    .checked_sub(current_start)
-                    .and_then(|current| current.checked_add(run_len))
-                    .is_none_or(|combined| combined > POSITION_BLOCK_TARGET_BYTES)
-            });
-            if start_new_block {
+            if directory.is_empty() || next_payload_len - block_start > POSITION_BLOCK_TARGET_BYTES {
+                block_start = payload_len;
                 if directory.len() >= limits.max_blocks {
                     return Err(PositionCodecError::BlockLimitExceeded {
                         limit: limits.max_blocks,
@@ -3972,24 +3981,56 @@ impl EncodedPositionList {
                     })?;
                 directory.push(RawPositionBlock {
                     first_posting_ordinal: posting_ordinal,
-                    block_offset: u64::try_from(payload.len()).map_err(|_| {
+                    block_offset: u64::try_from(payload_len).map_err(|_| {
                         PositionCodecError::ArithmeticOverflow {
                             field: "position payload offset",
                         }
                     })?,
                 });
             }
-            payload
-                .try_reserve(run_len)
-                .map_err(|_| PositionCodecError::Allocation {
-                    resource: "position payload bytes",
-                    count: next_payload_len,
-                })?;
-            write_position_run(run, &mut payload);
+            payload_len = next_payload_len;
             position_index = end;
         }
 
-        Self::finish_encoding(&directory, &payload, doc_freq, total_positions, limits)
+        let directory_len = position_directory_len(&directory)?;
+        let complete_len = directory_len.checked_add(payload_len).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "position term length",
+            },
+        )?;
+        if complete_len > limits.max_bytes {
+            return Err(PositionCodecError::ByteLimitExceeded {
+                limit: limits.max_bytes,
+                actual: complete_len,
+            });
+        }
+        let block_count =
+            u32::try_from(directory.len()).map_err(|_| PositionCodecError::BlockLimitExceeded {
+                limit: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+                actual: directory.len(),
+            })?;
+        let start = bytes.len();
+        bytes
+            .try_reserve(complete_len)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "position term bytes",
+                count: complete_len,
+            })?;
+        bytes.extend_from_slice(&block_count.to_le_bytes());
+        for block in &directory {
+            write_vint(block.first_posting_ordinal, bytes);
+            write_vint64(block.block_offset, bytes);
+        }
+        // The sizing pass checked every frequency and validated the exact same
+        // immutable runs. All fallible work is complete before the first byte.
+        let mut remaining = positions;
+        for posting in postings {
+            let (run, tail) = remaining.split_at(posting.freq as usize);
+            write_position_run(run, bytes);
+            remaining = tail;
+        }
+        debug_assert_eq!(bytes.len() - start, complete_len);
+        Ok((doc_freq, total_positions, directory.len()))
     }
 
     /// Concatenate validated source streams without rewriting payload blocks.
@@ -4127,52 +4168,6 @@ impl EncodedPositionList {
                 bytes.extend_from_slice(payload);
             }
         }
-        debug_assert_eq!(bytes.len(), complete_len);
-        Ok(Self {
-            bytes,
-            doc_freq,
-            total_positions,
-            block_count: directory.len(),
-        })
-    }
-
-    fn finish_encoding(
-        directory: &[RawPositionBlock],
-        payload: &[u8],
-        doc_freq: u32,
-        total_positions: u64,
-        limits: PositionListLimits,
-    ) -> Result<Self, PositionCodecError> {
-        let directory_len = position_directory_len(directory)?;
-        let complete_len = directory_len.checked_add(payload.len()).ok_or(
-            PositionCodecError::ArithmeticOverflow {
-                field: "position term length",
-            },
-        )?;
-        if complete_len > limits.max_bytes {
-            return Err(PositionCodecError::ByteLimitExceeded {
-                limit: limits.max_bytes,
-                actual: complete_len,
-            });
-        }
-        let block_count =
-            u32::try_from(directory.len()).map_err(|_| PositionCodecError::BlockLimitExceeded {
-                limit: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
-                actual: directory.len(),
-            })?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(complete_len)
-            .map_err(|_| PositionCodecError::Allocation {
-                resource: "position term bytes",
-                count: complete_len,
-            })?;
-        bytes.extend_from_slice(&block_count.to_le_bytes());
-        for block in directory {
-            write_vint(block.first_posting_ordinal, &mut bytes);
-            write_vint64(block.block_offset, &mut bytes);
-        }
-        bytes.extend_from_slice(payload);
         debug_assert_eq!(bytes.len(), complete_len);
         Ok(Self {
             bytes,
@@ -14913,6 +14908,54 @@ mod tests {
                 [expected]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn positions_append_is_term_relative_and_failure_atomic() -> TestResult {
+        let mut section = vec![0xac; 131];
+        let postings = [Posting::new(10, 3), Posting::new(20, 2)];
+        let values = [0, 0, 7, 130, 130];
+        let limits = PositionListLimits::default();
+        let header = section.clone();
+        assert_eq!(
+            EncodedPositionList::append_with_limits(&mut section, &postings, &values, limits)?,
+            (2, 5, 1),
+        );
+        assert_eq!(&section[..header.len()], &header);
+        assert_eq!(
+            &section[header.len()..],
+            [1, 0, 0, 0, 0, 0, 0, 0, 7, 0x82, 0x01, 0],
+        );
+        let first_term = section.clone();
+        assert!(matches!(
+            EncodedPositionList::append_with_limits(
+                &mut section,
+                &postings,
+                &[0, 0, 7, 130, 1],
+                limits
+            ),
+            Err(PositionCodecError::NonAscendingPosition {
+                posting_ordinal: 1,
+                ..
+            })
+        ));
+        assert_eq!(section, first_term);
+        assert!(matches!(
+            EncodedPositionList::append_with_limits(
+                &mut section,
+                &postings,
+                &values,
+                PositionListLimits {
+                    max_bytes: 11,
+                    ..limits
+                },
+            ),
+            Err(PositionCodecError::ByteLimitExceeded { actual: 12, .. }),
+        ));
+        assert_eq!(section, first_term);
+        EncodedPositionList::append_with_limits(&mut section, &[], &[], limits)?;
+        assert_eq!(&section[first_term.len()..], [0; 4]);
         Ok(())
     }
 

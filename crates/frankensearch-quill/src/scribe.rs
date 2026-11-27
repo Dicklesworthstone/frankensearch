@@ -59,7 +59,8 @@ use crate::quiver::{
     EncodedDocLenSection, EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection,
     EncodedPositionList, EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection,
     FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput, NumericCodecError,
-    NumericEntry, NumericFieldInput, NumericValue, PositionCodecError, Posting, StatsCodecError,
+    NumericEntry, NumericFieldInput, NumericValue, PositionCodecError, PositionListLimits, Posting,
+    StatsCodecError,
     StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
@@ -5533,14 +5534,23 @@ where
 {
     let (encoded_postings, encoded_blockmax) =
         EncodedPostingList::encode_with_block_max(postings, fieldnorm_for_doc)?;
-    let encoded_positions = positions
-        .map(|values| EncodedPositionList::encode(postings, values))
-        .transpose()?;
+    let positions_span = if let Some(values) = positions {
+        let start = positions_bytes.len();
+        let offset = durable_len(positions_bytes, "POSITIONS span")?;
+        EncodedPositionList::append_with_limits(
+            positions_bytes,
+            postings,
+            values,
+            PositionListLimits::default(),
+        )?;
+        Some(ByteSpan::new(
+            offset,
+            durable_len(&positions_bytes[start..], "POSITIONS span")?,
+        ))
+    } else {
+        None
+    };
     let postings_span = append_span(postings_bytes, encoded_postings.as_bytes(), "POSTINGS span")?;
-    let positions_span = encoded_positions
-        .as_ref()
-        .map(|encoded| append_span(positions_bytes, encoded.as_bytes(), "POSITIONS span"))
-        .transpose()?;
     let blockmax_span = append_span(blockmax_bytes, encoded_blockmax.as_bytes(), "BLOCKMAX span")?;
     let doc_freq = encoded_postings.doc_freq();
     let metadata = positions_span.map_or_else(
