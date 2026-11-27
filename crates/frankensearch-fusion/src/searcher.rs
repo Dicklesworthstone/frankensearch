@@ -25,6 +25,8 @@ use asupersync::time::timeout;
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg(feature = "graph")]
+use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
@@ -47,13 +49,11 @@ use frankensearch_core::types::{
     BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
     SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
-#[cfg(feature = "graph")]
-use frankensearch_core::DocumentGraph;
 use frankensearch_core::{
-    DocId, EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
-    LifecycleState, LiveSearchFrame, LiveSearchStreamEmitter, ResourceCollectorSample,
-    RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase, SearchStreamHealth,
-    TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
+    DocId, EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus,
+    LifecycleSeverity, LifecycleState, LiveSearchFrame, LiveSearchStreamEmitter,
+    ResourceCollectorSample, RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase,
+    SearchStreamHealth, TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
 use frankensearch_embed::CachedEmbedder;
 use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
@@ -2216,10 +2216,9 @@ impl TwoTierSearcher {
                         // The caller's filter can change while inference is
                         // suspended. Skipping quality keeps the Initial pool,
                         // even when no final ranking stage was requested.
-                        if let Err(error) = request_filter.validate_retained_ids(
-                            cx,
-                            initial_hits.iter().map(|hit| &hit.doc_id),
-                        ) {
+                        if let Err(error) = request_filter
+                            .validate_retained_ids(cx, initial_hits.iter().map(|hit| &hit.doc_id))
+                        {
                             self.export_error(&error);
                             if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                                 self.emit_session_stop_telemetry(
@@ -3528,7 +3527,8 @@ impl TwoTierSearcher {
                 let retrieve_fast = |limit| -> SearchResult<_> {
                     let classified = activated_fast.map_or_else(
                         || {
-                            self.index.search_fast_classified_with_params(
+                            self.index.search_fast_classified_cancellable(
+                                cx,
                                 &query_vec,
                                 limit,
                                 self.search_params,
@@ -4084,7 +4084,8 @@ impl TwoTierSearcher {
                         let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
                         activated.search_fast_classified_with_params(limit, self.search_params)?
                     } else {
-                        self.index.search_fast_classified_with_params(
+                        self.index.search_fast_classified_cancellable(
+                            cx,
                             &pools.fast_query,
                             limit,
                             self.search_params,
@@ -23091,8 +23092,10 @@ mod tests {
                     .await;
                 assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
                 if revoke {
-                    assert!(matches!(result, Err(SearchError::InvalidConfig { field, .. })
-                        if field == "search.filter"));
+                    assert!(
+                        matches!(result, Err(SearchError::InvalidConfig { field, .. })
+                        if field == "search.filter")
+                    );
                 } else {
                     let (hits, metrics) = result.unwrap();
                     assert_eq!(hits[0].doc_id, "doc-a");
@@ -23170,7 +23173,12 @@ mod tests {
     fn async_filter_quality_circuit_counts_provider_failures_but_not_filter_work() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_dir, index) = query_admission_index("exact-v2");
-            for fault in ["quality_error", "quality_cardinality", "quality_pending", "provider"] {
+            for fault in [
+                "quality_error",
+                "quality_cardinality",
+                "quality_pending",
+                "provider",
+            ] {
                 let breaker = Arc::new(CircuitBreaker::new(
                     crate::circuit_breaker::CircuitBreakerConfig {
                         failure_threshold: 1,

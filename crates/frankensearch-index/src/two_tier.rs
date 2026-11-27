@@ -34,7 +34,7 @@ use crate::native_hnsw::{
     native_hnsw_generation_receipt_path,
 };
 use crate::search::{
-    ScanCancellation, UncancelledScan, classified_candidates, deduplicate_ranked_hits,
+    ScanCancellation, UncancelledScan, classified_candidates_controlled, deduplicate_ranked_hits,
     query_zero_signal,
 };
 use crate::{
@@ -1688,7 +1688,7 @@ impl TwoTierIndex {
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_fast_candidates(query_vec, k, params)
+        self.search_fast_candidates(query_vec, k, params, UncancelledScan)
             .map(deduplicate_ranked_hits)
     }
 
@@ -1697,7 +1697,9 @@ impl TwoTierIndex {
         query_vec: &[f32],
         k: usize,
         params: Option<SearchParams>,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         #[cfg(feature = "ann")]
         if let Some(ann) = &self.fast_ann {
             // Source-aware HNSW filters tombstones and exact-repairs native
@@ -1711,6 +1713,7 @@ impl TwoTierIndex {
                 k,
                 self.config.hnsw_ef_search,
             )?;
+            cancel.checkpoint()?;
             if let Some(reason) = stats.fallback_reason {
                 let fallback_count = self
                     .ann_fallback_count
@@ -1738,15 +1741,18 @@ impl TwoTierIndex {
                     k,
                     "fast-tier ANN selected a row its resident WAL supersedes; using exact search"
                 );
-                return self.fast_tier().search_top_k_rows(
+                return self.fast_tier().search_top_k_controlled::<false>(
                     query_vec,
                     k,
                     None,
                     SearchParams::default(),
+                    cancel,
                 );
             }
 
-            return self.resolve_fast_ann_and_wal(hits, query_vec, k);
+            let hits = self.resolve_fast_ann_and_wal(hits, query_vec, k)?;
+            cancel.checkpoint()?;
+            return Ok(hits);
         }
         let mrl_config = crate::mrl::MrlConfig {
             search_dims: self.config.mrl_search_dims,
@@ -1755,7 +1761,11 @@ impl TwoTierIndex {
         };
 
         if mrl_config.search_dims > 0 && mrl_config.search_dims < self.fast_tier().dimension() {
-            return self.fast_tier().mrl_search(query_vec, k, &mrl_config, None);
+            let hits = self
+                .fast_tier()
+                .mrl_search(query_vec, k, &mrl_config, None)?;
+            cancel.checkpoint()?;
+            return Ok(hits);
         }
 
         // The default legacy fast tier rescores up to three candidates per
@@ -1763,12 +1773,16 @@ impl TwoTierIndex {
         const FAST_TIER_MULT: usize = 3;
         params.map_or_else(
             || {
-                self.fast_tier()
-                    .search_top_k_int8_rows(query_vec, k, FAST_TIER_MULT)
+                self.fast_tier().search_top_k_int8_rows_controlled(
+                    query_vec,
+                    k,
+                    FAST_TIER_MULT,
+                    cancel,
+                )
             },
             |params| {
                 self.fast_tier()
-                    .search_top_k_rows(query_vec, k, None, params)
+                    .search_top_k_controlled::<false>(query_vec, k, None, params, cancel)
             },
         )
     }
@@ -1809,6 +1823,38 @@ impl TwoTierIndex {
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<ClassifiedHits> {
+        self.search_fast_classified_controlled(query_vec, k, params, UncancelledScan)
+    }
+
+    /// Classified fast retrieval under the caller's cancellation context.
+    ///
+    /// The default int8 path checks cold quantization, candidate selection,
+    /// rescoring and result preparation. Explicit exact scans and resident-WAL
+    /// fallbacks use the same context. ANN and dimension truncation retain their
+    /// backend precedence, with checks at their synchronous call boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::search_fast_classified_with_params`],
+    /// plus [`SearchError::Cancelled`] without returning partial candidates.
+    pub fn search_fast_classified_cancellable(
+        &self,
+        cx: &Cx,
+        query_vec: &[f32],
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
+        self.search_fast_classified_controlled(query_vec, k, params, cx)
+    }
+
+    fn search_fast_classified_controlled(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+        params: Option<SearchParams>,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<ClassifiedHits> {
+        cancel.checkpoint()?;
         if query_vec.len() != self.fast_tier().dimension() {
             return Err(SearchError::DimensionMismatch {
                 expected: self.fast_tier().dimension(),
@@ -1821,13 +1867,20 @@ impl TwoTierIndex {
             return Ok(classified);
         }
         let fast = self.fast_tier();
-        let classified = classified_candidates(
+        let result = classified_candidates_controlled(
             k,
             fast.record_count().saturating_add(fast.wal_entries.len()),
-            |candidate_limit| self.search_fast_candidates(query_vec, candidate_limit, params),
+            |candidate_limit| {
+                self.search_fast_candidates(query_vec, candidate_limit, params, cancel)
+            },
             |hit| fast.classified_hit_is_usable(hit),
-            || self.classified_fast_census(),
-        )?;
+            || self.classified_fast_census(cancel),
+            cancel,
+        );
+        cancel.checkpoint()?;
+        let mut classified = result?;
+        classified.hits = deduplicate_ranked_hits(classified.hits);
+        cancel.checkpoint()?;
         self.note_zero_signal(classified.zero_signal);
         Ok(classified)
     }
@@ -1838,12 +1891,21 @@ impl TwoTierIndex {
     /// when ANN owns candidate retrieval and the census still shows usable
     /// live vectors, the empty result is the ANN-availability anomaly rather
     /// than a data problem.
-    fn classified_fast_census(&self) -> (bool, ZeroSignalReason) {
+    fn classified_fast_census(
+        &self,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<(bool, ZeroSignalReason)> {
+        let (usable, reason) = self
+            .fast_tier()
+            .classified_search_census_cancellable(cancel, false)?;
         #[cfg(feature = "ann")]
-        if self.fast_ann.is_some() {
-            return self.fast_tier().classified_ann_census();
-        }
-        self.fast_tier().classified_search_census(false)
+        let reason =
+            if self.fast_ann.is_some() && usable && reason == ZeroSignalReason::NoUsableVectors {
+                ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
+            } else {
+                reason
+            };
+        Ok((usable, reason))
     }
 
     /// Record a zero-signal observation and log state transitions exactly
@@ -4590,6 +4652,135 @@ mod tests {
             .expect("sequential override search");
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancellable_fast_classified_search_preserves_default_and_explicit_policies() {
+        use std::sync::Mutex;
+
+        use crate::search::SCAN_CHECKPOINT_INTERVAL;
+
+        #[derive(Clone, Copy)]
+        struct CancelDuringFastRows<'a> {
+            cx: &'a Cx,
+            visits: &'a Mutex<usize>,
+        }
+
+        impl ScanCancellation for CancelDuringFastRows<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                ScanCancellation::checkpoint(self.cx)
+            }
+
+            fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+                {
+                    let mut visits = self.visits.lock().unwrap();
+                    *visits += 1;
+                    if *visits == 17 {
+                        self.cx.set_cancel_requested(true);
+                    }
+                }
+                ScanCancellation::checkpoint_at(self.cx, offset)
+            }
+        }
+
+        let dir = temp_index_dir("cancel-fast-classified");
+        fs::create_dir_all(&dir).unwrap();
+        let mut writer = VectorIndex::create_with_revision(
+            &dir.join(VECTOR_INDEX_FAST_FILENAME),
+            "fast-cancel",
+            "test",
+            2,
+            Quantization::F16,
+        )
+        .unwrap();
+        for row in 0..4096 {
+            let score = f32::from(u16::try_from(row).unwrap()) / 4096.0;
+            writer
+                .write_record(&format!("fast-{row:05}"), &[score, 1.0 - score])
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for params in [
+            None,
+            Some(SearchParams {
+                parallel_enabled: false,
+                parallel_threshold: 1,
+                parallel_chunk_size: 37,
+            }),
+            Some(SearchParams {
+                parallel_enabled: true,
+                parallel_threshold: 1,
+                parallel_chunk_size: 37,
+            }),
+            Some(SearchParams {
+                parallel_enabled: true,
+                parallel_threshold: 1,
+                parallel_chunk_size: 4096,
+            }),
+        ] {
+            let index = TwoTierIndex::open(
+                &dir,
+                TwoTierConfig {
+                    hnsw_threshold: usize::MAX,
+                    mrl_search_dims: 0,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .unwrap();
+            let query = [1.0, 0.0];
+            let expected = index
+                .search_fast_classified_with_params(&query, 23, params)
+                .unwrap();
+            assert_eq!(
+                index.fast_tier().vectors_i8.get().is_some(),
+                params.is_none()
+            );
+            let cx = Cx::for_testing();
+            let visits = Mutex::new(0);
+            let result = pool.install(|| {
+                index.search_fast_classified_controlled(
+                    &query,
+                    23,
+                    params,
+                    CancelDuringFastRows {
+                        cx: &cx,
+                        visits: &visits,
+                    },
+                )
+            });
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            let visits = *visits.lock().unwrap();
+            assert!((17..=17 + 2 * SCAN_CHECKPOINT_INTERVAL).contains(&visits));
+            cx.set_cancel_requested(false);
+            let before = cx.checkpoint_state().checkpoint_count;
+            let actual = pool
+                .install(|| index.search_fast_classified_cancellable(&cx, &query, 23, params))
+                .unwrap();
+            assert!(cx.checkpoint_state().checkpoint_count > before + 2);
+            assert_eq!(actual.zero_signal, expected.zero_signal);
+            assert_eq!(actual.hits.len(), expected.hits.len());
+            for (actual, expected) in actual.hits.iter().zip(&expected.hits) {
+                assert_eq!(actual.doc_id, expected.doc_id);
+                assert_eq!(actual.index, expected.index);
+                assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            }
+            assert_eq!(
+                index.fast_tier().vectors_i8.get().is_some(),
+                params.is_none()
+            );
+            cx.set_cancel_requested(true);
+            for (query, limit) in [([1.0, 0.0], 0), ([0.0, 0.0], 23), ([1.0, 0.0], 23)] {
+                assert!(matches!(
+                    index.search_fast_classified_cancellable(&cx, &query, limit, params),
+                    Err(SearchError::Cancelled { .. })
+                ));
+            }
+        }
     }
 
     #[test]

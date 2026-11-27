@@ -1621,16 +1621,52 @@ pub fn quantize_f16_slab_to_i8(vectors_f16: &[f16]) -> Vec<i8> {
 /// the same AVX2+F16C quantization pipeline without first materializing a `Vec<f16>`.
 #[must_use]
 pub fn quantize_f16_le_bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
+    match quantize_f16_le_bytes_to_i8_controlled(bytes, |_| Ok::<(), std::convert::Infallible>(()))
+    {
+        Ok(values) => values,
+        Err(never) => match never {},
+    }
+}
+
+/// Bound cold-build work in scalar values, independently of the vector dimension.
+const INT8_QUANTIZATION_CHECKPOINT_VALUES: usize = 4096;
+
+/// The same two-pass, corpus-wide quantization with cooperative checkpoints.
+/// A failed checkpoint drops the private output; callers may publish only `Ok`.
+pub(crate) fn quantize_f16_le_bytes_to_i8_controlled<E>(
+    bytes: &[u8],
+    mut checkpoint: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Vec<i8>, E> {
+    checkpoint(0)?;
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
             // SAFETY: avx2 + f16c verified present by the runtime check above; on
             // little-endian x86, FSVI little-endian bytes are valid F16C inputs.
             #[allow(unsafe_code)]
-            return unsafe { quantize_f16_le_bytes_to_i8_avx2(bytes) };
+            return unsafe { quantize_f16_le_bytes_to_i8_avx2(bytes, checkpoint) };
         }
     }
-    quantize_f16_le_bytes_to_i8_generic(bytes)
+    quantize_f16_le_bytes_to_i8_generic_controlled(bytes, checkpoint)
+}
+
+fn zero_i8_slab_controlled<E>(
+    count: usize,
+    mut checkpoint: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Vec<i8>, E> {
+    let mut values = Vec::with_capacity(count);
+    while values.len() < count {
+        checkpoint(values.len())?;
+        values.resize(
+            values
+                .len()
+                .saturating_add(INT8_QUANTIZATION_CHECKPOINT_VALUES)
+                .min(count),
+            0,
+        );
+    }
+    checkpoint(0)?;
+    Ok(values)
 }
 
 /// Hand-written AVX2+F16C int8 slab quantizer. Bit-identical to the scalar kernel:
@@ -1745,8 +1781,10 @@ unsafe fn quantize_f16_slab_to_i8_avx2(vectors_f16: &[f16]) -> Vec<i8> {
     clippy::many_single_char_names,
     unsafe_code
 )]
-#[must_use]
-unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
+unsafe fn quantize_f16_le_bytes_to_i8_avx2<E>(
+    bytes: &[u8],
+    mut checkpoint: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Vec<i8>, E> {
     use core::arch::x86_64::{
         _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_cvtsi128_si32, _mm_loadu_si128, _mm256_add_ps,
         _mm256_and_ps, _mm256_castsi256_si128, _mm256_cvtph_ps, _mm256_cvttps_epi32,
@@ -1757,12 +1795,16 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
     let n = bytes.len() / 2;
     let chunks = n / 8;
 
+    checkpoint(0)?;
     let mut max_abs = 0.0_f32;
     // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
     unsafe {
         let abs_mask = _mm256_set1_ps(f32::from_bits(0x7fff_ffff));
         let mut vmax = _mm256_setzero_ps();
         for c in 0..chunks {
+            if (c * 8).is_multiple_of(INT8_QUANTIZATION_CHECKPOINT_VALUES) {
+                checkpoint(c * 8)?;
+            }
             let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
             vmax = _mm256_max_ps(vmax, _mm256_and_ps(x, abs_mask));
         }
@@ -1780,8 +1822,9 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
         max_abs = max_abs.max(value);
         tail += 2;
     }
+    checkpoint(0)?;
     if max_abs <= 0.0 {
-        return vec![0_i8; n];
+        return zero_i8_slab_controlled(n, checkpoint);
     }
     let scale = 127.0 / max_abs;
 
@@ -1799,6 +1842,9 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
         let lane_select = i64::from_le_bytes([0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80]);
         let lane_byte_mask = _mm256_set_epi64x(zero_bytes, lane_select, zero_bytes, lane_select);
         for c in 0..chunks {
+            if (c * 8).is_multiple_of(INT8_QUANTIZATION_CHECKPOINT_VALUES) {
+                checkpoint(c * 8)?;
+            }
             let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
             let v = _mm256_mul_ps(x, vscale);
             let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(v, vsign));
@@ -1832,7 +1878,8 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
         );
         tail += 2;
     }
-    out
+    checkpoint(0)?;
+    Ok(out)
 }
 
 /// Portable scalar int8 slab quantizer — the AVX2+F16C-dispatch fallback. Exposed
@@ -1863,27 +1910,45 @@ pub fn quantize_f16_slab_to_i8_generic(vectors_f16: &[f16]) -> Vec<i8> {
 #[doc(hidden)]
 #[must_use]
 pub fn quantize_f16_le_bytes_to_i8_generic(bytes: &[u8]) -> Vec<i8> {
+    match quantize_f16_le_bytes_to_i8_generic_controlled(bytes, |_| {
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(values) => values,
+        Err(never) => match never {},
+    }
+}
+
+fn quantize_f16_le_bytes_to_i8_generic_controlled<E>(
+    bytes: &[u8],
+    mut checkpoint: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Vec<i8>, E> {
+    checkpoint(0)?;
     let mut max_abs = 0.0_f32;
-    for chunk in bytes.as_chunks::<2>().0 {
+    for (offset, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        if offset.is_multiple_of(INT8_QUANTIZATION_CHECKPOINT_VALUES) {
+            checkpoint(offset)?;
+        }
         let value = f16::from_le_bytes(*chunk).to_f32().abs();
         max_abs = max_abs.max(value);
     }
+    checkpoint(0)?;
     if max_abs <= 0.0 {
-        return vec![0_i8; bytes.len() / 2];
+        return zero_i8_slab_controlled(bytes.len() / 2, checkpoint);
     }
     let scale = 127.0 / max_abs;
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|chunk| {
-            #[allow(clippy::cast_possible_truncation)]
-            let q = (f16::from_le_bytes(*chunk).to_f32() * scale)
-                .round()
-                .clamp(-127.0, 127.0) as i8;
-            q
-        })
-        .collect()
+    let mut values = Vec::with_capacity(bytes.len() / 2);
+    for (offset, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        if offset.is_multiple_of(INT8_QUANTIZATION_CHECKPOINT_VALUES) {
+            checkpoint(offset)?;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let q = (f16::from_le_bytes(*chunk).to_f32() * scale)
+            .round()
+            .clamp(-127.0, 127.0) as i8;
+        values.push(q);
+    }
+    checkpoint(0)?;
+    Ok(values)
 }
 
 /// Quantize one f32 to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's complement in
@@ -2589,14 +2654,80 @@ mod tests {
             let generic = quantize_f16_le_bytes_to_i8_generic(&bytes);
             // SAFETY: avx2+f16c verified present above.
             #[allow(unsafe_code)]
-            let avx2 = unsafe { quantize_f16_le_bytes_to_i8_avx2(&bytes) };
+            let avx2 = unsafe {
+                quantize_f16_le_bytes_to_i8_avx2(&bytes, |_| Ok::<(), std::convert::Infallible>(()))
+            }
+            .unwrap();
             assert_eq!(generic, avx2, "n={n}");
         }
         let zeros = vec![0_u8; 80];
         // SAFETY: avx2+f16c verified present above.
         #[allow(unsafe_code)]
-        let avx2_zero = unsafe { quantize_f16_le_bytes_to_i8_avx2(&zeros) };
+        let avx2_zero = unsafe {
+            quantize_f16_le_bytes_to_i8_avx2(&zeros, |_| Ok::<(), std::convert::Infallible>(()))
+        }
+        .unwrap();
         assert_eq!(quantize_f16_le_bytes_to_i8_generic(&zeros), avx2_zero);
+    }
+
+    #[test]
+    fn cancellable_int8_quantization_keeps_global_scale_and_stops_both_passes() {
+        let count = INT8_QUANTIZATION_CHECKPOINT_VALUES * 2 + 17;
+        for zero in [false, true] {
+            let mut values: Vec<f16> = (0..count)
+                .map(|offset| {
+                    let value = if zero {
+                        0.0
+                    } else {
+                        f32::from(u16::try_from(offset % 257).unwrap()) / 64.0 - 2.0
+                    };
+                    f16::from_f32(value)
+                })
+                .collect();
+            if !zero {
+                // A late maximum must set the scale even for the first block.
+                *values.last_mut().unwrap() = f16::from_f32(37.0);
+            }
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            // Independent f16-slice implementation is unchanged by this fix.
+            let expected = quantize_f16_slab_to_i8_generic(&values);
+            for scalar in [false, true] {
+                for target_pass in [0, 1] {
+                    let mut last_offset = 0;
+                    let mut pass = 0;
+                    let mut triggered = false;
+                    let checkpoint = |offset| {
+                        if offset == 0 && last_offset > 0 {
+                            pass += 1;
+                        }
+                        last_offset = offset;
+                        if pass == target_pass && offset > 0 {
+                            triggered = true;
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let result = if scalar {
+                        quantize_f16_le_bytes_to_i8_generic_controlled(&bytes, checkpoint)
+                    } else {
+                        quantize_f16_le_bytes_to_i8_controlled(&bytes, checkpoint)
+                    };
+                    assert_eq!(result, Err(()));
+                    assert!(triggered, "cancel after work in pass {target_pass}");
+                    assert_eq!(pass, target_pass);
+                    let retry = if scalar {
+                        quantize_f16_le_bytes_to_i8_generic(&bytes)
+                    } else {
+                        quantize_f16_le_bytes_to_i8(&bytes)
+                    };
+                    assert_eq!(retry, expected, "scalar={scalar}, zero={zero}");
+                }
+            }
+        }
     }
 
     /// The runtime AVX2+F16C 4-bit slab packer must be byte-for-byte identical to

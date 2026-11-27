@@ -101,12 +101,13 @@ impl<'a> RequestFilter<'a> {
             return Ok(());
         }
         cancellation_checkpoint(cx, "filter_metadata_lookup")?;
-        let values = self.read_for_filter(
-            cx,
-            "filter_metadata_lookup",
-            lexical.metadata_for_documents(cx, &unknown),
-        )
-        .await?;
+        let values = self
+            .read_for_filter(
+                cx,
+                "filter_metadata_lookup",
+                lexical.metadata_for_documents(cx, &unknown),
+            )
+            .await?;
         cancellation_checkpoint(cx, "filter_metadata_to_candidates")?;
         if values.len() != unknown.len() {
             self.filter_work_incomplete = true;
@@ -265,12 +266,13 @@ impl<'a> RequestFilter<'a> {
             self.attach_metadata(retained);
             return Ok(());
         }
-        let batch = self.read_for_filter(
-            cx,
-            "filter_lexical_revalidation",
-            lexical.search_candidates(cx, query, target),
-        )
-        .await?;
+        let batch = self
+            .read_for_filter(
+                cx,
+                "filter_lexical_revalidation",
+                lexical.search_candidates(cx, query, target),
+            )
+            .await?;
         let batch = self
             .refill_lexical_with_exclusions(cx, lexical, query, target, batch, exclusions, text_fn)
             .await?;
@@ -349,12 +351,13 @@ impl<'a> RequestFilter<'a> {
                 });
             }
             limit = next;
-            batch = self.read_for_filter(
-                cx,
-                "filter_lexical_refill",
-                lexical.search_candidates(cx, query, limit),
-            )
-            .await?;
+            batch = self
+                .read_for_filter(
+                    cx,
+                    "filter_lexical_refill",
+                    lexical.search_candidates(cx, query, limit),
+                )
+                .await?;
         }
     }
 

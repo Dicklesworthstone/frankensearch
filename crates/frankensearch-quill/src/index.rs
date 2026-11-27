@@ -26300,7 +26300,10 @@ mod tests {
     #[test]
     fn public_snippets_follow_phrase_prefix_and_boolean_query_terms() {
         run_with_cx(|cx| async move {
-            let documents = [IndexableDocument::new("target", "bright starship starlight")];
+            let documents = [IndexableDocument::new(
+                "target",
+                "bright starship starlight",
+            )];
             let index = QuillIndex::in_memory(QuillConfig {
                 // Matching this phrase has two possible suffixes. Snippet
                 // generation must not turn it into an independent glob query.
@@ -26308,7 +26311,10 @@ mod tests {
                 ..deterministic_config()
             })
             .unwrap();
-            index.index_documents_visible(&cx, &documents).await.unwrap();
+            index
+                .index_documents_visible(&cx, &documents)
+                .await
+                .unwrap();
             #[cfg(feature = "tantivy-oracle")]
             let oracle = {
                 let oracle = frankensearch_lexical::TantivyIndex::in_memory().unwrap();

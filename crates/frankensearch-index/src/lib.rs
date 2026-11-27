@@ -75,6 +75,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -955,6 +956,8 @@ pub struct VectorIndex {
     /// first two-pass use, so exact-only callers never pay the quantization cost or
     /// its footprint. One corpus-wide max-abs scale (see `quantize_f16_bytes_to_i8`).
     pub(crate) vectors_i8: OnceLock<Vec<i8>>,
+    /// One cold-build owner at a time; contenders remain cancellation-aware.
+    pub(crate) vectors_i8_building: AtomicBool,
     /// Lazily-built packed signed-4-bit quantization of the (contiguous, F16) main
     /// vector region — 2 dims/byte, `dim.div_ceil(2)` bytes per vector (half the int8
     /// slab) — for the optional 4-bit two-pass scan (`search_top_k_4bit_two_pass`).
@@ -1980,6 +1983,7 @@ impl ValidatedFsviBytes {
             wal_config: WalConfig::default(),
             wal_append_requires_reopen: false,
             vectors_i8: OnceLock::new(),
+            vectors_i8_building: AtomicBool::new(false),
             vectors_nibbles: OnceLock::new(),
         };
         Ok(Self {
@@ -2339,6 +2343,7 @@ impl VectorIndex {
                 wal_config: WalConfig::default(),
                 wal_append_requires_reopen: false,
                 vectors_i8: OnceLock::new(),
+                vectors_i8_building: AtomicBool::new(false),
                 vectors_nibbles: OnceLock::new(),
             },
             recovery,
@@ -3654,6 +3659,7 @@ impl VectorIndex {
         // that no longer exist (or reads past a shrunken slab). Reset so the
         // next two-pass search re-quantizes the new region (bd-0ho5p).
         self.vectors_i8 = OnceLock::new();
+        self.vectors_i8_building = AtomicBool::new(false);
         self.vectors_nibbles = OnceLock::new();
 
         Ok(())

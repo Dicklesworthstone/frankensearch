@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use ahash::AHashSet;
 
@@ -11,12 +12,12 @@ use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter, SearchFilter
 use frankensearch_core::{Cx, SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
-use crate::simd::dot_i8x4_i8;
+use crate::simd::{dot_i8x4_i8, quantize_f16_le_bytes_to_i8_controlled};
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8, dot_i8_i8_maddubs,
     dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, maddubs_query_bias,
-    pack_f16_le_bytes_to_4bit, prepare_4bit_query, quantize_f16_le_bytes_to_i8,
+    pack_f16_le_bytes_to_4bit, prepare_4bit_query,
 };
 
 /// Record-count threshold where search switches from sequential to Rayon.
@@ -80,6 +81,15 @@ impl ScanCancellation for &Cx {
             });
         }
         Ok(())
+    }
+}
+
+/// Release initializer ownership on success, cancellation, or unwinding.
+struct Int8SlabBuildGuard<'a>(&'a AtomicBool);
+
+impl Drop for Int8SlabBuildGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
     }
 }
 
@@ -189,7 +199,7 @@ pub(super) fn deduplicate_ranked_hits(mut hits: Vec<VectorHit>) -> Vec<VectorHit
     hits
 }
 
-fn classified_candidates_controlled(
+pub(super) fn classified_candidates_controlled(
     limit: usize,
     candidate_count: usize,
     mut search: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
@@ -532,7 +542,7 @@ impl VectorIndex {
         Ok(classified)
     }
 
-    fn classified_search_census_cancellable(
+    pub(super) fn classified_search_census_cancellable(
         &self,
         cancel: impl ScanCancellation,
         had_filter: bool,
@@ -961,7 +971,7 @@ impl VectorIndex {
         )
     }
 
-    fn search_top_k_controlled<const DEDUPLICATE: bool>(
+    pub(super) fn search_top_k_controlled<const DEDUPLICATE: bool>(
         &self,
         query: &[f32],
         limit: usize,
@@ -1063,6 +1073,16 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_rows_controlled(query, k, candidate_multiplier, UncancelledScan)
+    }
+
+    pub(super) fn search_top_k_int8_rows_controlled(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<VectorHit>> {
         // Production keeps the EXACT-int8 pass-1. The `vpmaddubs` kernel (bd-b5wl) is 1.23× faster
         // in isolation (decidable) and recall-exact, but its **scan-level** win is only ~1.02–1.11×
         // (Amdahl-shrunk) and is NOT robustly decidable under fleet contention: two null-controlled
@@ -1071,7 +1091,7 @@ impl VectorIndex {
         // contention-dependent effect fails the gate, so it stays behind
         // `bench_search_top_k_int8_two_pass_maddubs`. Retry = worker isolation (same as cod's int8
         // micro-opt block). See docs/NEGATIVE_EVIDENCE.md 2026-07-10.
-        self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier)
+        self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier, cancel)
     }
 
     /// Exact pre-row-block implementation retained only for same-binary
@@ -1084,8 +1104,13 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier)
-            .map(deduplicate_ranked_hits)
+        self.search_top_k_int8_two_pass_impl::<false, false>(
+            query,
+            k,
+            candidate_multiplier,
+            UncancelledScan,
+        )
+        .map(deduplicate_ranked_hits)
     }
 
     /// Four-row query-decode-reuse candidate retained only so the null-controlled
@@ -1098,8 +1123,13 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<true, false>(query, k, candidate_multiplier)
-            .map(deduplicate_ranked_hits)
+        self.search_top_k_int8_two_pass_impl::<true, false>(
+            query,
+            k,
+            candidate_multiplier,
+            UncancelledScan,
+        )
+        .map(deduplicate_ranked_hits)
     }
 
     /// `vpmaddubs` pass-1 kernel candidate (bd-b5wl), retained for the same-binary A/B.
@@ -1113,8 +1143,13 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<false, true>(query, k, candidate_multiplier)
-            .map(deduplicate_ranked_hits)
+        self.search_top_k_int8_two_pass_impl::<false, true>(
+            query,
+            k,
+            candidate_multiplier,
+            UncancelledScan,
+        )
+        .map(deduplicate_ranked_hits)
     }
 
     fn search_top_k_int8_two_pass_impl<const ROW_BLOCKED: bool, const MADDUBS: bool>(
@@ -1122,7 +1157,9 @@ impl VectorIndex {
         query: &[f32],
         k: usize,
         candidate_multiplier: usize,
+        cancel: impl ScanCancellation,
     ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         let count = self.record_count();
         // Fall back to the exact scan for anything this fast path does not cover.
         if k == 0
@@ -1130,7 +1167,13 @@ impl VectorIndex {
             || !self.wal_entries.is_empty()
             || self.quantization() != Quantization::F16
         {
-            return self.search_top_k_rows(query, k, None, SearchParams::default());
+            return self.search_top_k_controlled::<false>(
+                query,
+                k,
+                None,
+                SearchParams::default(),
+                cancel,
+            );
         }
         if query.len() != self.dimension() {
             return Err(SearchError::DimensionMismatch {
@@ -1144,14 +1187,14 @@ impl VectorIndex {
             .saturating_mul(candidate_multiplier.max(1))
             .min(count)
             .max(k.min(count));
-        let query_i8 = quantize_i8_query(query);
+        let query_i8 = quantize_i8_query(query, cancel)?;
         // Per-query bias `128·Σq` for the `MADDUBS` pass-1 kernel; unused (0) otherwise.
         let q_bias128 = if MADDUBS {
             maddubs_query_bias(&query_i8, dim)
         } else {
             0
         };
-        let slab = self.int8_slab();
+        let slab = self.int8_slab(cancel)?;
 
         // Pass 1: bounded-heap int8 scan keeping the top `candidate_count`.
         // The int8 dot is cheap enough that exact-scan sized chunks overproduce
@@ -1159,7 +1202,7 @@ impl VectorIndex {
         // the post-scan merge fan-in.
         let candidate_heap = if count < PARALLEL_THRESHOLD {
             if ROW_BLOCKED {
-                self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
+                self.int8_scan_range(slab, &query_i8, 0, count, candidate_count, cancel)?
             } else {
                 self.int8_scan_range_orig::<MADDUBS>(
                     slab,
@@ -1168,17 +1211,18 @@ impl VectorIndex {
                     0,
                     count,
                     candidate_count,
-                )
+                    cancel,
+                )?
             }
         } else {
             let chunk_count = count.div_ceil(INT8_PARALLEL_CHUNK_SIZE);
-            let partials: Vec<BinaryHeap<Int8HeapKey>> = (0..chunk_count)
+            let partials: SearchResult<Vec<BinaryHeap<Int8HeapKey>>> = (0..chunk_count)
                 .into_par_iter()
                 .map(|chunk_index| {
                     let start = chunk_index * INT8_PARALLEL_CHUNK_SIZE;
                     let end = (start + INT8_PARALLEL_CHUNK_SIZE).min(count);
                     if ROW_BLOCKED {
-                        self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
+                        self.int8_scan_range(slab, &query_i8, start, end, candidate_count, cancel)
                     } else {
                         self.int8_scan_range_orig::<MADDUBS>(
                             slab,
@@ -1187,26 +1231,40 @@ impl VectorIndex {
                             start,
                             end,
                             candidate_count,
+                            cancel,
                         )
                     }
                 })
                 .collect();
-            merge_int8_partial_heaps(partials, candidate_count)
+            merge_int8_partial_heaps(partials?, candidate_count, cancel)?
         };
 
+        self.rescore_int8_candidates(query, k, candidate_heap, cancel)
+    }
+
+    fn rescore_int8_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_heap: BinaryHeap<Int8HeapKey>,
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<Vec<VectorHit>> {
+        cancel.checkpoint()?;
         // Pass 2: exact f16 rescore of the candidates through the SAME bounded-heap
         // selection + tie-break as `search_top_k`, so the final order is identical
         // whenever pass-1 retained the true top-k.
-        let stride = dim * 2;
+        let stride = self.dimension() * 2;
         let mut heap = BinaryHeap::with_capacity(k.min(candidate_heap.len()));
-        for candidate in candidate_heap {
+        for (offset, candidate) in candidate_heap.into_iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             let index = int8_heap_index(candidate);
             let vector_offset = self.vectors_offset + index * stride;
             let vector_bytes = &self.data[vector_offset..vector_offset + stride];
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
             insert_candidate(&mut heap, HeapEntry::new(index, score), k);
         }
-        self.resolve_hits::<false>(heap, UncancelledScan)
+        cancel.checkpoint()?;
+        self.resolve_hits::<false>(heap, cancel)
     }
 
     fn int8_scan_range_orig<const MADDUBS: bool>(
@@ -1217,9 +1275,11 @@ impl VectorIndex {
         start: usize,
         end: usize,
         limit: usize,
-    ) -> BinaryHeap<Int8HeapKey> {
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<BinaryHeap<Int8HeapKey>> {
+        cancel.checkpoint()?;
         if limit == 0 {
-            return BinaryHeap::new();
+            return Ok(BinaryHeap::new());
         }
         if self.dimension() <= MAX_EXACT_I8_DOT_DIM {
             self.int8_scan_range_orig_with_key::<MADDUBS, _>(
@@ -1230,6 +1290,7 @@ impl VectorIndex {
                 end,
                 limit,
                 int8_heap_key,
+                cancel,
             )
         } else {
             self.int8_scan_range_orig_with_key::<MADDUBS, _>(
@@ -1240,6 +1301,7 @@ impl VectorIndex {
                 end,
                 limit,
                 int8_heap_key_from_f32,
+                cancel,
             )
         }
     }
@@ -1256,7 +1318,8 @@ impl VectorIndex {
         end: usize,
         limit: usize,
         make_key: F,
-    ) -> BinaryHeap<Int8HeapKey>
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<BinaryHeap<Int8HeapKey>>
     where
         F: Fn(usize, i32) -> Int8HeapKey,
     {
@@ -1267,6 +1330,7 @@ impl VectorIndex {
         let mut slab_offset = start * dim;
 
         for index in start..end {
+            cancel.checkpoint_at(index - start)?;
             let flags_bytes = &self.data[flags_offset..flags_offset + 2];
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
@@ -1291,7 +1355,8 @@ impl VectorIndex {
             flags_offset += 16;
             slab_offset += dim;
         }
-        heap
+        cancel.checkpoint()?;
+        Ok(heap)
     }
 
     /// Bounded-heap int8 scan of records `[start, end)` over the int8 `slab`
@@ -1304,14 +1369,24 @@ impl VectorIndex {
         start: usize,
         end: usize,
         limit: usize,
-    ) -> BinaryHeap<Int8HeapKey> {
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<BinaryHeap<Int8HeapKey>> {
+        cancel.checkpoint()?;
         if limit == 0 {
-            return BinaryHeap::new();
+            return Ok(BinaryHeap::new());
         }
         if self.dimension() <= MAX_EXACT_I8_DOT_DIM {
-            self.int8_scan_range_with_key(slab, query_i8, start, end, limit, int8_heap_key)
+            self.int8_scan_range_with_key(slab, query_i8, start, end, limit, int8_heap_key, cancel)
         } else {
-            self.int8_scan_range_with_key(slab, query_i8, start, end, limit, int8_heap_key_from_f32)
+            self.int8_scan_range_with_key(
+                slab,
+                query_i8,
+                start,
+                end,
+                limit,
+                int8_heap_key_from_f32,
+                cancel,
+            )
         }
     }
 
@@ -1323,7 +1398,8 @@ impl VectorIndex {
         end: usize,
         limit: usize,
         make_key: F,
-    ) -> BinaryHeap<Int8HeapKey>
+        cancel: impl ScanCancellation,
+    ) -> SearchResult<BinaryHeap<Int8HeapKey>>
     where
         F: Fn(usize, i32) -> Int8HeapKey,
     {
@@ -1335,6 +1411,7 @@ impl VectorIndex {
 
         let mut index = start;
         while index + 4 <= end {
+            cancel.checkpoint_at(index - start)?;
             let flags0 = u16::from_le_bytes([self.data[flags_offset], self.data[flags_offset + 1]]);
             let flags1 =
                 u16::from_le_bytes([self.data[flags_offset + 16], self.data[flags_offset + 17]]);
@@ -1376,6 +1453,7 @@ impl VectorIndex {
         }
 
         while index < end {
+            cancel.checkpoint_at(index - start)?;
             let flags_bytes = &self.data[flags_offset..flags_offset + 2];
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
@@ -1391,20 +1469,59 @@ impl VectorIndex {
             flags_offset += 16;
             slab_offset += dim;
         }
-        heap
+        cancel.checkpoint()?;
+        Ok(heap)
     }
 
-    /// Lazily build (once) the int8 quantization of the contiguous F16 main-vector
-    /// region. Only called after the F16/no-WAL gate in `search_top_k_int8_two_pass`.
-    fn int8_slab(&self) -> &[i8] {
-        self.vectors_i8.get_or_init(|| {
-            let count = self.record_count();
-            let dim = self.dimension();
-            let byte_len = count * dim * 2;
-            quantize_f16_le_bytes_to_i8(
-                &self.data[self.vectors_offset..self.vectors_offset + byte_len],
-            )
-        })
+    /// Lazily quantize the F16 main slab. All callers share one builder, while
+    /// contenders can cancel without waiting for that builder's whole corpus.
+    /// Cancellation drops private output and releases the claim for a retry.
+    fn int8_slab(&self, cancel: impl ScanCancellation) -> SearchResult<&[i8]> {
+        let mut yielded = false;
+        loop {
+            cancel.checkpoint()?;
+            if let Some(slab) = self.vectors_i8.get() {
+                return Ok(slab);
+            }
+            if self
+                .vectors_i8_building
+                .compare_exchange(
+                    false,
+                    true,
+                    AtomicOrdering::Acquire,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok()
+            {
+                // Declare the guard before the private Vec, so a failed build
+                // releases its allocation before another caller can acquire.
+                let _building = Int8SlabBuildGuard(&self.vectors_i8_building);
+                if let Some(slab) = self.vectors_i8.get() {
+                    cancel.checkpoint()?;
+                    return Ok(slab);
+                }
+                cancel.checkpoint()?;
+                let byte_len = self.record_count() * self.dimension() * 2;
+                let slab = quantize_f16_le_bytes_to_i8_controlled(
+                    &self.data[self.vectors_offset..self.vectors_offset + byte_len],
+                    |offset| cancel.checkpoint_at(offset),
+                )?;
+                cancel.checkpoint()?;
+                // Initialization only moves a complete Vec; no traversal runs
+                // inside OnceLock, and the claim excludes other slab builders.
+                let slab = self.vectors_i8.get_or_init(|| slab);
+                cancel.checkpoint()?;
+                return Ok(slab);
+            }
+            if yielded {
+                // This CPU-bound API is synchronous. A short sleep prevents
+                // contenders from busy-spinning while keeping checks bounded.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                std::thread::yield_now();
+                yielded = true;
+            }
+        }
     }
 
     /// Select candidates using packed signed 4-bit vectors, then rank them by
@@ -2304,16 +2421,24 @@ impl VectorIndex {
 /// Quantize an f32 query to int8 using its own max-abs scale (a per-query constant
 /// that does not change the dot-product ranking).
 #[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the f32->i8 cast
-fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
-    let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
-    if max_abs <= 0.0 {
-        return vec![0; query.len()];
+fn quantize_i8_query(query: &[f32], cancel: impl ScanCancellation) -> SearchResult<Vec<i8>> {
+    let mut max_abs = 0.0_f32;
+    for (offset, value) in query.iter().enumerate() {
+        cancel.checkpoint_at(offset)?;
+        max_abs = max_abs.max(value.abs());
     }
     let scale = 127.0 / max_abs;
-    query
-        .iter()
-        .map(|&x| (x * scale).round().clamp(-127.0, 127.0) as i8)
-        .collect()
+    let mut values = Vec::with_capacity(query.len());
+    for (offset, &value) in query.iter().enumerate() {
+        cancel.checkpoint_at(offset)?;
+        values.push(if max_abs <= 0.0 {
+            0
+        } else {
+            (value * scale).round().clamp(-127.0, 127.0) as i8
+        });
+    }
+    cancel.checkpoint()?;
+    Ok(values)
 }
 
 /// Quantize one component to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's
@@ -2419,14 +2544,19 @@ fn merge_partial_heaps(
 fn merge_int8_partial_heaps(
     partial_heaps: Vec<BinaryHeap<Int8HeapKey>>,
     limit: usize,
-) -> BinaryHeap<Int8HeapKey> {
-    let total_elements = partial_heaps
-        .iter()
-        .map(BinaryHeap::len)
-        .fold(0_usize, usize::saturating_add);
+    cancel: impl ScanCancellation,
+) -> SearchResult<BinaryHeap<Int8HeapKey>> {
+    cancel.checkpoint()?;
+    let mut total_elements = 0_usize;
+    for (offset, heap) in partial_heaps.iter().enumerate() {
+        cancel.checkpoint_at(offset)?;
+        total_elements = total_elements.saturating_add(heap.len());
+    }
     let mut merged = BinaryHeap::with_capacity(limit.min(total_elements).saturating_add(1));
     for heap in partial_heaps {
-        for candidate in heap {
+        cancel.checkpoint()?;
+        for (offset, candidate) in heap.into_iter().enumerate() {
+            cancel.checkpoint_at(offset)?;
             if merged.len() < limit {
                 merged.push(candidate);
             } else if merged.peek().is_some_and(|&worst| candidate < worst) {
@@ -2435,7 +2565,8 @@ fn merge_int8_partial_heaps(
             }
         }
     }
-    merged
+    cancel.checkpoint()?;
+    Ok(merged)
 }
 
 fn parallel_search_enabled() -> bool {
@@ -2942,6 +3073,328 @@ mod tests {
             index.search_top_k_cancellable(&cx, &[1.0, 0.0], 1, Some(&filter)),
             Err(SearchError::Cancelled { .. })
         ));
+    }
+
+    #[test]
+    fn cancellable_int8_cold_build_discards_both_partial_passes_and_retries() {
+        #[derive(Clone, Copy)]
+        struct CancelQuantizationPass<'a> {
+            cx: &'a Cx,
+            state: &'a Mutex<(usize, usize, bool)>,
+            target_pass: usize,
+        }
+
+        impl ScanCancellation for CancelQuantizationPass<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                ScanCancellation::checkpoint(self.cx)
+            }
+
+            fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if offset == 0 && state.0 > 0 {
+                        state.1 += 1;
+                    }
+                    state.0 = offset;
+                    if state.1 == self.target_pass && offset > 0 {
+                        state.2 = true;
+                        self.cx.set_cancel_requested(true);
+                    }
+                }
+                ScanCancellation::checkpoint_at(self.cx, offset)
+            }
+        }
+
+        for target_pass in [0, 1] {
+            let (_path, index) = cancellation_index(
+                "cancel-int8-cold-build",
+                Quantization::F16,
+                CANCELLATION_TEST_ROWS,
+            );
+            let cx = Cx::for_testing();
+            let state = Mutex::new((0, 0, false));
+            let result = index.int8_slab(CancelQuantizationPass {
+                cx: &cx,
+                state: &state,
+                target_pass,
+            });
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert!(state.lock().unwrap().2, "cancel inside the selected pass");
+            assert!(
+                index.vectors_i8.get().is_none(),
+                "never publish partial bytes"
+            );
+            assert!(!index.vectors_i8_building.load(AtomicOrdering::Acquire));
+
+            cx.set_cancel_requested(false);
+            let bytes = &index.data[index.vectors_offset
+                ..index.vectors_offset + index.record_count() * index.dimension() * 2];
+            let expected = crate::quantize_f16_le_bytes_to_i8(bytes);
+            let actual = index
+                .int8_slab(&cx)
+                .expect("retry completes the cold build");
+            assert_eq!(actual, expected);
+            let published = actual.as_ptr();
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                index.int8_slab(&cx),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(index.vectors_i8.get().unwrap().as_ptr(), published);
+            assert_eq!(index.vectors_i8.get().unwrap().as_slice(), expected);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancellable_int8_waiter_does_not_allocate_a_second_cold_slab() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, mpsc};
+        use std::time::Duration;
+
+        #[derive(Clone, Copy)]
+        struct PausedBuilder<'a> {
+            entered: &'a Barrier,
+            release: &'a Barrier,
+            paused: &'a AtomicBool,
+        }
+
+        impl ScanCancellation for PausedBuilder<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                Ok(())
+            }
+
+            fn checkpoint_at(self, _offset: usize) -> SearchResult<()> {
+                if !self.paused.swap(true, AtomicOrdering::AcqRel) {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct CancelWaiting<'a> {
+            cx: &'a Cx,
+            checks: &'a AtomicUsize,
+            quantizer_visits: &'a AtomicUsize,
+        }
+
+        impl ScanCancellation for CancelWaiting<'_> {
+            fn checkpoint(self) -> SearchResult<()> {
+                if self.checks.fetch_add(1, AtomicOrdering::Relaxed) == 3 {
+                    self.cx.set_cancel_requested(true);
+                }
+                ScanCancellation::checkpoint(self.cx)
+            }
+
+            fn checkpoint_at(self, offset: usize) -> SearchResult<()> {
+                self.quantizer_visits.fetch_add(1, AtomicOrdering::Relaxed);
+                ScanCancellation::checkpoint_at(self.cx, offset)
+            }
+        }
+
+        let (_path, index) = cancellation_index(
+            "cancel-int8-contender",
+            Quantization::F16,
+            CANCELLATION_TEST_ROWS,
+        );
+        let entered = Barrier::new(2);
+        let release = Barrier::new(2);
+        let paused = AtomicBool::new(false);
+        let checks = AtomicUsize::new(0);
+        let quantizer_visits = AtomicUsize::new(0);
+        let cx = Cx::for_testing();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let builder = scope.spawn(|| {
+                index.int8_slab(PausedBuilder {
+                    entered: &entered,
+                    release: &release,
+                    paused: &paused,
+                })
+            });
+            entered.wait();
+            assert!(index.vectors_i8.get().is_none());
+            let waiter = scope.spawn(|| {
+                let result = index
+                    .int8_slab(CancelWaiting {
+                        cx: &cx,
+                        checks: &checks,
+                        quantizer_visits: &quantizer_visits,
+                    })
+                    .map(<[i8]>::len);
+                sender.send(result).unwrap();
+            });
+            // Always release the builder before asserting, so a broken waiter
+            // fails the test rather than leaving a blocked scoped thread.
+            let result = receiver.recv_timeout(Duration::from_secs(2));
+            release.wait();
+            let published = builder.join().unwrap().unwrap();
+            waiter.join().unwrap();
+            assert!(matches!(result, Ok(Err(SearchError::Cancelled { .. }))));
+            assert_eq!(quantizer_visits.load(AtomicOrdering::Relaxed), 0);
+            assert!(!index.vectors_i8_building.load(AtomicOrdering::Acquire));
+            let bytes = &index.data[index.vectors_offset
+                ..index.vectors_offset + index.record_count() * index.dimension() * 2];
+            assert_eq!(published, crate::quantize_f16_le_bytes_to_i8(bytes));
+            cx.set_cancel_requested(false);
+            assert_eq!(index.int8_slab(&cx).unwrap().as_ptr(), published.as_ptr());
+        });
+    }
+
+    #[test]
+    fn cancellable_int8_candidate_scan_keeps_cached_bytes_and_exact_retry_bits() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for count in [CANCELLATION_TEST_ROWS, PARALLEL_THRESHOLD + 3] {
+            let (_path, mut index) =
+                cancellation_index("cancel-int8-pass1", Quantization::F16, count);
+            index
+                .soft_delete_batch(&["doc-00001", "doc-00030"])
+                .unwrap();
+            let query = [1.0, 0.0];
+            let expected = index.search_top_k_int8_two_pass(&query, 23, 3).unwrap();
+            let cached = index.vectors_i8.get().unwrap().clone();
+            let cached_address = index.vectors_i8.get().unwrap().as_ptr();
+            let cx = Cx::for_testing();
+            let visits = Mutex::new(0);
+            let result = pool.install(|| {
+                index.search_top_k_int8_rows_controlled(
+                    &query,
+                    23,
+                    3,
+                    CancelDuringRows {
+                        cx: &cx,
+                        visits: &visits,
+                    },
+                )
+            });
+            assert_bounded_cancellation(
+                &result,
+                *visits.lock().unwrap(),
+                if count >= PARALLEL_THRESHOLD { 2 } else { 1 },
+            );
+            assert_eq!(index.vectors_i8.get().unwrap(), &cached);
+            assert_eq!(index.vectors_i8.get().unwrap().as_ptr(), cached_address);
+            cx.set_cancel_requested(false);
+            let retry = pool
+                .install(|| index.search_top_k_int8_rows_controlled(&query, 23, 3, &cx))
+                .unwrap();
+            assert_same_hits(&retry, &expected);
+        }
+    }
+
+    #[test]
+    fn cancellable_int8_rescore_and_parallel_merge_stop_after_real_work() {
+        let (_path, index) = cancellation_index(
+            "cancel-int8-rescore",
+            Quantization::F16,
+            CANCELLATION_TEST_ROWS,
+        );
+        let candidates: BinaryHeap<_> = (0..index.record_count())
+            .map(|row| int8_heap_key(row, 100))
+            .collect();
+        let query = [1.0, 0.0];
+        let expected = index
+            .rescore_int8_candidates(&query, 23, candidates.clone(), UncancelledScan)
+            .unwrap();
+        let cx = Cx::for_testing();
+        let visits = Mutex::new(0);
+        let result = index.rescore_int8_candidates(
+            &query,
+            23,
+            candidates.clone(),
+            CancelDuringRows {
+                cx: &cx,
+                visits: &visits,
+            },
+        );
+        assert_bounded_cancellation(&result, *visits.lock().unwrap(), 1);
+        cx.set_cancel_requested(false);
+        assert_same_hits(
+            &index
+                .rescore_int8_candidates(&query, 23, candidates, &cx)
+                .unwrap(),
+            &expected,
+        );
+
+        let partials: Vec<BinaryHeap<_>> = (0..4)
+            .map(|chunk| {
+                (0..1024)
+                    .map(|row| int8_heap_key(chunk * 1024 + row, 100))
+                    .collect()
+            })
+            .collect();
+        let expected = merge_int8_partial_heaps(partials.clone(), 23, UncancelledScan)
+            .unwrap()
+            .into_sorted_vec();
+        *visits.lock().unwrap() = 0;
+        let result = merge_int8_partial_heaps(
+            partials.clone(),
+            23,
+            CancelDuringRows {
+                cx: &cx,
+                visits: &visits,
+            },
+        );
+        assert_bounded_cancellation(&result, *visits.lock().unwrap(), 1);
+        cx.set_cancel_requested(false);
+        assert_eq!(
+            merge_int8_partial_heaps(partials, 23, &cx)
+                .unwrap()
+                .into_sorted_vec(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn cancellable_int8_fallbacks_keep_f32_and_wal_visibility() {
+        for (quantization, wal) in [
+            (Quantization::F32, false),
+            (Quantization::F16, true),
+            (Quantization::F32, true),
+        ] {
+            let (_path, mut index) = cancellation_index(
+                "cancel-int8-exact-fallback",
+                quantization,
+                if wal { 1 } else { CANCELLATION_TEST_ROWS },
+            );
+            if wal {
+                let rows: Vec<_> = (0..CANCELLATION_TEST_ROWS)
+                    .map(|row| (format!("wal-{row:05}"), vec![1.0, 0.5]))
+                    .collect();
+                index.append_batch(&rows).unwrap();
+                // The old main row scores 1.0; its live WAL replacement scores
+                // zero and must not conceal any of the new 0.5-score rows.
+                index.append("doc-00000", &[-1.0, 0.0]).unwrap();
+            }
+            let query = [0.0, 1.0];
+            let expected = index.search_top_k(&query, 23, None).unwrap();
+            if wal {
+                assert!(expected.iter().all(|hit| hit.doc_id != "doc-00000"));
+            }
+            let cx = Cx::for_testing();
+            let visits = Mutex::new(0);
+            let result = index.search_top_k_int8_rows_controlled(
+                &query,
+                23,
+                3,
+                CancelDuringRows {
+                    cx: &cx,
+                    visits: &visits,
+                },
+            );
+            assert_bounded_cancellation(&result, *visits.lock().unwrap(), 1);
+            assert!(index.vectors_i8.get().is_none());
+            cx.set_cancel_requested(false);
+            let retry = index
+                .search_top_k_int8_rows_controlled(&query, 23, 3, &cx)
+                .unwrap();
+            assert_same_hits(&retry, &expected);
+        }
     }
 
     #[test]
@@ -4751,7 +5204,8 @@ mod tests {
                 .into_iter()
                 .map(|entry| entry.index)
                 .collect::<Vec<_>>();
-            let mut packed_indices = merge_int8_partial_heaps(packed_parts, limit)
+            let mut packed_indices = merge_int8_partial_heaps(packed_parts, limit, UncancelledScan)
+                .expect("uncancelled int8 merge")
                 .into_iter()
                 .map(int8_heap_index)
                 .collect::<Vec<_>>();
