@@ -146,13 +146,53 @@ impl RetainedSearchReader {
 ///
 /// Invalid selection, failed admission and cancellation are returned to the
 /// caller; they never trigger an implicit stale-result or legacy-index fallback.
+/// The store directory is retained by identity: replacing its pathname does not
+/// authorize this reader to follow an unrelated store or a new symlink.
 #[derive(Debug)]
 pub struct LiveRetainedSearchReader {
     store: crate::generation_store::CompleteGenerationStore,
+    root_directory: Arc<fs::File>,
     reader: RetainedSearchReader,
 }
 
+fn validate_live_store_root(root: &Path, directory: &fs::File) -> SearchResult<()> {
+    let replaced = || {
+        complete_cli::complete_cli_error(
+            "root",
+            "the live reader's store directory was replaced or is no longer a directory; its original generation remains retained",
+        )
+    };
+    let opened = directory.metadata()?;
+    let current = fs::symlink_metadata(root).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            replaced()
+        } else {
+            SearchError::Io(error)
+        }
+    })?;
+    #[cfg(unix)]
+    let same_directory = {
+        use std::os::unix::fs::MetadataExt;
+        (opened.dev(), opened.ino()) == (current.dev(), current.ino())
+    };
+    // CompleteGenerationStore already refuses non-Unix platforms before I/O.
+    // Never substitute a constant matching identity on an unsupported target.
+    #[cfg(not(unix))]
+    let same_directory = false;
+    if !opened.is_dir() || !current.is_dir() || !same_directory {
+        return Err(replaced());
+    }
+    Ok(())
+}
+
 impl LiveRetainedSearchReader {
+    fn validate_store_root(&self) -> SearchResult<()> {
+        validate_live_store_root(self.store.root(), &self.root_directory)
+    }
+
     /// The currently loaded generation, not an assertion about a later pointer.
     #[must_use]
     pub const fn generation(&self) -> &crate::generation_store::PublishedGeneration {
@@ -168,18 +208,26 @@ impl LiveRetainedSearchReader {
     /// after repair, or the caller can explicitly opt into `into_retained`.
     ///
     /// # Errors
-    /// Returns the original selection, integrity, producer or cancellation error.
+    /// Returns the original store-identity, selection, integrity, producer or
+    /// cancellation error.
     pub async fn refresh(&mut self, cx: &Cx) -> SearchResult<bool> {
         retained_search_checkpoint(cx)?;
-        if self.store.is_selected(cx, self.reader.generation())? {
+        self.validate_store_root()?;
+        let selected = self.store.is_selected(cx, self.reader.generation())?;
+        self.validate_store_root()?;
+        if selected {
             return Ok(false);
         }
         let replacement = self
             .reader
             .runtime
             .open_retained_search(cx, self.store.root())
-            .await?;
+            .await;
         retained_search_checkpoint(cx)?;
+        // Admission may yield while the store pathname is replaced. Check
+        // even when that admission failed, before accepting any new reader.
+        self.validate_store_root()?;
+        let replacement = replacement?;
         let changed = replacement.generation() != self.reader.generation();
         self.reader = replacement;
         Ok(changed)
@@ -424,8 +472,23 @@ impl FsfsRuntime {
             store_root,
             frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
         )?;
-        let reader = self.open_retained_search(cx, store.root()).await?;
-        Ok(LiveRetainedSearchReader { store, reader })
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        }
+        let root_directory = Arc::new(options.open(store.root())?);
+        validate_live_store_root(store.root(), &root_directory)?;
+        let reader = self.open_retained_search(cx, store.root()).await;
+        retained_search_checkpoint(cx)?;
+        validate_live_store_root(store.root(), &root_directory)?;
+        Ok(LiveRetainedSearchReader {
+            store,
+            root_directory,
+            reader: reader?,
+        })
     }
 
     /// Resolve and open the selected complete generation once for repeated reads.
@@ -4740,6 +4803,125 @@ mod retained_search_tests {
                 store.active(&cx).expect("sealed inventory"),
                 Some(live.generation().clone())
             );
+        });
+    }
+
+    #[test]
+    fn live_retained_root_replacement_refuses_a_foreign_store_and_preserves_the_reader() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fixture");
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let mut live = runtime
+                .open_live_retained_search(&cx, &root)
+                .await
+                .expect("live reader");
+            let first = live.generation().clone();
+
+            let foreign_directory = tempfile::tempdir().expect("foreign fixture");
+            let (foreign_runtime, foreign_source, foreign_root) = fixture(foreign_directory.path());
+            fs::write(
+                foreign_source.join("alpha.md"),
+                "foreigntoken unrelated content",
+            )
+            .expect("foreign source");
+            publish(&foreign_runtime, &cx, &foreign_root).await;
+            let foreign_pointer =
+                fs::read(foreign_root.join(crate::generation_store::COMPLETE_GENERATION_POINTER))
+                    .expect("foreign selection");
+            let moved = directory.path().join("retained-original-store");
+            fs::rename(&root, &moved).expect("retain original store at another path");
+            fs::rename(&foreign_root, &root).expect("replace the store pathname");
+
+            let mut delivered = 0;
+            let mut sink = |_: &SearchPayload| {
+                delivered += 1;
+                Ok(())
+            };
+            let error = live
+                .search_with_phase_sink(&cx, "foreigntoken", 10, &mut sink)
+                .await
+                .expect_err("a foreign directory cannot become the live reader's authority");
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "complete_generation.root"));
+            assert_eq!(delivered, 0);
+            assert_eq!(live.generation(), &first);
+            assert_eq!(
+                fs::read(root.join(crate::generation_store::COMPLETE_GENERATION_POINTER))
+                    .expect("foreign store remains unchanged"),
+                foreign_pointer
+            );
+
+            fs::rename(&root, &foreign_root).expect("retain foreign store at its original path");
+            fs::rename(&moved, &root).expect("restore original authority pathname");
+            assert!(
+                !live
+                    .refresh(&cx)
+                    .await
+                    .expect("original reader is still installed")
+            );
+            let original = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("original query");
+            assert_eq!(original.last().expect("phase").hits.len(), 1);
+            assert_eq!(live.generation(), &first);
+
+            fs::write(source.join("beta.md"), "sharedtoken legitimate successor")
+                .expect("new original source");
+            publish(&runtime, &cx, &root).await;
+            let successor = live
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .expect("normal successor");
+            assert_eq!(successor.last().expect("phase").hits.len(), 2);
+            assert_ne!(live.generation(), &first);
+        });
+    }
+
+    #[test]
+    fn live_retained_root_replacement_refuses_copied_selection_and_symlink_routes() {
+        run_test_with_cx(|cx| async move {
+            for symlink in [false, true] {
+                let directory = tempfile::tempdir().expect("fixture");
+                let (runtime, _, root) = fixture(directory.path());
+                publish(&runtime, &cx, &root).await;
+                let mut live = runtime
+                    .open_live_retained_search(&cx, &root)
+                    .await
+                    .expect("live reader");
+                let first = live.generation().clone();
+                let moved = directory.path().join("retained-original-store");
+                fs::rename(&root, &moved).expect("retain original directory");
+                if symlink {
+                    std::os::unix::fs::symlink(&moved, &root).expect("replace root by alias");
+                } else {
+                    fs::create_dir(&root).expect("replacement root");
+                    fs::copy(
+                        moved.join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                        root.join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                    )
+                    .expect("copy the exact selection without its original root");
+                }
+                let error = live
+                    .refresh(&cx)
+                    .await
+                    .expect_err("unchanged selection bytes do not establish root identity");
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                        if field == "complete_generation.root"));
+                assert_eq!(live.generation(), &first);
+
+                fs::rename(&root, directory.path().join("rejected-replacement"))
+                    .expect("retain rejected replacement");
+                fs::rename(&moved, &root).expect("restore original directory");
+                let mut retained = live.into_retained();
+                let phases = retained
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .expect("retained query");
+                assert_eq!(phases.last().expect("phase").hits.len(), 1);
+                assert_eq!(retained.generation(), &first);
+            }
         });
     }
 

@@ -800,8 +800,10 @@ impl FsfsRuntime {
                 admitted.enable_daemon_dispatch(cx, services).await?;
             }
         }
+        state.0.validate_store_root()?;
         Ok(LiveRetainedSearchReader {
             store: state.0.store.clone(),
+            root_directory: Arc::clone(&state.0.root_directory),
             reader: RetainedSearchReader {
                 runtime,
                 generation: state.0.reader.generation.clone(),
