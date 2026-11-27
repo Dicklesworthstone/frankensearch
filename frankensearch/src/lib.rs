@@ -85,6 +85,10 @@
 //! });
 //! ```
 //!
+//! Keyword-only services can call `open_lexical(&cx, "./my_index").await?`
+//! to obtain the persisted lexical reader and its backend without opening the
+//! vector tier or loading a model. Enable `quill` or `lexical-tantivy`.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -447,6 +451,8 @@ pub use frankensearch_rerank::FastEmbedReranker;
 // ─── IndexBuilder convenience API ────────────────────────────────────────────
 
 mod index_builder;
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+pub use index_builder::open_lexical;
 #[cfg(any(feature = "native", feature = "rerank"))]
 pub use index_builder::detect_embedder_stack_with_pool;
 pub use index_builder::{

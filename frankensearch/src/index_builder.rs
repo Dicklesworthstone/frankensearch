@@ -1714,7 +1714,7 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     })
 }
 
-/// The lexical engine admitted by [`open_hybrid`].
+/// The lexical engine admitted when reopening a persisted facade index.
 ///
 /// [`Self::Quill`] is the default facade authority. [`Self::TantivyOracle`]
 /// is an explicitly selected rollback/oracle reader; it never means that the
@@ -1775,6 +1775,53 @@ fn is_plain_lexical_directory(metadata: &std::fs::Metadata) -> bool {
     true
 }
 
+fn has_lexical_directory(dir: &Path) -> SearchResult<bool> {
+    // Inspect without following the final component. A dangling link or a
+    // non-directory obstruction is distinct from a genuinely absent arm.
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if is_plain_lexical_directory(&metadata) => Ok(true),
+        Ok(_) => Err(SearchError::InvalidConfig {
+            field: "data_dir/lexical".to_owned(),
+            value: "non-directory".to_owned(),
+            reason: "the lexical path must be a directory without a symlink or reparse point"
+                .to_owned(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Open only the persisted keyword index under `data_dir/lexical`.
+///
+/// Use this for keyword searches while vector files or embedding models are
+/// unavailable. Opening inspects only the lexical layout, takes no writer
+/// lock, and returns the selected reader and its actual engine. With Quill
+/// enabled, blue-green roots follow their published engine selection.
+///
+/// # Errors
+///
+/// Returns an error for cancellation, missing or unusable keyword data,
+/// an unsupported engine, or an obstructed or symlinked lexical directory.
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+pub async fn open_lexical(
+    cx: &Cx,
+    data_dir: impl AsRef<Path>,
+) -> SearchResult<(Arc<dyn LexicalRead>, LexicalReaderBackend)> {
+    build_checkpoint(cx, "lexical index open")?;
+    let dir = data_dir.as_ref().join("lexical");
+    let reader = if has_lexical_directory(&dir)? {
+        open_lexical_reader(cx, &dir).await?
+    } else {
+        None
+    };
+    build_checkpoint(cx, "lexical index opened")?;
+    reader.ok_or_else(|| SearchError::InvalidConfig {
+        field: "data_dir/lexical".to_owned(),
+        value: dir.display().to_string(),
+        reason: "no persisted lexical index at this location".to_owned(),
+    })
+}
+
 /// Open every arm of an index directory produced by [`IndexBuilder`].
 ///
 /// The advertised hybrid flow used to build lexical data and then construct
@@ -1814,28 +1861,10 @@ pub async fn open_hybrid(
     build_checkpoint(cx, "hybrid index open")?;
     let data_dir = data_dir.as_ref();
     let lexical_dir = data_dir.join("lexical");
-    // `is_dir` folds unreadable paths, dangling links and file obstructions
-    // into the same false result as a genuinely absent arm. Inspect without
-    // following links before vector opening, which can recover legacy WALs.
-    // A profile with no lexical backend deliberately does not inspect this arm.
-    let has_lexical_directory = if cfg!(any(feature = "quill", feature = "lexical-tantivy")) {
-        match std::fs::symlink_metadata(&lexical_dir) {
-            Ok(metadata) if is_plain_lexical_directory(&metadata) => true,
-            Ok(_) => {
-                return Err(SearchError::InvalidConfig {
-                    field: "data_dir/lexical".to_owned(),
-                    value: "non-directory".to_owned(),
-                    reason:
-                        "the lexical path must be a directory without a symlink or reparse point"
-                            .to_owned(),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        false
-    };
+    // Check before vector opening, which can recover legacy WALs. Builds
+    // without a lexical backend deliberately skip inspection of this arm.
+    let has_lexical = cfg!(any(feature = "quill", feature = "lexical-tantivy"))
+        && has_lexical_directory(&lexical_dir)?;
     let vectors = Arc::new(TwoTierIndex::open(data_dir, config)?);
     if is_hash_generation_id(vectors.fast_embedder_id()) {
         return Err(SearchError::EmbedderUnavailable {
@@ -1846,11 +1875,12 @@ pub async fn open_hybrid(
         });
     }
 
-    let (lexical, lexical_backend) = if has_lexical_directory {
+    let (lexical, lexical_backend) = if has_lexical {
         open_lexical_reader(cx, &lexical_dir).await?
     } else {
-        (None, None)
-    };
+        None
+    }
+    .unzip();
     build_checkpoint(cx, "hybrid index opened")?;
 
     Ok(HybridIndexParts {
@@ -1925,7 +1955,7 @@ pub fn open_admitted_v2_sync_with_residual_sidecar_cache(
 async fn open_lexical_reader(
     cx: &Cx,
     dir: &Path,
-) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
+) -> SearchResult<Option<(Arc<dyn LexicalRead>, LexicalReaderBackend)>> {
     // bd-8nqz.2: the Quill path stays bound to the lexical *root*, not the
     // engine child selected during this call. `RootBoundQuillSearchIndex`
     // validates CURRENT before its atomic refresh swap, so a future refresh
@@ -1935,7 +1965,7 @@ async fn open_lexical_reader(
         source: Box::new(source),
     })?;
     match layout {
-        LexicalLayout::Empty => Ok((None, None)),
+        LexicalLayout::Empty => Ok(None),
         // NOTE: deliberately two arms, not an or-pattern — `pointer` is only
         // bound in the BlueGreen variant, so `DirectQuill | BlueGreen {..} if
         // pointer.engine() == ...` is E0408 (pointer not bound in all
@@ -1943,31 +1973,25 @@ async fn open_lexical_reader(
         // downstream workspaces such as mcp_agent_mail_rust).
         LexicalLayout::DirectQuill => {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
-            Ok((Some(Arc::new(index)), Some(LexicalReaderBackend::Quill)))
+            Ok(Some((Arc::new(index), LexicalReaderBackend::Quill)))
         }
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
-            Ok((Some(Arc::new(index)), Some(LexicalReaderBackend::Quill)))
+            Ok(Some((Arc::new(index), LexicalReaderBackend::Quill)))
         }
         #[cfg(feature = "lexical-tantivy")]
         LexicalLayout::DirectTantivy => {
             let index = TantivyIndex::open_read_only(dir)?;
-            Ok((
-                Some(Arc::new(index)),
-                Some(LexicalReaderBackend::TantivyOracle),
-            ))
+            Ok(Some((Arc::new(index), LexicalReaderBackend::TantivyOracle)))
         }
         #[cfg(feature = "lexical-tantivy")]
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Tantivy =>
         {
             let index = TantivyIndex::open_read_only(&pointer.engine_dir(dir))?;
-            Ok((
-                Some(Arc::new(index)),
-                Some(LexicalReaderBackend::TantivyOracle),
-            ))
+            Ok(Some((Arc::new(index), LexicalReaderBackend::TantivyOracle)))
         }
         ref layout => Err(SearchError::InvalidConfig {
             field: "data_dir/lexical".to_owned(),
@@ -1984,20 +2008,18 @@ async fn open_lexical_reader(
 async fn open_lexical_reader(
     _cx: &Cx,
     dir: &Path,
-) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
+) -> SearchResult<Option<(Arc<dyn LexicalRead>, LexicalReaderBackend)>> {
+    inspect_direct_tantivy_directory(dir)?;
     let index = TantivyIndex::open_read_only(dir)?;
-    Ok((
-        Some(Arc::new(index)),
-        Some(LexicalReaderBackend::TantivyOracle),
-    ))
+    Ok(Some((Arc::new(index), LexicalReaderBackend::TantivyOracle)))
 }
 
 #[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
 async fn open_lexical_reader(
     _cx: &Cx,
     _dir: &Path,
-) -> SearchResult<(Option<Arc<dyn LexicalRead>>, Option<LexicalReaderBackend>)> {
-    Ok((None, None))
+) -> SearchResult<Option<(Arc<dyn LexicalRead>, LexicalReaderBackend)>> {
+    Ok(None)
 }
 
 #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
@@ -2257,34 +2279,39 @@ async fn build_lexical_index(
 }
 
 #[cfg(feature = "lexical-tantivy")]
-fn prepare_existing_tantivy_lexical_index(
-    data_dir: &Path,
-    documents: &[IndexableDocument],
-) -> SearchResult<Option<PreparedLexicalIndex<TantivyIndex>>> {
+fn inspect_direct_tantivy_directory(data_dir: &Path) -> SearchResult<bool> {
     let map_io_error = |source| SearchError::SubsystemError {
         subsystem: "tantivy",
         source: Box::new(source),
     };
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(map_io_error(error)),
     };
     let mut nonempty = false;
     for entry in entries {
         let entry = entry.map_err(map_io_error)?;
         let name = entry.file_name();
-        if name == "MANIFEST" || name == "CURRENT" {
+        if name == "MANIFEST" || name == "MANIFEST.prev" || name == "CURRENT" {
             return Err(SearchError::InvalidConfig {
                 field: "data_dir/lexical".to_owned(),
                 value: data_dir.display().to_string(),
-                reason: "refusing Tantivy writes over Quill or blue-green lexical markers"
+                reason: "direct Tantivy conflicts with Quill or blue-green lexical markers"
                     .to_owned(),
             });
         }
         nonempty = true;
     }
-    if !nonempty {
+    Ok(nonempty)
+}
+
+#[cfg(feature = "lexical-tantivy")]
+fn prepare_existing_tantivy_lexical_index(
+    data_dir: &Path,
+    documents: &[IndexableDocument],
+) -> SearchResult<Option<PreparedLexicalIndex<TantivyIndex>>> {
+    if !inspect_direct_tantivy_directory(data_dir)? {
         return Ok(None);
     }
     let reader = TantivyIndex::open_read_only(data_dir)?;
@@ -4959,7 +4986,7 @@ mod tests {
     #[test]
     fn tantivy_builder_refuses_mixed_markers_before_touching_vectors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for marker in ["MANIFEST", "CURRENT"] {
+            for marker in ["MANIFEST", "MANIFEST.prev", "CURRENT"] {
                 let dir = retained_tantivy_builder_dir();
                 let lexical_path = dir.join("lexical");
                 let lexical = TantivyIndex::create(&lexical_path).expect("create Tantivy");
@@ -4980,6 +5007,7 @@ mod tests {
                 let marker_path = lexical_path.join(marker);
                 std::fs::write(&marker_path, b"retained conflicting marker").unwrap();
                 let before_meta = std::fs::read(lexical_path.join("meta.json")).unwrap();
+                assert!(crate::open_lexical(&cx, &dir).await.is_err());
                 let error = IndexBuilder::new(&dir)
                     .with_embedder_stack(tantivy_hash_stack())
                     .with_tantivy_lexical()
@@ -6813,9 +6841,8 @@ mod tests {
             )
             .unwrap();
 
-            let (lexical, backend) = open_lexical_reader(&cx, &lexical_root).await.unwrap();
-            assert_eq!(backend, Some(LexicalReaderBackend::TantivyOracle));
-            let lexical = lexical.expect("published Tantivy generation must open");
+            let (lexical, backend) = crate::open_lexical(&cx, root.path()).await.unwrap();
+            assert_eq!(backend, LexicalReaderBackend::TantivyOracle);
             let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].doc_id, "tantivy-doc");
@@ -6949,6 +6976,97 @@ mod tests {
             let lexical = parts.lexical.expect("lexical arm must be attached");
             let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
             assert!(!hits.is_empty(), "trait-object search must answer");
+        });
+    }
+
+    #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+    #[test]
+    fn public_lexical_reopen_searches_persisted_documents_without_vector_files() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for expected_backend in [
+                #[cfg(feature = "quill")]
+                LexicalReaderBackend::Quill,
+                #[cfg(feature = "lexical-tantivy")]
+                LexicalReaderBackend::TantivyOracle,
+            ] {
+                let built = tempfile::tempdir().unwrap();
+                let restored = tempfile::tempdir().unwrap();
+                let builder = IndexBuilder::new(built.path())
+                    .with_embedder_stack(stub_stack())
+                    .add_document("alpha", "recovery sentinel")
+                    .add_document("beta", "another document");
+                #[cfg(feature = "lexical-tantivy")]
+                let builder = if expected_backend == LexicalReaderBackend::TantivyOracle {
+                    builder.with_tantivy_lexical()
+                } else {
+                    builder
+                };
+                builder.build(&cx).await.unwrap();
+                std::fs::rename(built.path().join("lexical"), restored.path().join("lexical"))
+                    .unwrap();
+                let vector = restored.path().join(VECTOR_INDEX_FAST_FILENAME);
+                for corrupt_vector in [false, true] {
+                    if corrupt_vector {
+                        std::fs::write(&vector, b"invalid-vector").unwrap();
+                    }
+                    let (reader, backend) =
+                        crate::open_lexical(&cx, restored.path()).await.unwrap();
+                    assert_eq!(backend, expected_backend);
+                    let hits = reader.search(&cx, "sentinel", 5).await.unwrap();
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].doc_id, "alpha");
+                    if corrupt_vector {
+                        assert_eq!(std::fs::read(&vector).unwrap(), b"invalid-vector");
+                    } else {
+                        assert!(!vector.exists());
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+    #[test]
+    fn public_lexical_reopen_leaves_missing_and_obstructed_paths_untouched() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("lexical");
+            assert!(crate::open_lexical(&cx, root.path()).await.is_err());
+            assert!(!dir.exists());
+            std::fs::write(&dir, b"obstructed").unwrap();
+            assert!(matches!(
+                crate::open_lexical(&cx, root.path()).await,
+                Err(SearchError::InvalidConfig { field, .. }) if field == "data_dir/lexical"
+            ));
+            assert_eq!(std::fs::read(&dir).unwrap(), b"obstructed");
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                crate::open_lexical(&cx, root.path()).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn public_lexical_reopen_preserves_corrupt_and_mixed_layout_evidence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("lexical");
+            std::fs::create_dir(&dir).unwrap();
+            let manifest = dir.join("MANIFEST");
+            std::fs::write(&manifest, b"damaged-manifest").unwrap();
+            assert!(crate::open_lexical(&cx, root.path()).await.is_err());
+            assert_eq!(std::fs::read(&manifest).unwrap(), b"damaged-manifest");
+            let tantivy = dir.join("meta.json");
+            std::fs::write(&tantivy, b"{}").unwrap();
+            assert!(matches!(
+                crate::open_lexical(&cx, root.path()).await,
+                Err(SearchError::InvalidConfig { field, .. }) if field == "data_dir/lexical"
+            ));
+            assert_eq!(std::fs::read(&manifest).unwrap(), b"damaged-manifest");
+            assert_eq!(std::fs::read(&tantivy).unwrap(), b"{}");
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
         });
     }
 
