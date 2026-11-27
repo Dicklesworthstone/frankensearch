@@ -403,8 +403,9 @@ It validates the full inventory before writing stdout and loads no models.\n\
 --max-source-bytes bounds both raw source and encoded output, with the index\n\
 input limits also enforced. Empty selections emit zero records. Current complete\n\
 topologies can export with damaged vectors or graphs through authenticated source.\n\
-Partial selections require intact vectors to authenticate quality membership,\n\
-and can export despite a damaged graph. Historical export requires healthy\n\
+Partial selections can do the same when metadata authenticates their exact\n\
+quality membership. Older partial metadata without that proof still requires\n\
+healthy vectors; a damaged graph is allowed. Historical export requires healthy\n\
 current and target selections and normal ancestry admission.\n\
 authority-fetch reads one selected document window without loading a model.\n\
 Its receipt selects the exact current authority unless --current-receipt selects\n\

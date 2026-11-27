@@ -531,8 +531,15 @@ fn partial_quality_metadata_authenticates_exact_live_membership_before_search() 
                 "the witness follows sorted admitted membership, not input order"
             );
             let original = built.metadata.clone();
-            let documents =
-                CanonicalDocsetV1::from_ordered_live_documents(["a", "b", "c", "x", "z"]).unwrap();
+            let admitted_source = built
+                .preview_candidate(&cx, &candidate(&built))
+                .unwrap()
+                .source_documents(&cx, BUDGET)
+                .unwrap();
+            let documents = CanonicalDocsetV1::from_ordered_live_documents(
+                admitted_source.iter().map(|document| document.id.as_str()),
+            )
+            .unwrap();
             let reseal = |built: &mut NativeBuiltExactGeneration| {
                 built.metadata.manifest_hash = compute_manifest_hash(&built.metadata).unwrap();
                 built.metadata_bytes = serde_json::to_vec(&built.metadata).unwrap().into();

@@ -435,7 +435,9 @@ fn open_vector_source(
 }
 
 /// Admit exactly the components that prove this receipt's selected source.
-/// Partial receipts also require their actual quality rows to attest coverage.
+/// Authenticated partial membership permits source rescue without vector or
+/// graph images. Older partial metadata still requires its healthy retained
+/// quality rows; no other source admission failure authorizes that fallback.
 pub(super) fn export_documents(
     cx: &Cx,
     root: &QualifiedGenerationRoot,
@@ -443,12 +445,24 @@ pub(super) fn export_documents(
     max_image_bytes: usize,
     max_source_bytes: usize,
 ) -> Result<Vec<frankensearch::IndexableDocument>> {
-    if selected.quality_documents.is_some() {
-        let vectors = open_vector_source(cx, root, selected, max_image_bytes)?;
-        Ok(vectors.source().source_documents(cx, max_source_bytes)?)
-    } else {
-        let source = open_source(cx, root, selected, max_image_bytes)?;
-        Ok(source.source_documents(cx, max_source_bytes)?)
+    match open_source(cx, root, selected, max_image_bytes) {
+        Ok(source) => Ok(source.source_documents(cx, max_source_bytes)?),
+        Err(error)
+            if selected.quality_documents.is_some()
+                && matches!(
+                    error.downcast_ref::<frankensearch::SearchError>(),
+                    Some(frankensearch::SearchError::InvalidConfig { field, value, .. })
+                        if field == "native_ann.generation.source-recovery"
+                            && value == "quality-membership-required"
+                ) =>
+        {
+            // A missing historical declaration does not establish coverage.
+            // Reopen only the same expected authority and independently prove
+            // its subset from healthy vectors; never follow a newer selection.
+            let vectors = open_vector_source(cx, root, selected, max_image_bytes)?;
+            Ok(vectors.source().source_documents(cx, max_source_bytes)?)
+        }
+        Err(error) => Err(error),
     }
 }
 

@@ -692,6 +692,119 @@ mod lifecycle {
     }
 
     #[test]
+    fn partial_source_export_recovers_all_fields_without_vectors_or_graphs() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (vector_missing, ann_missing) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let fixture = fixture(&cx, partial_topology(), true, false).await;
+                let expected = fixture
+                    .snapshot
+                    .source_documents(&cx, MAX_INPUT_BYTES)
+                    .unwrap();
+                assert_eq!(expected.len(), 2);
+                assert_eq!(
+                    fixture.snapshot.partial_quality_document_ids(&cx).unwrap(),
+                    ["retry"]
+                );
+                let primary_calls = fixture.primary.calls.load(Ordering::SeqCst);
+                let quality = fixture.quality.as_ref().unwrap();
+                let quality_calls = quality.calls.load(Ordering::SeqCst);
+                let vector = damage(
+                    &cx,
+                    &fixture,
+                    GenerationComponentRole::Vector,
+                    vector_missing,
+                );
+                let ann = damage(&cx, &fixture, GenerationComponentRole::Ann, ann_missing);
+                assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                let receipt = fixture.parent.join("selected.json");
+                let selected_bytes = fs::read(&receipt).unwrap();
+                let options = Options::parse([
+                    "authority-export".to_owned(),
+                    "--receipt".to_owned(),
+                    receipt.to_str().unwrap().to_owned(),
+                ])
+                .unwrap()
+                .unwrap();
+                let mut output = Vec::new();
+                crate::generation::export(&cx, &options, &mut output).unwrap();
+                let recovered = crate::read_documents(&mut std::io::Cursor::new(&output)).unwrap();
+                // Includes the uncovered garden document, original Unicode
+                // content/title, escaped metadata and an empty metadata value.
+                assert_eq!(
+                    serde_json::to_value(recovered).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), primary_calls);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), quality_calls);
+                assert_eq!(fs::read(&receipt).unwrap(), selected_bytes);
+                assert_eq!(
+                    fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                    authority
+                );
+                for (path, missing) in [(vector, vector_missing), (ann, ann_missing)] {
+                    if missing {
+                        assert!(!path.exists());
+                    } else {
+                        assert_eq!(fs::read(path).unwrap(), b"damaged-component-evidence");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn partial_source_export_preserves_integrity_refusals_without_vector_fallback() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for legacy in [false, true] {
+                for role in [
+                    GenerationComponentRole::Lexical,
+                    GenerationComponentRole::Metadata,
+                ] {
+                    let fixture = fixture(&cx, partial_topology(), true, false).await;
+                    let fixture = if legacy {
+                        without_source_membership(&cx, fixture)
+                    } else {
+                        fixture
+                    };
+                    let corrupted = damage(&cx, &fixture, role, false);
+                    let vector = damage(&cx, &fixture, GenerationComponentRole::Vector, true);
+                    let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+                    let receipt = fixture.parent.join("selected.json");
+                    let selected_bytes = fs::read(&receipt).unwrap();
+                    let options = Options::parse([
+                        "authority-export".to_owned(),
+                        "--receipt".to_owned(),
+                        receipt.to_str().unwrap().to_owned(),
+                    ])
+                    .unwrap()
+                    .unwrap();
+                    let mut output = Vec::new();
+                    let error = crate::generation::export(&cx, &options, &mut output).unwrap_err();
+                    // A generic fallback would wrap this as a vector-admission
+                    // refusal, masking the independently damaged source.
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("authority repair source admission refused:"),
+                        "legacy={legacy}, role={role:?}: {error}"
+                    );
+                    assert!(output.is_empty());
+                    assert!(!vector.exists());
+                    assert_eq!(fs::read(corrupted).unwrap(), b"damaged-component-evidence");
+                    assert_eq!(fs::read(&receipt).unwrap(), selected_bytes);
+                    assert_eq!(
+                        fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                        authority
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn partial_source_export_survives_graph_damage_and_refuses_missing_membership_proof() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let fixture =

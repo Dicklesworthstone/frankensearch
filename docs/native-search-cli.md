@@ -870,6 +870,36 @@ identities changed, even when migration was authorized. Repair does not preview
 or replay a query. Its saved receipt supports the existing `authority-recover`
 reconciliation after interrupted publication or lost output.
 
+### Export stored documents after vector or graph loss
+
+`authority-export` recovers the selected generation's complete stored source as
+ordinary index JSONL without loading embedding models or publishing a successor.
+It preserves each live document's identifier, content, nonempty title and metadata,
+so the output can serve as input to a fresh index or an explicit source replacement.
+
+```sh
+./target/release/frankensearch-native authority-export \
+  --receipt "$HOME/frankensearch-authority/partial.json" \
+  --max-source-bytes 268435456 \
+  > ./recovered-documents.jsonl
+```
+
+Current complete generations can export when vector or graph images are lost.
+Partial generations can also export after both images are damaged or missing when
+their metadata authenticates the original quality membership. Historical partial
+metadata without that record uses independently admitted healthy vectors to prove
+membership; the graph may still be damaged. Malformed membership, corrupt source
+or metadata, and a receipt that no longer selects the current authority refuse
+export. The recovery route does not change the authority or the damaged objects.
+
+The command validates the entire inventory before writing output. The
+`--max-source-bytes` limit bounds both raw stored fields and encoded JSONL; the
+ordinary index input limits and separate encoded-image budget also apply. A source
+or budget error therefore cannot emit a valid-looking incomplete inventory. An
+empty selection emits zero records. Historical export with `--current-receipt`
+continues to require healthy current and target generations with authenticated
+ancestry.
+
 ### Authority source updates
 
 `authority-update` applies a JSONL delta to the exact generation selected by
