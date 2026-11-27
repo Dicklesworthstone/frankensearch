@@ -96,7 +96,7 @@ impl<'a> RequestFilter<'a> {
         Ok(())
     }
 
-    fn includes(&self, cx: &Cx, id: &str) -> SearchResult<bool> {
+    pub(super) fn includes(&self, cx: &Cx, id: &str) -> SearchResult<bool> {
         Self::matches_candidate(
             cx,
             self.predicate,
@@ -141,7 +141,11 @@ impl<'a> RequestFilter<'a> {
     /// A final ranker may await user code or consume candidates that were not
     /// displayed in the preceding phase. Recheck every retained identity using
     /// the request's pinned metadata before work and before publication/fallback.
-    pub(super) fn validate_retained_ids(&self, cx: &Cx, ids: &[DocId]) -> SearchResult<()> {
+    pub(super) fn validate_retained_ids<'id>(
+        &self,
+        cx: &Cx,
+        ids: impl IntoIterator<Item = &'id DocId>,
+    ) -> SearchResult<()> {
         if !self.is_active() {
             return Ok(());
         }
@@ -150,7 +154,7 @@ impl<'a> RequestFilter<'a> {
                 return Err(SearchError::InvalidConfig {
                     field: "search.filter".to_owned(),
                     value: "eligibility_changed".to_owned(),
-                    reason: "document eligibility changed before final ranking completed"
+                    reason: "document eligibility changed before the retained ranking could be used"
                         .to_owned(),
                 });
             }

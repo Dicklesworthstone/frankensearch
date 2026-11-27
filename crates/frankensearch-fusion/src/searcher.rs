@@ -1532,6 +1532,9 @@ impl TwoTierSearcher {
     /// its retained candidates still satisfy the filter. If refinement learned
     /// that one of those candidates is ineligible, the original error or timeout
     /// is returned without reusing that pool for fallback or final ranking.
+    /// A quality query with no vector signal can keep Initial only while its
+    /// candidates remain eligible. Query expansion also rechecks each feedback
+    /// document after quality inference before reading its vector.
     /// Final ranking rechecks the entire retained pool after public callbacks
     /// and ranker work. Changed eligibility returns an invalid `search.filter`
     /// configuration instead of publishing or falling back to revoked results.
@@ -2208,6 +2211,26 @@ impl TwoTierSearcher {
                 Ok(phase2_outcome) => match phase2_outcome {
                     Ok(Phase2Outcome::SkippedZeroSignal) => {
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
+                        // The caller's filter can change while inference is
+                        // suspended. Skipping quality keeps the Initial pool,
+                        // even when no final ranking stage was requested.
+                        if let Err(error) = request_filter.validate_retained_ids(
+                            cx,
+                            initial_hits.iter().map(|hit| &hit.doc_id),
+                        ) {
+                            self.export_error(&error);
+                            if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                                self.emit_session_stop_telemetry(
+                                    root_request_id,
+                                    telemetry_last_event_id.clone(),
+                                    LifecycleState::Degraded,
+                                    LifecycleSeverity::Warn,
+                                    Some(error.diagnostic_code().to_owned()),
+                                    search_started_at.elapsed(),
+                                );
+                            }
+                            return Err(error);
+                        }
                         metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
                         self.maybe_record_quality_completion(phase2_latency, None);
                     }
@@ -4182,6 +4205,11 @@ impl TwoTierSearcher {
         if self.prf_config.should_expand(&query_class) {
             let mut feedback_embeddings = Vec::new();
             for result in initial_results.iter().take(self.prf_config.top_k_feedback) {
+                // Quality inference can yield after Initial was published. A
+                // now-ineligible row cannot steer even the eligible winners.
+                if request_filter.is_active() && !request_filter.includes(cx, &result.doc_id)? {
+                    continue;
+                }
                 // PRF interpolates these document vectors with `quality_vec`, so
                 // every feedback value must come from that exact embedding space.
                 // `semantic_vector_for_doc_id` is intentionally unsuitable here:
@@ -22899,6 +22927,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn async_filter_zero_quality_signal_cannot_return_a_revoked_initial() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = query_admission_index("exact-v2");
+            for revoke in [false, true] {
+                let quality = Arc::new(
+                    query_admission_embedder("quality")
+                        .with_async_bound_response()
+                        .with_bound_response_values(vec![0.0; 6]),
+                );
+                let searcher = TwoTierSearcher::new(
+                    index.clone(),
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(quality.clone());
+                let filter = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| {
+                    !revoke || quality.bound_embeds.load(Ordering::Relaxed) == 0
+                });
+                let result = searcher
+                    .search_collect_with_filter(&cx, "query", 1, Some(&filter))
+                    .await;
+                assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                if revoke {
+                    assert!(matches!(result, Err(SearchError::InvalidConfig { field, .. })
+                        if field == "search.filter"));
+                } else {
+                    let (hits, metrics) = result.unwrap();
+                    assert_eq!(hits[0].doc_id, "doc-a");
+                    assert_eq!(
+                        metrics.skip_reason.as_deref(),
+                        Some("quality_query_zero_norm")
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn async_filter_revoked_initial_cannot_steer_quality_query_expansion() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = query_admission_index_with_rows(
+                "exact-v2",
+                &[("feedback", &[1.0, 0.0, 0.0, 0.0])],
+                &[
+                    ("feedback", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                    ("winner", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                ],
+            );
+            for revoke in [false, true] {
+                let quality =
+                    Arc::new(query_admission_embedder("quality").with_async_bound_response());
+                let searcher = TwoTierSearcher::new(
+                    index.clone(),
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig::default(),
+                )
+                .with_quality_embedder(quality.clone())
+                .with_prf_config(PrfConfig {
+                    enabled: true,
+                    alpha: 0.5,
+                    top_k_feedback: 1,
+                    min_feedback_docs: 1,
+                    score_weighted: false,
+                });
+                let filter = AsyncTestFilter(|id: &str, _: Option<&serde_json::Value>| {
+                    id != "feedback" || !revoke || quality.bound_embeds.load(Ordering::Relaxed) == 0
+                });
+                let (hits, _) = searcher
+                    .search_collect_with_filter(
+                        &cx,
+                        "find a relevant quality document",
+                        2,
+                        Some(&filter),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(hits.iter().any(|hit| hit.doc_id == "feedback"), !revoke);
+                let score = hits
+                    .iter()
+                    .find(|hit| hit.doc_id == "winner")
+                    .unwrap()
+                    .quality_score
+                    .unwrap();
+                // The eligible orthogonal feedback rotates the query by 45 degrees.
+                // Revocation leaves the original unit query pointing at the winner.
+                let expected = if revoke {
+                    1.0
+                } else {
+                    std::f32::consts::FRAC_1_SQRT_2
+                };
+                assert!(
+                    (score - expected).abs() < 1e-5,
+                    "revoke={revoke}, score={score}"
+                );
+            }
+        });
     }
 
     #[test]
