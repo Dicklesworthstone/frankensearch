@@ -1447,6 +1447,11 @@ impl TwoTierSearcher {
     /// retained reader, semantic-only and graph candidates receive metadata
     /// from that same publication before the predicate runs. Unknown metadata
     /// is passed unchanged to the filter's own missing-value policy.
+    /// Built-in metadata filters can use `on_missing_metadata` with
+    /// [`MissingMetadataPolicy::Reject`](frankensearch_core::filter::MissingMetadataPolicy::Reject)
+    /// to exclude unknown documents. A metadata source is needed for those
+    /// filters to admit semantic-only candidates; eligible candidates below an
+    /// initially rejected window are retrieved before the result is truncated.
     ///
     /// # Errors
     ///
@@ -22207,6 +22212,285 @@ mod tests {
                 .unwrap();
             assert_eq!(lexical.pins.load(Ordering::Relaxed), 0);
             assert_eq!(lexical.lookups.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn async_strict_metadata_filter_refills_one_percent_tail_with_quill() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_core::filter::{DocTypeFilter, MissingMetadataPolicy};
+        use frankensearch_core::traits::LexicalWrite;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let quill = QuillIndex::create(&cx, directory.path(), QuillConfig::default())
+                .await
+                .unwrap();
+            let documents: Vec<_> = (0..1_000)
+                .map(|rank| {
+                    let archived = rank < 990;
+                    IndexableDocument::new(
+                        format!("doc-{rank:04}"),
+                        if archived { "needle" } else { "garden" },
+                    )
+                    .with_metadata("doc_type", if archived { "archived" } else { "active" })
+                })
+                .collect();
+            LexicalWrite::index_documents(&quill, &cx, &documents)
+                .await
+                .unwrap();
+            LexicalWrite::commit(&quill, &cx).await.unwrap();
+            let lexical: Arc<dyn LexicalRead> = Arc::new(quill);
+            let rows: Vec<_> = (0..=1_000)
+                .map(|rank| {
+                    let id = if rank == 0 {
+                        "metadata-unavailable".to_owned()
+                    } else {
+                        format!("doc-{:04}", rank - 1)
+                    };
+                    let score = 1.0 - rank as f32 * 0.0004;
+                    let other = (1.0 - score * score).sqrt();
+                    (
+                        id,
+                        vec![score, other, 0.0, 0.0],
+                        vec![0.0, score, other, 0.0, 0.0, 0.0],
+                    )
+                })
+                .collect();
+            let fast_rows: Vec<_> = rows
+                .iter()
+                .map(|(id, fast, _)| (id.as_str(), fast.as_slice()))
+                .collect();
+            let quality_rows: Vec<_> = rows
+                .iter()
+                .map(|(id, _, quality)| (id.as_str(), quality.as_slice()))
+                .collect();
+            let strict =
+                DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+            let assert_hits = |hits: &[ScoredResult]| {
+                assert_eq!(hits.len(), 5, "one percent eligible must still fill top-k");
+                assert!(hits.iter().all(|hit| {
+                    hit.metadata
+                        .as_deref()
+                        .is_some_and(|value| value["doc_type"] == "active")
+                        && hit.lexical_score.is_none()
+                        && hit.doc_id != "metadata-unavailable"
+                }));
+            };
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_dir, index) =
+                    query_admission_index_with_rows(layout, &fast_rows, &quality_rows);
+                let searcher = TwoTierSearcher::new(
+                    index,
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig {
+                        candidate_multiplier: 1,
+                        quality_timeout_ms: 60_000,
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(Arc::new(query_admission_embedder("quality")))
+                .with_lexical(Arc::clone(&lexical));
+                let mut phases = Vec::new();
+                searcher
+                    .search_with_filter(
+                        &cx,
+                        "needle",
+                        5,
+                        Some(&strict),
+                        |_| None,
+                        |phase| phases.push(phase),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(phases.len(), 2, "{layout}: {phases:?}");
+                for phase in phases {
+                    match phase {
+                        SearchPhase::Initial { results, .. } => assert_hits(&results),
+                        SearchPhase::Refined { results, .. } => {
+                            assert_hits(&results);
+                            assert!(results.iter().all(|hit| hit.quality_score.is_some()));
+                        }
+                        other => panic!("{layout}: unexpected strict-filter phase: {other:?}"),
+                    }
+                }
+                let (quality, _) = searcher
+                    .search_quality_only_collect_with_filter(&cx, "needle", 5, Some(&strict))
+                    .await
+                    .unwrap();
+                assert_hits(&quality);
+                assert!(quality.iter().all(|hit| hit.quality_score.is_some()));
+            }
+        });
+    }
+
+    #[test]
+    fn async_strict_metadata_filters_reject_vector_only_unknowns() {
+        use frankensearch_core::filter::{DateRangeFilter, DocTypeFilter, MissingMetadataPolicy};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let types =
+                DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+            let dates =
+                DateRangeFilter::after(100).on_missing_metadata(MissingMetadataPolicy::Reject);
+            for layout in ["stamped-v1", "exact-v2", "native-v2"] {
+                let (_dir, index) = query_admission_index(layout);
+                for mode in ["fast", "progressive", "quality"] {
+                    let searcher = TwoTierSearcher::new(
+                        Arc::clone(&index),
+                        Arc::new(query_admission_embedder("fast")),
+                        TwoTierConfig {
+                            fast_only: mode == "fast",
+                            ..TwoTierConfig::default()
+                        },
+                    )
+                    .with_quality_embedder(Arc::new(query_admission_embedder("quality")));
+                    for filter in [&types as &dyn SearchFilter, &dates] {
+                        let mut phases = Vec::new();
+                        if mode == "quality" {
+                            searcher
+                                .search_quality_only_with_filter(
+                                    &cx,
+                                    "query",
+                                    2,
+                                    Some(filter),
+                                    |_| None,
+                                    |phase| phases.push(phase),
+                                )
+                                .await
+                                .unwrap();
+                        } else {
+                            searcher
+                                .search_with_filter(
+                                    &cx,
+                                    "query",
+                                    2,
+                                    Some(filter),
+                                    |_| None,
+                                    |phase| phases.push(phase),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(!phases.is_empty());
+                        for phase in phases {
+                            match phase {
+                                SearchPhase::Initial { results, .. }
+                                | SearchPhase::Refined { results, .. } => {
+                                    assert!(
+                                        results.is_empty(),
+                                        "{layout}/{mode}: unknown rows leaked"
+                                    );
+                                }
+                                other => panic!("unexpected strict-filter phase: {other:?}"),
+                            }
+                        }
+                    }
+                    let permissive = DocTypeFilter::new(["active"]);
+                    let (hits, _) = if mode == "quality" {
+                        searcher
+                            .search_quality_only_collect_with_filter(
+                                &cx,
+                                "query",
+                                2,
+                                Some(&permissive),
+                            )
+                            .await
+                            .unwrap()
+                    } else {
+                        searcher
+                            .search_collect_with_filter(&cx, "query", 2, Some(&permissive))
+                            .await
+                            .unwrap()
+                    };
+                    assert!(!hits.is_empty(), "the permissive default is unchanged");
+                    assert!(hits.iter().all(|hit| hit.metadata.is_none()));
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn async_date_filter_reads_timestamp_strings_from_real_quill_metadata() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_core::filter::{DateRangeFilter, MissingMetadataPolicy};
+        use frankensearch_core::traits::LexicalWrite;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let quill = QuillIndex::create(&cx, directory.path(), QuillConfig::default())
+                .await
+                .unwrap();
+            let documents = [
+                IndexableDocument::new("doc-a", "needle").with_metadata("created_at", "1500"),
+                IndexableDocument::new("doc-b", "needle").with_metadata("created_at", "500"),
+                IndexableDocument::new("doc-quality-only", "garden")
+                    .with_metadata("created_at", "1500"),
+                IndexableDocument::new("malformed-date", "needle")
+                    .with_metadata("created_at", "1500suffix"),
+                IndexableDocument::new("overflow-date", "needle")
+                    .with_metadata("created_at", "9223372036854775808"),
+                IndexableDocument::new("missing-date", "needle"),
+            ];
+            LexicalWrite::index_documents(&quill, &cx, &documents)
+                .await
+                .unwrap();
+            LexicalWrite::commit(&quill, &cx).await.unwrap();
+            let (_dir, index) = query_admission_index("exact-v2");
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(query_admission_embedder("fast")),
+                TwoTierConfig {
+                    candidate_multiplier: 1,
+                    quality_timeout_ms: 60_000,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(Arc::new(query_admission_embedder("quality")))
+            .with_lexical(Arc::new(quill));
+            let dates = DateRangeFilter::between(1_000, 2_000)
+                .on_missing_metadata(MissingMetadataPolicy::Reject);
+            let mut phases = Vec::new();
+            searcher
+                .search_with_filter(
+                    &cx,
+                    "needle",
+                    3,
+                    Some(&dates),
+                    |_| None,
+                    |phase| phases.push(phase),
+                )
+                .await
+                .unwrap();
+            assert_eq!(phases.len(), 2);
+            for (refined, phase) in [false, true].into_iter().zip(phases) {
+                let results = match phase {
+                    SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                        results
+                    }
+                    other => panic!("unexpected date-filter phase: {other:?}"),
+                };
+                assert_eq!(results.len(), if refined { 2 } else { 1 });
+                assert!(results.iter().all(|hit| {
+                    matches!(hit.doc_id.as_str(), "doc-a" | "doc-quality-only")
+                        && hit.metadata.as_deref().unwrap()["created_at"] == "1500"
+                }));
+            }
+            let (quality, _) = searcher
+                .search_quality_only_collect_with_filter(&cx, "needle", 3, Some(&dates))
+                .await
+                .unwrap();
+            assert_eq!(quality.len(), 2);
+            let semantic_only = quality
+                .iter()
+                .find(|hit| hit.doc_id == "doc-quality-only")
+                .unwrap();
+            assert!(semantic_only.quality_score.is_some());
+            assert!(semantic_only.lexical_score.is_none());
         });
     }
 
