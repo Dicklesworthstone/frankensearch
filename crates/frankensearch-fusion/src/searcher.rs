@@ -48,9 +48,9 @@ use frankensearch_core::types::{
     SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
 #[cfg(feature = "graph")]
-use frankensearch_core::{DocId, DocumentGraph};
+use frankensearch_core::DocumentGraph;
 use frankensearch_core::{
-    EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
+    DocId, EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
     LifecycleState, LiveSearchFrame, LiveSearchStreamEmitter, ResourceCollectorSample,
     RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase, SearchStreamHealth,
     TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
@@ -2161,7 +2161,9 @@ impl TwoTierSearcher {
                     };
                     metrics.skip_reason = Some(timeout_error.diagnostic_code().to_owned());
                     self.export_error(&timeout_error);
-                    if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                    if !request_filter.filter_work_incomplete()
+                        && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
+                    {
                         let outcome = QualityOutcome::Slow {
                             latency_ms: phase2_latency_ms,
                         };
@@ -2353,7 +2355,9 @@ impl TwoTierSearcher {
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         metrics.skip_reason = Some(err.diagnostic_code().to_owned());
                         self.export_error(&err);
-                        if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
+                        if !request_filter.filter_work_incomplete()
+                            && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
+                        {
                             let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
                         }
                         if !fallback_eligible {
@@ -21747,6 +21751,12 @@ mod tests {
             Box::pin(async move {
                 self.lookups.fetch_add(1, Ordering::Relaxed);
                 match self.fault {
+                    Some("quality_cardinality") if ids.contains(&"doc-quality-only") => {
+                        Ok(Vec::new())
+                    }
+                    Some("quality_pending") if ids.contains(&"doc-quality-only") => {
+                        std::future::pending().await
+                    }
                     Some("quality_error") if ids.contains(&"doc-quality-only") => {
                         Err(SearchError::InvalidConfig {
                             field: "fixture.metadata".to_owned(),
@@ -23152,6 +23162,77 @@ mod tests {
                     (score - expected).abs() < 1e-5,
                     "revoke={revoke}, score={score}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn async_filter_quality_circuit_counts_provider_failures_but_not_filter_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_dir, index) = query_admission_index("exact-v2");
+            for fault in ["quality_error", "quality_cardinality", "quality_pending", "provider"] {
+                let breaker = Arc::new(CircuitBreaker::new(
+                    crate::circuit_breaker::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    },
+                ));
+                let mut quality = query_admission_embedder("quality");
+                if fault == "provider" {
+                    quality.bound_action = Some(BoundResponseAction::Fail);
+                }
+                let quality = Arc::new(quality);
+                let searcher = TwoTierSearcher::new(
+                    index.clone(),
+                    Arc::new(query_admission_embedder("fast")),
+                    TwoTierConfig {
+                        quality_timeout_ms: if fault == "quality_pending" { 0 } else { 1000 },
+                        ..TwoTierConfig::default()
+                    },
+                )
+                .with_quality_embedder(quality.clone())
+                .with_circuit_breaker(breaker.clone())
+                .with_lexical(Arc::new(FilterLookupLexical {
+                    fault: Some(fault),
+                    ..Default::default()
+                }));
+                let filter = AsyncTestFilter(|_: &str, _: Option<&serde_json::Value>| true);
+                let mut failure = None;
+                searcher
+                    .search_with_filter(
+                        &cx,
+                        "query",
+                        3,
+                        Some(&filter),
+                        |_| None,
+                        |phase| {
+                            if let SearchPhase::RefinementFailed { error, .. } = phase {
+                                failure = Some(error);
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                match (fault, failure) {
+                    ("quality_error", Some(SearchError::InvalidConfig { field, .. })) => {
+                        assert_eq!(field, "fixture.metadata");
+                    }
+                    ("quality_cardinality", Some(SearchError::InvalidConfig { field, .. })) => {
+                        assert_eq!(field, "search.filter_metadata");
+                    }
+                    ("quality_pending", Some(SearchError::SearchTimeout { .. }))
+                    | ("provider", Some(SearchError::EmbeddingFailed { .. })) => {}
+                    observed => panic!("unexpected refinement outcome: {observed:?}"),
+                }
+                assert_eq!(breaker.is_open(), fault == "provider");
+                let (_, metrics) = searcher.search_collect(&cx, "query", 3).await.unwrap();
+                if fault == "provider" {
+                    assert_eq!(metrics.skip_reason.as_deref(), Some("circuit_breaker_open"));
+                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 1);
+                } else {
+                    assert!(metrics.phase2_vectors_searched > 0);
+                    assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 2);
+                }
             }
         });
     }

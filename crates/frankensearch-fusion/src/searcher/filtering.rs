@@ -20,6 +20,9 @@ use super::{
 pub struct RequestFilter<'a> {
     predicate: Option<&'a dyn SearchFilter>,
     metadata: AHashMap<DocId, Option<Arc<serde_json::Value>>>,
+    // A failed or suspended filter read belongs to this request, even if the
+    // phase deadline drops its future before the provider returns an error.
+    filter_work_incomplete: bool,
 }
 
 /// The lexical pool and scoring snapshot that must remain eligible while a
@@ -37,11 +40,37 @@ impl<'a> RequestFilter<'a> {
         Self {
             predicate,
             metadata: AHashMap::new(),
+            filter_work_incomplete: false,
         }
     }
 
     pub(super) const fn is_active(&self) -> bool {
         self.predicate.is_some()
+    }
+
+    pub(super) const fn filter_work_incomplete(&self) -> bool {
+        self.filter_work_incomplete
+    }
+
+    async fn read_for_filter<T>(
+        &mut self,
+        cx: &Cx,
+        phase: &'static str,
+        read: super::SearchFuture<'_, T>,
+    ) -> SearchResult<T> {
+        self.filter_work_incomplete = true;
+        let value = frankensearch_core::with_cancellation(cx, phase, read).await?;
+        self.filter_work_incomplete = false;
+        Ok(value)
+    }
+
+    fn unstable_predicate(&mut self) -> SearchError {
+        self.filter_work_incomplete = true;
+        SearchError::InvalidConfig {
+            field: "search.filter".to_owned(),
+            value: "unstable_predicate".to_owned(),
+            reason: "filter eligibility changed repeatedly during candidate refill".to_owned(),
+        }
     }
 
     fn observe(&mut self, results: &[ScoredResult]) {
@@ -72,7 +101,7 @@ impl<'a> RequestFilter<'a> {
             return Ok(());
         }
         cancellation_checkpoint(cx, "filter_metadata_lookup")?;
-        let values = frankensearch_core::with_cancellation(
+        let values = self.read_for_filter(
             cx,
             "filter_metadata_lookup",
             lexical.metadata_for_documents(cx, &unknown),
@@ -80,6 +109,7 @@ impl<'a> RequestFilter<'a> {
         .await?;
         cancellation_checkpoint(cx, "filter_metadata_to_candidates")?;
         if values.len() != unknown.len() {
+            self.filter_work_incomplete = true;
             return Err(SearchError::InvalidConfig {
                 field: "search.filter_metadata".to_owned(),
                 value: "cardinality".to_owned(),
@@ -154,8 +184,9 @@ impl<'a> RequestFilter<'a> {
                 return Err(SearchError::InvalidConfig {
                     field: "search.filter".to_owned(),
                     value: "eligibility_changed".to_owned(),
-                    reason: "document eligibility changed before the retained ranking could be used"
-                        .to_owned(),
+                    reason:
+                        "document eligibility changed before the retained ranking could be used"
+                            .to_owned(),
                 });
             }
         }
@@ -234,7 +265,7 @@ impl<'a> RequestFilter<'a> {
             self.attach_metadata(retained);
             return Ok(());
         }
-        let batch = frankensearch_core::with_cancellation(
+        let batch = self.read_for_filter(
             cx,
             "filter_lexical_revalidation",
             lexical.search_candidates(cx, query, target),
@@ -280,7 +311,7 @@ impl<'a> RequestFilter<'a> {
             let (mut results, context) = batch.into_parts();
             let exhausted = results.len() < limit;
             if let Some(context) = context.as_ref() {
-                frankensearch_core::with_cancellation(
+                self.read_for_filter(
                     cx,
                     "filter_lexical_hydration",
                     lexical.hydrate_candidates(cx, Some(context), &mut results),
@@ -318,7 +349,7 @@ impl<'a> RequestFilter<'a> {
                 });
             }
             limit = next;
-            batch = frankensearch_core::with_cancellation(
+            batch = self.read_for_filter(
                 cx,
                 "filter_lexical_refill",
                 lexical.search_candidates(cx, query, limit),
@@ -505,12 +536,7 @@ impl<'a> RequestFilter<'a> {
                     // same refilled ID again therefore means the predicate is
                     // unstable; fail rather than retry forever or lose recall.
                     if !revoked.insert(hit.doc_id.clone()) {
-                        return Err(SearchError::InvalidConfig {
-                            field: "search.filter".to_owned(),
-                            value: "unstable_predicate".to_owned(),
-                            reason: "filter eligibility changed repeatedly during candidate refill"
-                                .to_owned(),
-                        });
+                        return Err(self.unstable_predicate());
                     }
                     changed = true;
                 }
@@ -560,7 +586,7 @@ impl<'a> RequestFilter<'a> {
 
     #[cfg(feature = "graph")]
     pub(super) fn retain_scored(
-        &self,
+        &mut self,
         cx: &Cx,
         results: &mut Vec<ScoredResult>,
     ) -> SearchResult<bool> {
@@ -571,7 +597,7 @@ impl<'a> RequestFilter<'a> {
     /// changes after a previously rejected graph document is refilled.
     #[cfg(feature = "graph")]
     pub(super) fn retain_scored_with_history(
-        &self,
+        &mut self,
         cx: &Cx,
         results: &mut Vec<ScoredResult>,
         revoked: &mut AHashSet<DocId>,
@@ -581,7 +607,7 @@ impl<'a> RequestFilter<'a> {
 
     #[cfg(feature = "graph")]
     fn retain_scored_inner(
-        &self,
+        &mut self,
         cx: &Cx,
         results: &mut Vec<ScoredResult>,
         mut revoked: Option<&mut AHashSet<DocId>>,
@@ -598,12 +624,7 @@ impl<'a> RequestFilter<'a> {
             } else if let Some(revoked) = revoked.as_deref_mut()
                 && !revoked.insert(results[rank].doc_id.clone())
             {
-                return Err(SearchError::InvalidConfig {
-                    field: "search.filter".to_owned(),
-                    value: "unstable_predicate".to_owned(),
-                    reason: "filter eligibility changed repeatedly during candidate refill"
-                        .to_owned(),
-                });
+                return Err(self.unstable_predicate());
             }
         }
         results.truncate(retained);
