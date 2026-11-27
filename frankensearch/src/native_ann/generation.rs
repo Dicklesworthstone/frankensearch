@@ -559,7 +559,11 @@ impl NativeGenerationSnapshot {
     ///
     /// `expected_vector` is the caller's selected generation/embedding/storage
     /// binding. It must not be inferred from the untrusted component it admits.
-    /// `schema` identifies the caller's lexical schema. `max_image_bytes` bounds
+    /// `schema` identifies the caller's lexical schema. Stored `metadata_json`
+    /// is resolved by that descriptor for lexical and semantic-only winners;
+    /// schemas without the column return no metadata. Complete source export
+    /// remains restricted to the default schema's canonical document contract.
+    /// `max_image_bytes` bounds
     /// the combined encoded component and activation-manifest images, not total
     /// process RSS; parsed search structures have additional memory costs.
     ///
@@ -2041,6 +2045,8 @@ impl CompositeReaders {
     // This closed reader also owns the admitted common source cohort, so it
     // can recover their metadata without inventing a lexical rank or reopening
     // a component path. Read only the winning metadata column, not source bodies.
+    // Search accepts the caller's admitted lexical schema; the default-schema
+    // contract for exporting complete IndexableDocuments must not restrict it.
     pub(in crate::native_ann) fn hydrate_vector_metadata(
         &self,
         cx: &Cx,
@@ -2049,7 +2055,24 @@ impl CompositeReaders {
         if results.iter().all(|result| result.lexical_score.is_some()) {
             return Ok(());
         }
-        let (snapshot, _, fields) = self.source_context(cx)?;
+        checkpoint(cx, "native_ann.generation.vector_metadata")?;
+        let snapshot = self
+            .lexical
+            .snapshot()
+            .map_err(|_| refused("source", "lexical-snapshot"))?;
+        let live_count = self.vector.owner_witness().live_count;
+        if snapshot.doc_count() != live_count || self.metadata.total_documents != live_count {
+            return Err(refused("source", "live-count-mismatch"));
+        }
+        let schema = snapshot.schema();
+        // Schema names are diagnostic, not part of persisted schema identity.
+        // Renaming the default layout must not relax its source validation.
+        let canonical_source_metadata = schema.fields == DEFAULT_SCHEMA.fields;
+        let metadata_field = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "metadata_json" && field.stored)
+            .map(|field| field.id);
         let mut staged = Vec::new();
         for (position, result) in results.iter().enumerate() {
             if result.lexical_score.is_some() {
@@ -2069,25 +2092,46 @@ impl CompositeReaders {
                 .resolve_document_id(result.doc_id.as_str())
                 .map_err(|_| refused("source", "invalid-lexical-identity"))?
                 .ok_or_else(|| refused("source", "missing-live-document"))?;
-            let bytes = self
-                .lexical
-                .stored_field_value(fields[3], document.global_docid)
-                .map_err(|_| refused("source", "invalid-stored-field"))?
-                .ok_or_else(|| refused("source", "missing-stored-field"))?;
-            let metadata: BTreeMap<String, String> = serde_json::from_slice(&bytes)
-                .map_err(|_| refused("source", "invalid-metadata"))?;
-            if serde_json::to_vec(&metadata).map_err(|_| refused("source", "invalid-metadata"))?
-                != bytes
-            {
-                return Err(refused("source", "noncanonical-metadata"));
-            }
-            let metadata = if metadata.is_empty() {
-                None
+            let bytes = metadata_field
+                .map(|field| {
+                    self.lexical
+                        .stored_field_value(field, document.global_docid)
+                        .map_err(|_| refused("source", "invalid-stored-field"))
+                })
+                .transpose()?
+                .flatten();
+            let metadata = if canonical_source_metadata {
+                // Preserve the canonical source contract of the shipping
+                // schema, including missing fields and duplicate JSON keys.
+                let bytes = bytes.ok_or_else(|| refused("source", "missing-stored-field"))?;
+                let metadata: BTreeMap<String, String> = serde_json::from_slice(&bytes)
+                    .map_err(|_| refused("source", "invalid-metadata"))?;
+                if serde_json::to_vec(&metadata)
+                    .map_err(|_| refused("source", "invalid-metadata"))?
+                    != bytes
+                {
+                    return Err(refused("source", "noncanonical-metadata"));
+                }
+                if metadata.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(
+                        serde_json::to_value(metadata)
+                            .map_err(|_| refused("source", "invalid-metadata"))?,
+                    ))
+                }
             } else {
-                Some(Arc::new(
-                    serde_json::to_value(metadata)
-                        .map_err(|_| refused("source", "invalid-metadata"))?,
-                ))
+                // Schema-document ingestion may store arbitrary JSON and may
+                // omit this column altogether. Match Quill lexical hydration
+                // rather than interpreting an unrelated field as metadata.
+                bytes
+                    .map(|bytes| {
+                        serde_json::from_slice::<serde_json::Value>(&bytes)
+                            .map_err(|_| refused("source", "invalid-metadata"))
+                    })
+                    .transpose()?
+                    .filter(|metadata| !metadata.as_object().is_some_and(serde_json::Map::is_empty))
+                    .map(Arc::new)
             };
             staged.push((position, metadata));
         }
