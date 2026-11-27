@@ -4285,6 +4285,91 @@ mod tests {
     }
 
     #[test]
+    fn strict_metadata_filters_reject_metadata_less_exact_and_wal_searches() {
+        use frankensearch_core::{
+            BitsetFilter, DateRangeFilter, DocTypeFilter, FilterChain, FilterMode,
+            IncludeDocIdsFilter, MissingMetadataPolicy,
+        };
+
+        let strict_type =
+            DocTypeFilter::new(["active"]).on_missing_metadata(MissingMetadataPolicy::Reject);
+        let strict_date =
+            DateRangeFilter::between(100, 200).on_missing_metadata(MissingMetadataPolicy::Reject);
+        // The exact-ID operand is small enough to select the gather route.
+        // Neither gathering nor hash compilation may bypass metadata policy.
+        let exact_scope = FilterChain::new(FilterMode::All)
+            .with(Box::new(IncludeDocIdsFilter::new(["doc-0"])))
+            .with(Box::new(strict_type.clone()));
+        let hashed_scope = FilterChain::new(FilterMode::All)
+            .with(Box::new(BitsetFilter::from_doc_ids(["doc-0"])))
+            .with(Box::new(strict_date));
+        let filters: [&dyn SearchFilter; 4] =
+            [&strict_type, &strict_date, &exact_scope, &hashed_scope];
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let mrl = crate::MrlConfig {
+            search_dims: 2,
+            ..crate::MrlConfig::default()
+        };
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("strict-metadata");
+            let mut writer =
+                VectorIndex::create_with_revision(&path, "hash", "test", query.len(), quantization)
+                    .expect("create index");
+            for row in 0..128 {
+                writer
+                    .write_record(&format!("doc-{row}"), &query)
+                    .expect("write row");
+            }
+            writer.finish().expect("finish index");
+            let mut index = VectorIndex::open(&path).expect("open index");
+            for with_wal in [false, true] {
+                if with_wal {
+                    index.append("wal-only", &query).expect("append new ID");
+                    index.append("doc-0", &query).expect("replace main row");
+                }
+                assert_eq!(
+                    index
+                        .search_top_k(&query, 3, Some(&DocTypeFilter::new(["active"])))
+                        .expect("permissive metadata policy")
+                        .len(),
+                    3
+                );
+                for filter in filters {
+                    for parallel_enabled in [false, true] {
+                        let params = SearchParams {
+                            parallel_enabled,
+                            parallel_threshold: 0,
+                            parallel_chunk_size: 7,
+                        };
+                        assert!(
+                            index
+                                .search_top_k_with_params(&query, 3, Some(filter), params)
+                                .expect("strict exact search")
+                                .is_empty(),
+                            "{} admitted a metadata-less row ({quantization:?}, WAL={with_wal}, parallel={parallel_enabled})",
+                            filter.name()
+                        );
+                    }
+                    let classified = index
+                        .search_top_k_classified(&query, 3, Some(filter))
+                        .expect("strict classified search");
+                    assert!(classified.hits.is_empty());
+                    assert_eq!(
+                        classified.zero_signal,
+                        Some(ZeroSignalReason::FilterEliminatedAll)
+                    );
+                    assert!(
+                        index
+                            .mrl_search(&query, 3, &mrl, Some(filter))
+                            .expect("strict truncated search")
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bitset_filter_during_vector_search() {
         let path = temp_index_path("bitset-filter");
         write_index(
