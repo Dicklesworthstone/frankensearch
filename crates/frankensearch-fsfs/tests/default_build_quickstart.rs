@@ -8899,7 +8899,14 @@ meta:
             let probe = fsfs.run(
                 temp.path(),
                 &format!("open-loader-{model_id}"),
-                ["download-models", model_id, "--offline", "--verify-loader", "--format", "json"],
+                [
+                    "download-models",
+                    model_id,
+                    "--offline",
+                    "--verify-loader",
+                    "--format",
+                    "json",
+                ],
                 QUICKSTART_TIMEOUT,
             );
             let opened = parse_success_envelope("offline model loader verification", &probe);
