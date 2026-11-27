@@ -2035,11 +2035,19 @@ struct Fixture {
 
 impl Fixture {
     fn admit(&self, cx: &Cx) -> SearchResult<CompositeReaders> {
+        self.admit_with_schema(cx, DEFAULT_SCHEMA)
+    }
+
+    fn admit_with_schema(
+        &self,
+        cx: &Cx,
+        schema: SchemaDescriptor,
+    ) -> SearchResult<CompositeReaders> {
         admit_components(
             cx,
             &self.activation,
             &self.binding,
-            DEFAULT_SCHEMA,
+            schema,
             config(),
             self.images.clone(),
             self.ann.clone(),
@@ -2256,6 +2264,288 @@ fn assert_source_refused<T>(result: SearchResult<T>, expected_code: &str) {
     };
     assert_eq!(field, "native_ann.generation.source");
     assert_eq!(value, expected_code);
+}
+
+const REORDERED_METADATA_FIELDS: [frankensearch_quill::FieldDescriptor; 4] = [
+    frankensearch_quill::FieldDescriptor {
+        id: 0,
+        ..DEFAULT_SCHEMA.fields[2]
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 1,
+        ..DEFAULT_SCHEMA.fields[0]
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 2,
+        ..DEFAULT_SCHEMA.fields[3]
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 3,
+        ..DEFAULT_SCHEMA.fields[1]
+    },
+];
+
+const REORDERED_METADATA_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+    name: "retained-reordered-metadata",
+    fields: &REORDERED_METADATA_FIELDS,
+};
+
+async fn schema_metadata_fixture(
+    cx: &Cx,
+    provider: &Provider,
+    tier: EmbedderTierTag,
+    schema: SchemaDescriptor,
+    metadata: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Fixture {
+    let mut fixture = fixture(cx, provider, tier).await;
+    let writer = QuillIndex::create_with_schema(
+        cx,
+        fixture.directory.path().join("schema-lexical"),
+        schema,
+        config(),
+    )
+    .await
+    .unwrap();
+    let documents = source_ids(&fixture)
+        .into_iter()
+        .map(|id| {
+            let indexed = schema
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    let value = match field.name {
+                        "id" => id.clone(),
+                        "content" => "common retained document".to_owned(),
+                        "title" => String::new(),
+                        _ => return None,
+                    };
+                    Some((field.id, value))
+                })
+                .collect();
+            let stored = schema
+                .fields
+                .iter()
+                .find(|field| field.name == "metadata_json" && field.stored)
+                .and_then(|field| metadata(&id).map(|bytes| (field.id, bytes)))
+                .into_iter()
+                .collect();
+            SchemaDocument {
+                id,
+                indexed,
+                stored,
+                ..SchemaDocument::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    writer.index_schema_documents(cx, &documents).await.unwrap();
+    writer.commit(cx).await.unwrap();
+    replace_source_image(cx, &mut fixture, &writer);
+    fixture
+}
+
+#[test]
+fn retained_custom_schema_hydrates_semantic_winners_like_lexical_winners() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let expected = serde_json::json!({
+            "active": true,
+            "created_at": 1500,
+            "nested": { "labels": ["retained", "custom"] }
+        });
+        for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+            for ann in [false, true] {
+                let provider = Provider::new();
+                let fixture = schema_metadata_fixture(
+                    &cx,
+                    &provider,
+                    tier,
+                    REORDERED_METADATA_SCHEMA,
+                    |_| Some(serde_json::to_vec(&expected).unwrap()),
+                )
+                .await;
+                let fixture = if ann {
+                    fixture.with_ann(&cx, HnswParams::default(), 73)
+                } else {
+                    fixture
+                };
+                let readers = fixture
+                    .admit_with_schema(&cx, REORDERED_METADATA_SCHEMA)
+                    .unwrap();
+                assert!(
+                    fixture.admit(&cx).is_err(),
+                    "the schema stays caller-selected"
+                );
+                assert_source_refused(readers.source_documents(&cx, BUDGET), "unsupported-schema");
+                // All queries keep their retained image even after the source
+                // directory moves. No pathname or original document is reopened.
+                std::fs::rename(
+                    fixture.directory.path().join("schema-lexical"),
+                    fixture.directory.path().join("relocated-schema-lexical"),
+                )
+                .unwrap();
+                assert!(
+                    readers
+                        .search_text(&cx, &provider, "unmatched", 0)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                for query in ["common", "unmatched"] {
+                    let hits = readers.search_text(&cx, &provider, query, 2).await.unwrap();
+                    assert_eq!(hits.len(), 2);
+                    for hit in &hits {
+                        assert_eq!(hit.metadata.as_deref(), Some(&expected));
+                        assert_eq!(hit.lexical_score.is_some(), query == "common");
+                        assert_eq!(hit.fast_score.is_some(), tier == EmbedderTierTag::Fast);
+                        assert_eq!(
+                            hit.quality_score.is_some(),
+                            tier == EmbedderTierTag::Quality
+                        );
+                    }
+                }
+                let mut lexical = readers
+                    .search_lexical_with_reader(&cx, &readers.lexical, "common", 2)
+                    .await
+                    .unwrap();
+                let before = serde_json::to_value(&lexical).unwrap();
+                readers.hydrate_vector_metadata(&cx, &mut lexical).unwrap();
+                assert_eq!(serde_json::to_value(&lexical).unwrap(), before);
+            }
+        }
+    });
+}
+
+#[test]
+fn retained_custom_schema_allows_absent_or_empty_metadata() {
+    const NO_METADATA_FIELDS: [frankensearch_quill::FieldDescriptor; 4] = [
+        REORDERED_METADATA_FIELDS[0],
+        REORDERED_METADATA_FIELDS[1],
+        frankensearch_quill::FieldDescriptor {
+            name: "preview",
+            ..REORDERED_METADATA_FIELDS[2]
+        },
+        REORDERED_METADATA_FIELDS[3],
+    ];
+    const NO_METADATA_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "retained-without-metadata",
+        fields: &NO_METADATA_FIELDS,
+    };
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (schema, bytes) in [
+            (NO_METADATA_SCHEMA, None),
+            (REORDERED_METADATA_SCHEMA, None),
+            (REORDERED_METADATA_SCHEMA, Some(b"{}".as_slice())),
+        ] {
+            let provider = Provider::new();
+            let fixture =
+                schema_metadata_fixture(&cx, &provider, EmbedderTierTag::Fast, schema, |_| {
+                    bytes.map(<[u8]>::to_vec)
+                })
+                .await;
+            let readers = fixture.admit_with_schema(&cx, schema).unwrap();
+            for query in ["common", "unmatched"] {
+                let hits = readers.search_text(&cx, &provider, query, 2).await.unwrap();
+                assert_eq!(hits.len(), 2);
+                assert!(hits.iter().all(|hit| hit.metadata.is_none()));
+                assert!(
+                    hits.iter()
+                        .all(|hit| hit.lexical_score.is_some() == (query == "common"))
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn retained_custom_schema_refuses_corrupt_metadata_without_partial_hydration() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let fixture = fixture(&cx, &provider, EmbedderTierTag::Fast).await;
+        let mut results = fixture
+            .admit(&cx)
+            .unwrap()
+            .search_text(&cx, &provider, "unmatched", 2)
+            .await
+            .unwrap();
+        let first = results[0].doc_id.clone();
+        let corrupt = schema_metadata_fixture(
+            &cx,
+            &provider,
+            EmbedderTierTag::Fast,
+            REORDERED_METADATA_SCHEMA,
+            |id| {
+                Some(if id == first.as_str() {
+                    br#"{"version":"new"}"#.to_vec()
+                } else {
+                    b"{invalid-json".to_vec()
+                })
+            },
+        )
+        .await
+        .admit_with_schema(&cx, REORDERED_METADATA_SCHEMA)
+        .unwrap();
+        let before = serde_json::to_value(&results).unwrap();
+        assert_source_refused(
+            corrupt.hydrate_vector_metadata(&cx, &mut results),
+            "invalid-metadata",
+        );
+        assert_eq!(serde_json::to_value(&results).unwrap(), before);
+        assert_source_refused(
+            corrupt.search_text(&cx, &provider, "unmatched", 2).await,
+            "invalid-metadata",
+        );
+        assert!(
+            corrupt
+                .search_text(&cx, &provider, "unmatched", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn retained_default_schema_keeps_strict_metadata_hydration_contract() {
+    const RENAMED_DEFAULT_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "retained-default-schema-alias",
+        fields: DEFAULT_SCHEMA.fields,
+    };
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        assert_eq!(
+            RENAMED_DEFAULT_SCHEMA.schema_id().unwrap(),
+            DEFAULT_SCHEMA.schema_id().unwrap()
+        );
+        for schema in [DEFAULT_SCHEMA, RENAMED_DEFAULT_SCHEMA] {
+            for (bytes, code) in [
+                (None, "missing-stored-field"),
+                (Some(b"{invalid-json".as_slice()), "invalid-metadata"),
+                (Some(br#"{"count":42}"#.as_slice()), "invalid-metadata"),
+                (
+                    Some(br#"{"key":"first","key":"second"}"#.as_slice()),
+                    "noncanonical-metadata",
+                ),
+            ] {
+                let provider = Provider::new();
+                let fixture =
+                    schema_metadata_fixture(&cx, &provider, EmbedderTierTag::Fast, schema, |_| {
+                        bytes.map(<[u8]>::to_vec)
+                    })
+                    .await;
+                let readers = fixture.admit_with_schema(&cx, schema).unwrap();
+                assert_source_refused(
+                    readers.search_text(&cx, &provider, "unmatched", 2).await,
+                    code,
+                );
+                assert_source_refused(
+                    readers.source_documents(&cx, BUDGET),
+                    if schema == DEFAULT_SCHEMA {
+                        code
+                    } else {
+                        "unsupported-schema"
+                    },
+                );
+            }
+        }
+    });
 }
 
 #[test]
