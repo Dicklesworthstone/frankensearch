@@ -165,7 +165,7 @@ fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
 ///
 /// This does not preempt the stage that just ran or the opaque call that
 /// preceded it; it stops the next material stage from starting.
-fn cancellation_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+pub(crate) fn cancellation_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
         phase: phase.to_owned(),
         reason: cx
@@ -179,19 +179,25 @@ fn missing_query_identity(error: &SearchError) -> bool {
 }
 
 fn capture_query_identity(
+    cx: &Cx,
     embedder: &dyn Embedder,
     tier: &str,
 ) -> SearchResult<Option<EmbeddingIdentityBundleV1>> {
-    let identity = match embedder.identity() {
+    cancellation_checkpoint(cx, "query_identity_admission")?;
+    let declared = embedder.identity();
+    cancellation_checkpoint(cx, "query_identity_admission")?;
+    let identity = match declared {
         Ok(identity) => identity,
         Err(error) if missing_query_identity(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     identity.validate()?;
-    if usize::try_from(identity.space.dimension).ok() != Some(embedder.dimension()) {
+    let dimension = embedder.dimension();
+    cancellation_checkpoint(cx, "query_identity_admission")?;
+    if usize::try_from(identity.space.dimension).ok() != Some(dimension) {
         return Err(SearchError::InvalidConfig {
             field: format!("query_embedding.{tier}.dimension"),
-            value: embedder.dimension().to_string(),
+            value: dimension.to_string(),
             reason: "the configured embedder's dimension disagrees with its identity".to_owned(),
         });
     }
@@ -1155,8 +1161,8 @@ impl TwoTierSearcher {
     /// The captured query contracts also admit every actual bound response
     /// after inference, before feedback-vector reads, exact scoring or graph
     /// traversal. A provider cannot relabel raw values with a later identity.
-    /// Explicit fast-only policy excludes the quality producer from admission
-    /// as well as execution; an unused tier cannot prevent fast retrieval.
+    /// Progressive quality admission follows the same tier policy as
+    /// refinement, so an unused quality producer cannot prevent fast retrieval.
     ///
     /// # Errors
     ///
@@ -1167,16 +1173,17 @@ impl TwoTierSearcher {
     /// producer than the one that wrote the index — including the
     /// certified-compatible case, which is comparison-grade telemetry and
     /// never an admission basis.
-    fn admit_semantic_query(&self) -> SearchResult<(SemanticAdmission, QueryEmbeddingIdentities)> {
-        let quality_embedder = self
-            .quality_embedder
-            .as_ref()
-            .filter(|_| !self.config.fast_only);
+    fn admit_semantic_query(
+        &self,
+        cx: &Cx,
+        quality_enabled: bool,
+    ) -> SearchResult<(SemanticAdmission, QueryEmbeddingIdentities)> {
+        let fast = capture_query_identity(cx, self.fast_embedder.as_ref(), "fast")?;
+        let quality_embedder = self.quality_embedder.as_ref().filter(|_| quality_enabled);
         let identities = QueryEmbeddingIdentities {
-            fast: capture_query_identity(self.fast_embedder.as_ref(), "fast")?,
+            fast,
             quality: quality_embedder
-                .filter(|_| self.index.has_quality_index())
-                .map(|embedder| capture_query_identity(embedder.as_ref(), "quality"))
+                .map(|embedder| capture_query_identity(cx, embedder.as_ref(), "quality"))
                 .transpose()?
                 .flatten(),
         };
@@ -1215,11 +1222,7 @@ impl TwoTierSearcher {
             fast_binding,
             "fast",
         )?;
-        // The quality tier is admitted only when BOTH halves are present. A
-        // configured quality embedder with no retained quality owner is not
-        // an error — `should_run_quality` already keeps such a search on the
-        // Initial phase — and a retained quality owner with no configured
-        // embedder is simply never consulted.
+        // A quality owner participates only when refinement can use its producer.
         let quality = if let Some(embedder) = quality_embedder
             && let Some(binding) = self.index.quality_admitted_binding()
         {
@@ -1241,6 +1244,7 @@ impl TwoTierSearcher {
     /// In particular, no fast-provider method or fast-tier binding is consulted.
     fn admit_quality_only_query(
         &self,
+        cx: &Cx,
     ) -> SearchResult<(SemanticAdmission, QueryEmbeddingIdentities)> {
         if self.config.fast_only {
             return Err(SearchError::InvalidConfig {
@@ -1264,7 +1268,7 @@ impl TwoTierSearcher {
                 reason: "quality-only retrieval requires a quality index".to_owned(),
             });
         }
-        let identity = capture_query_identity(embedder, "quality")?.ok_or_else(|| {
+        let identity = capture_query_identity(cx, embedder, "quality")?.ok_or_else(|| {
             SearchError::InvalidConfig {
                 field: "search_activation.quality.embedder_identity".to_owned(),
                 value: "unidentified".to_owned(),
@@ -1596,6 +1600,7 @@ impl TwoTierSearcher {
         mode: SearchExecutionMode,
         request_filter: &mut RequestFilter<'_>,
     ) -> SearchResult<TwoTierMetrics> {
+        cancellation_checkpoint(cx, "search_admission")?;
         let mut metrics = TwoTierMetrics::default();
 
         // Determine whether a nonempty quality request is actually lexical
@@ -1613,7 +1618,7 @@ impl TwoTierSearcher {
             .is_some_and(|(_, parsed)| parsed.is_positive_empty() && parsed.has_negations());
         let quality_admission =
             if mode == SearchExecutionMode::QualityOnly && !quality_lexical_complement {
-                let admission = self.admit_quality_only_query();
+                let admission = self.admit_quality_only_query(cx);
                 cancellation_checkpoint(cx, "quality_only_identity_admission")?;
                 Some(admission?)
             } else {
@@ -1623,7 +1628,7 @@ impl TwoTierSearcher {
         // Empty progressive requests keep the same producer admission as real
         // retrieval, without invoking the canonicalizer or either embedder.
         if mode == SearchExecutionMode::Progressive && (k == 0 || query.is_empty()) {
-            let admission = self.admit_semantic_query();
+            let admission = self.admit_semantic_query(cx, self.should_run_quality());
             cancellation_checkpoint(cx, "query_identity_admission")?;
             admission?;
         }
@@ -1651,6 +1656,10 @@ impl TwoTierSearcher {
             (canonical, parsed)
         });
         let lexical_complement = parsed_query.is_positive_empty() && parsed_query.has_negations();
+        cancellation_checkpoint(cx, "query_shape_admission")?;
+        let quality_enabled = mode == SearchExecutionMode::Progressive
+            && !lexical_complement
+            && self.should_run_quality();
         // Admit before the canonicalized-empty exit, inference, embedding
         // caches or vector/ANN reads. A lexical complement has no semantic
         // query and does not consult either producer.
@@ -1660,7 +1669,7 @@ impl TwoTierSearcher {
         } else if mode == SearchExecutionMode::QualityOnly {
             quality_admission
         } else {
-            let admission = self.admit_semantic_query();
+            let admission = self.admit_semantic_query(cx, quality_enabled);
             cancellation_checkpoint(cx, "query_identity_admission")?;
             Some(admission?)
         };
@@ -1765,9 +1774,6 @@ impl TwoTierSearcher {
         // An explicitly requested final ranker needs its window even when
         // quality is unavailable, disabled, or later fails. Exclusion-only
         // lexical browsing retains its single-phase contract.
-        let quality_enabled = mode == SearchExecutionMode::Progressive
-            && !lexical_complement
-            && self.should_run_quality();
         let final_ranking_enabled = !lexical_complement && self.final_ranking_enabled();
         let candidate_target = if quality_enabled || final_ranking_enabled {
             self.final_candidate_target(k)
@@ -1985,9 +1991,6 @@ impl TwoTierSearcher {
         // phase. Retained pools distinguish that case from failed embedding or
         // a policy short circuit; a work counter cannot make that distinction.
         // An unidentified legacy tier still needs candidates to rescore.
-        let quality_enabled = mode == SearchExecutionMode::Progressive
-            && !lexical_complement
-            && self.should_run_quality();
         let independent_quality = match admitted.as_ref().map(|(admission, _)| admission) {
             Some(SemanticAdmission::OwnerBacked { quality }) => *quality,
             Some(SemanticAdmission::LegacyUnidentified) => self
@@ -13576,31 +13579,83 @@ mod tests {
     }
 
     #[test]
-    fn empty_progressive_requests_preserve_cancellation() {
-        for (query, k) in [("", 3), ("query", 0), ("", 0), ("  ", 3)] {
+    fn cancelled_request_admission_never_calls_the_canonicalizer_or_producers() {
+        struct UnusedCanonicalizer;
+
+        impl Canonicalizer for UnusedCanonicalizer {
+            fn canonicalize(&self, _text: &str) -> String {
+                panic!("a cancelled search must not canonicalize document text");
+            }
+
+            fn canonicalize_query(&self, _query: &str) -> String {
+                panic!("a cancelled search must not canonicalize the query");
+            }
+        }
+
+        for (query, k) in [("", 3), ("query", 0), ("", 0), ("  ", 3), ("query", 3)] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (_index_dir, index) = query_admission_index("exact-v2");
                 let fast = Arc::new(query_admission_embedder("fast"));
                 let quality = Arc::new(query_admission_embedder("quality"));
                 let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
                     .with_quality_embedder(quality.clone())
-                    .with_embedding_cache(8);
+                    .with_embedding_cache(8)
+                    .with_canonicalizer(Box::new(UnusedCanonicalizer));
                 cx.set_cancel_requested(true);
+                for mode in [
+                    SearchExecutionMode::Progressive,
+                    SearchExecutionMode::QualityOnly,
+                ] {
+                    let error = searcher
+                        .search_with_mode(
+                            &cx,
+                            query,
+                            k,
+                            |_| panic!("a cancelled request must not hydrate text"),
+                            |phase| panic!("a cancelled request published {phase:?}"),
+                            mode,
+                            None,
+                        )
+                        .await
+                        .expect_err("a request must preserve cancellation");
+                    assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
+                }
+                for provider in [&fast, &quality] {
+                    assert_eq!(provider.identity_count(), 0);
+                    assert_eq!(provider.embed_count(), 0);
+                    assert_eq!(provider.bound_embeds.load(Ordering::Relaxed), 0);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cancellation_during_fast_admission_stops_before_quality_admission() {
+        for (query, k) in [("", 2), ("query", 0), ("  ", 2), ("query", 2)] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_index_dir, index) = query_admission_index("exact-v2");
+                let fast = Arc::new(
+                    query_admission_embedder("fast").cancel_on_identity_call(cx.clone(), 1),
+                );
+                let quality = Arc::new(query_admission_embedder("quality"));
+                let searcher = TwoTierSearcher::new(index, fast.clone(), TwoTierConfig::default())
+                    .with_quality_embedder(quality.clone());
                 let error = searcher
                     .search(
                         &cx,
                         query,
                         k,
-                        |_| panic!("a cancelled request must not hydrate text"),
-                        |phase| panic!("a cancelled request published {phase:?}"),
+                        |_| panic!("cancelled admission hydrated text"),
+                        |phase| panic!("cancelled admission emitted {phase:?}"),
                     )
                     .await
-                    .expect_err("an empty request must preserve cancellation");
+                    .expect_err("cancellation from fast admission must stop the request");
                 assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
-                for provider in [&fast, &quality] {
-                    assert_eq!(provider.embed_count(), 0);
-                    assert_eq!(provider.bound_embeds.load(Ordering::Relaxed), 0);
-                }
+                assert_eq!(fast.identity_count(), 1);
+                assert_eq!(quality.identity_count(), 0);
+                assert_eq!(fast.embed_count() + quality.embed_count(), 0);
+                assert_eq!(fast.bound_embeds.load(Ordering::Relaxed), 0);
+                assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
             });
         }
     }
@@ -16581,17 +16636,30 @@ mod tests {
     }
 
     #[test]
-    fn hash_control_does_not_schedule_quality_refinement() {
-        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
-
+    fn hash_control_admission_does_not_consult_the_unused_quality_provider() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (_index_dir, index) = build_test_index_with_quality(4);
             let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
+            let mut unavailable = query_admission_embedder("quality");
+            unavailable.identity_refusal = Some("quality.provider_unavailable");
+            let quality = Arc::new(unavailable);
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
-                .with_quality_embedder(quality)
+                .with_quality_embedder(quality.clone())
                 .with_lexical(lexical);
+
+            for (query, k) in [("", 5), ("query", 0), ("  ", 5)] {
+                searcher
+                    .search(
+                        &cx,
+                        query,
+                        k,
+                        |_| panic!("no-op hydrated text"),
+                        |phase| panic!("no-op emitted {phase:?}"),
+                    )
+                    .await
+                    .expect("an unused quality provider cannot block a hash-control request");
+            }
 
             let mut got_refined = false;
             let metrics = searcher
@@ -16622,10 +16690,12 @@ mod tests {
                 Some("non_semantic_fast_embedder_lexical_short_circuit")
             );
             assert_eq!(
-                quality_calls.load(std::sync::atomic::Ordering::Relaxed),
+                quality.identity_count(),
                 0,
-                "quality must not refine hash-control ranks"
+                "quality must not participate in hash-control admission"
             );
+            assert_eq!(quality.embed_count(), 0);
+            assert_eq!(quality.bound_embeds.load(Ordering::Relaxed), 0);
         });
     }
 

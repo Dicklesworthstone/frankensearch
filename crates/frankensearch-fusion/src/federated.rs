@@ -19,7 +19,9 @@ use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchPhase, Se
 use tracing::{debug, warn};
 
 use crate::normalize::{NormalizationMethod, normalize_scores_with_method};
-use crate::searcher::{RequestFilter, SearchExecutionMode, TwoTierSearcher};
+use crate::searcher::{
+    RequestFilter, SearchExecutionMode, TwoTierSearcher, cancellation_checkpoint,
+};
 
 const DEFAULT_FEDERATED_RRF_K: f64 = 60.0;
 
@@ -596,6 +598,7 @@ impl FederatedSearcher {
         F: Fn(&str, &str) -> Option<String> + Send + Sync,
         P: Fn(&str) -> Option<&'filter dyn SearchFilter> + Send + Sync,
     {
+        cancellation_checkpoint(cx, "federated_admission")?;
         if self.indices.is_empty()
             || (matches!(mode, FederatedSearchMode::Progressive)
                 && (query.is_empty() || limit == 0))
@@ -672,15 +675,17 @@ impl FederatedSearcher {
             .indices
             .iter()
             .take(self.config.max_indices)
-            .map(|index| {
+            .map(|index| -> SearchResult<ShardFuture<'_>> {
+                cancellation_checkpoint(cx, "federated_filter_admission")?;
                 let index_name = index.name.clone();
                 let index_weight = index.weight;
                 let searcher = Arc::clone(&index.searcher);
                 let filter = filter_fn(index.name.as_str());
+                cancellation_checkpoint(cx, "federated_filter_admission")?;
                 if let Some(filter) = filter {
                     shard_filters.insert(index.name.as_str(), filter);
                 }
-                Box::pin(async move {
+                Ok(Box::pin(async move {
                     let timeout_start = cx.now();
                     let mut last_results = None;
                     let mut refinement_error = None;
@@ -773,9 +778,9 @@ impl FederatedSearcher {
                             None => ShardCompletion::TimedOut { index: index_name },
                         },
                     }
-                }) as ShardFuture<'_>
+                }))
             })
-            .collect();
+            .collect::<SearchResult<_>>()?;
 
         let mut shard_results = Vec::new();
         let mut first_shard_error: Option<SearchError> = None;
@@ -3595,6 +3600,63 @@ mod tests {
                 .unwrap();
             assert!(empty.hits.is_empty());
             assert!(empty.coverage.queried.is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelled_federated_admission_refuses_noops_and_skips_callbacks() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, searcher) = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let with_shard = FederatedSearcher::new().add_index("primary", searcher, 1.0);
+            let without_shards = FederatedSearcher::new();
+            cx.set_cancel_requested(true);
+
+            for (federated, query, limit) in [
+                (&without_shards, "query", 1),
+                (&with_shard, "", 10),
+                (&with_shard, "query", 0),
+                (&with_shard, "query", 1),
+            ] {
+                let error = federated
+                    .search_with_index_filter(
+                        &cx,
+                        query,
+                        limit,
+                        |_| panic!("cancelled admission resolved a filter"),
+                        |_, _| panic!("cancelled admission read text"),
+                    )
+                    .await
+                    .expect_err("cancelled federation must refuse the request");
+                assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_during_federated_filter_admission_stops_dispatch() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_directory, searcher) = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let federated = FederatedSearcher::new()
+                .add_index("first", Arc::clone(&searcher), 1.0)
+                .add_index("second", searcher, 1.0);
+            let filter_calls = AtomicU64::new(0);
+            let error = federated
+                .search_with_index_filter(
+                    &cx,
+                    "query",
+                    1,
+                    |name| {
+                        assert_eq!(name, "first", "later shards must not resolve filters");
+                        filter_calls.fetch_add(1, Ordering::Relaxed);
+                        cx.set_cancel_requested(true);
+                        None
+                    },
+                    |_, _| panic!("cancelled admission read text"),
+                )
+                .await
+                .expect_err("cancellation from filter selection must stop the request");
+            assert!(matches!(error, SearchError::Cancelled { .. }), "{error}");
+            assert_eq!(filter_calls.load(Ordering::Relaxed), 1);
         });
     }
 
