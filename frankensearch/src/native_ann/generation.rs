@@ -66,6 +66,79 @@ pub(super) const NATIVE_QUALITY_ANN_RECEIPT_KEY: &str = "native_quality_hnsw_rec
 // framing. Source-only recovery must not mistake a partial owner for a full tier
 // when its vector image is unavailable.
 pub(super) const NATIVE_QUALITY_COVERAGE_KEY: &str = "native_quality_coverage_v1";
+// The authenticated metadata must retain the actual subset, not only its size,
+// so source-only repair can preserve coverage when the vector image is lost.
+pub(super) const NATIVE_QUALITY_DOCUMENT_IDS_KEY: &str = "native_quality_document_ids_v1";
+
+/// Decode the optional, canonical quality-membership witness.
+///
+/// Older partial generations may omit this witness and remain searchable from
+/// their admitted vectors. They cannot authorize subset-preserving source-only
+/// repair. A present witness is always checked, including on ordinary reads.
+pub(super) fn declared_partial_quality_document_ids(
+    cx: &Cx,
+    metadata: &GenerationManifest,
+) -> SearchResult<Option<Vec<String>>> {
+    checkpoint(cx, "native_ann.generation.quality_membership")?;
+    let Some(encoded) = metadata.metadata.get(NATIVE_QUALITY_DOCUMENT_IDS_KEY) else {
+        return Ok(None);
+    };
+    if metadata
+        .metadata
+        .get(NATIVE_QUALITY_COVERAGE_KEY)
+        .map(String::as_str)
+        != Some("partial_quality")
+        || metadata.vector_artifacts.len() != 2
+        || metadata.vector_artifacts[0].embedder_tier != EmbedderTierTag::Fast
+        || metadata.vector_artifacts[1].embedder_tier != EmbedderTierTag::Quality
+    {
+        return Err(refused("metadata", "quality-membership-contract-mismatch"));
+    }
+    let identifiers: Vec<String> = serde_json::from_str(encoded)
+        .map_err(|_| refused("metadata", "invalid-quality-membership"))?;
+    let count = u64::try_from(identifiers.len())
+        .map_err(|_| refused("metadata", "invalid-quality-membership"))?;
+    if count == 0
+        || count >= metadata.total_documents
+        || count > metadata.vector_artifacts[1].vector_count
+    {
+        return Err(refused("metadata", "invalid-quality-membership"));
+    }
+    let mut previous: Option<&str> = None;
+    for identifier in &identifiers {
+        checkpoint(cx, "native_ann.generation.quality_membership_id")?;
+        if identifier.is_empty() || previous.is_some_and(|last| last >= identifier.as_str()) {
+            return Err(refused("metadata", "invalid-quality-membership"));
+        }
+        previous = Some(identifier);
+    }
+    if serde_json::to_string(&identifiers)
+        .map_err(|_| refused("metadata", "invalid-quality-membership"))?
+        != *encoded
+    {
+        return Err(refused("metadata", "noncanonical-quality-membership"));
+    }
+    Ok(Some(identifiers))
+}
+
+/// Record membership from admitted live rows, never from requested counts or
+/// historical physical row counts (which may include tombstones).
+pub(super) fn encode_partial_quality_document_ids(
+    cx: &Cx,
+    quality: &ValidatedFsviBytes,
+) -> SearchResult<String> {
+    let mut identifiers = Vec::new();
+    for physical in 0..quality.record_count() {
+        checkpoint(cx, "native_ann.generation.quality_membership_encode")?;
+        let row = quality.row(physical)?;
+        if row.flags().is_live() {
+            identifiers.push(row.doc_id().to_owned());
+        }
+    }
+    identifiers.sort_unstable();
+    serde_json::to_string(&identifiers)
+        .map_err(|_| refused("metadata", "invalid-quality-membership"))
+}
 
 /// Independently admitted vector owners stored in a complete authority generation.
 /// This describes stored shape, not semantic readiness or a request's chosen mode.
@@ -2723,6 +2796,7 @@ pub(super) fn admit_components_with_coverage(
     ) {
         return Err(refused("metadata", "quality-coverage-contract-mismatch"));
     }
+    let declared_quality_ids = declared_partial_quality_document_ids(cx, &metadata)?;
     let decode_receipt = |key: &str| {
         metadata
             .metadata
@@ -2758,6 +2832,21 @@ pub(super) fn admit_components_with_coverage(
             )
         })
         .transpose()?;
+    if let Some(identifiers) = declared_quality_ids {
+        let quality = cohort
+            .as_ref()
+            .ok_or_else(|| refused("metadata", "quality-membership-contract-mismatch"))?
+            .quality();
+        if u64::try_from(identifiers.len()).ok() != Some(quality.witness().live_count) {
+            return Err(refused("metadata", "quality-membership-owner-mismatch"));
+        }
+        for identifier in identifiers {
+            checkpoint(cx, "native_ann.generation.quality_membership_owner")?;
+            if quality.find_live_row_by_doc_id(&identifier)?.is_none() {
+                return Err(refused("metadata", "quality-membership-owner-mismatch"));
+            }
+        }
+    }
     let owner = if let Some(cohort) = &cohort {
         Arc::clone(cohort.fast())
     } else {

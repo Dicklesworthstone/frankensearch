@@ -22,7 +22,10 @@ use super::{
     NativeBuildRetrieval, NativeBuiltExactGeneration, capture_ann_image, checkpoint,
     image_budget_error, invalid, lower_hex, remaining_budget, timestamp_millis,
 };
-use crate::native_ann::generation::{NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY};
+use crate::native_ann::generation::{
+    NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY, NATIVE_QUALITY_DOCUMENT_IDS_KEY,
+    encode_partial_quality_document_ids,
+};
 use crate::native_ann::{NativeGenerationTopology, NativeGenerationVectorSource};
 use crate::{Cx, SearchResult};
 
@@ -273,6 +276,19 @@ impl NativeGenerationVectorSource {
         }
         metadata.metadata.remove(NATIVE_ANN_RECEIPT_KEY);
         metadata.metadata.remove(NATIVE_QUALITY_ANN_RECEIPT_KEY);
+        if coverage == VectorCohortCoverage::PartialQuality {
+            let owner = quality.as_ref().ok_or_else(|| {
+                invalid(
+                    "vector_recovery.metadata",
+                    "missing-quality",
+                    "partial repair requires its admitted quality owner",
+                )
+            })?;
+            metadata.metadata.insert(
+                NATIVE_QUALITY_DOCUMENT_IDS_KEY.to_owned(),
+                encode_partial_quality_document_ids(cx, owner)?,
+            );
+        }
         for (key, graph) in [
             (NATIVE_ANN_RECEIPT_KEY, primary_graph.as_ref()),
             (NATIVE_QUALITY_ANN_RECEIPT_KEY, quality_graph.as_ref()),

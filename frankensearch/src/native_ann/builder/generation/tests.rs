@@ -498,6 +498,118 @@ fn candidate(built: &NativeBuiltExactGeneration) -> GenerationCandidateV1 {
 }
 
 #[test]
+fn partial_quality_metadata_authenticates_exact_live_membership_before_search() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+            let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
+            let policy = if ann {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 71,
+                }
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            let mut built = builder(&directory.path().join("partial"), &fast)
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, policy)
+                .with_quality_storage(NativeBuildPrecision::F16, policy)
+                .unwrap()
+                .build_partial_quality_generation(
+                    &cx,
+                    SOURCE,
+                    ["z", "b"].map(str::to_owned),
+                    BUDGET,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                built.metadata.metadata[NATIVE_QUALITY_DOCUMENT_IDS_KEY], r#"["b","z"]"#,
+                "the witness follows sorted admitted membership, not input order"
+            );
+            let original = built.metadata.clone();
+            let documents =
+                CanonicalDocsetV1::from_ordered_live_documents(["a", "b", "c", "x", "z"]).unwrap();
+            let reseal = |built: &mut NativeBuiltExactGeneration| {
+                built.metadata.manifest_hash = compute_manifest_hash(&built.metadata).unwrap();
+                built.metadata_bytes = serde_json::to_vec(&built.metadata).unwrap().into();
+                let metadata = ExactComponentReceiptV1::for_metadata_manifest(
+                    &built.metadata,
+                    &built.metadata_bytes,
+                    &documents,
+                )
+                .unwrap();
+                built.components = ExactGenerationComponentsV1::admit(
+                    built.components.vector().clone(),
+                    built.components.lexical().clone(),
+                    built.components.ann().cloned(),
+                    metadata,
+                )
+                .unwrap();
+            };
+            for encoded in [
+                r#"[]"#,
+                r#"[""]"#,
+                r#"["b","b"]"#,
+                r#"["z","b"]"#,
+                r#"["a","b","c","x","z"]"#,
+                r#"["b"]"#,
+                r#"["b","missing"]"#,
+                r#"["a","b"]"#,
+                r#"[ "b", "z" ]"#,
+                r#"{"ids":["b","z"]}"#,
+            ] {
+                built.metadata.clone_from(&original);
+                built.metadata.metadata.insert(
+                    NATIVE_QUALITY_DOCUMENT_IDS_KEY.to_owned(),
+                    encoded.to_owned(),
+                );
+                // Recompute every outer digest: rejection must come from the
+                // membership contract, not a stale component checksum.
+                reseal(&mut built);
+                assert!(
+                    built.validate_candidate(&cx, &candidate(&built)).is_err(),
+                    "resealed incorrect membership {encoded} must be refused"
+                );
+            }
+            built.metadata.clone_from(&original);
+            built.metadata.metadata.remove(NATIVE_QUALITY_COVERAGE_KEY);
+            reseal(&mut built);
+            assert!(built.validate_candidate(&cx, &candidate(&built)).is_err());
+
+            // Historical partial metadata still admits through healthy exact
+            // vector owners; absence never invents a source-repair witness.
+            built.metadata.clone_from(&original);
+            built
+                .metadata
+                .metadata
+                .remove(NATIVE_QUALITY_DOCUMENT_IDS_KEY);
+            reseal(&mut built);
+            let preview = built.preview_candidate(&cx, &candidate(&built)).unwrap();
+            assert_eq!(
+                preview.partial_quality_document_ids(&cx).unwrap(),
+                ["b", "z"]
+            );
+
+            built.metadata = original;
+            reseal(&mut built);
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                built.validate_candidate(&cx, &candidate(&built)),
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            built.validate_candidate(&cx, &candidate(&built)).unwrap();
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
 fn real_fast_and_quality_images_join_and_query_after_source_relocation() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         for (tier, precision, name) in [

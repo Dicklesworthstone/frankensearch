@@ -25,8 +25,8 @@ use frankensearch_quill::{
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    NATIVE_QUALITY_COVERAGE_KEY, NativeGenerationTopology, checkpoint, lower_hex, refused,
-    validate_artifact_metadata,
+    NATIVE_QUALITY_COVERAGE_KEY, NativeGenerationTopology, checkpoint,
+    declared_partial_quality_document_ids, lower_hex, refused, validate_artifact_metadata,
 };
 use crate::{Cx, IndexableDocument, SearchResult};
 
@@ -165,7 +165,7 @@ impl NativeGenerationVectorSource {
         if authority.retained_image_bytes() > u64::try_from(max_image_bytes).unwrap_or(u64::MAX) {
             return Err(refused("vector-recovery", "encoded-image-limit"));
         }
-        let components = admit_source_components_with_coverage(
+        let mut components = admit_source_components_with_coverage(
             cx,
             authority.source().manifest(),
             primary,
@@ -246,6 +246,26 @@ impl NativeGenerationVectorSource {
         )?;
         let topology = match (cohort.as_ref(), coverage, tier) {
             (Some(cohort), VectorCohortCoverage::PartialQuality, _) => {
+                let mut quality_document_ids = Vec::new();
+                for physical in 0..cohort.quality().record_count() {
+                    checkpoint(cx, "native_ann.generation.vector_recovery_quality_row")?;
+                    let row = cohort.quality().row(physical)?;
+                    if row.flags().is_live() {
+                        quality_document_ids.push(row.doc_id().to_owned());
+                    }
+                }
+                quality_document_ids.sort_unstable();
+                if components
+                    .partial_quality_document_ids
+                    .as_ref()
+                    .is_some_and(|declared| declared != &quality_document_ids)
+                {
+                    return Err(refused("vector-recovery", "quality-membership-mismatch"));
+                }
+                // Older partial generations can prove membership with healthy
+                // retained owners even when their metadata has no source-only
+                // recovery declaration. Never infer it from a physical count.
+                components.partial_quality_document_ids = Some(quality_document_ids);
                 let quality_documents = cohort.quality_receipt().live_document_count;
                 let total_documents = cohort.fast_receipt().live_document_count;
                 let coverage_ppm = u32::try_from(
@@ -354,6 +374,57 @@ impl NativeGenerationSource {
         })
     }
 
+    /// Admit a partial-quality source without opening either vector tier.
+    ///
+    /// Both independent bindings come from the caller's trusted selection. The
+    /// selected metadata must authenticate a canonical proper subset of quality
+    /// document IDs, and every declared ID must belong to the retained live
+    /// lexical corpus. Older partial metadata without this declaration cannot
+    /// authorize subset-preserving source repair. Healthy retained vectors or
+    /// explicit full quality completion remain separate recovery capabilities.
+    ///
+    /// This handle certifies source and intended membership, never vector
+    /// health. Rebuild both tiers with the returned source documents and exact
+    /// [`Self::partial_quality_document_ids`], then admit the complete successor
+    /// before expected-pair publication. No old vector bits are reusable here.
+    ///
+    /// # Errors
+    /// Refuses missing, malformed or foreign membership, complete topology,
+    /// identity/generation/source disagreement, image limits and cancellation.
+    pub fn admit_partial_quality(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationSourceV1>,
+        fast: &FsviV2IdentityBinding,
+        quality: &FsviV2IdentityBinding,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.generation.partial_source_admit")?;
+        if authority.retained_image_bytes() > u64::try_from(max_image_bytes).unwrap_or(u64::MAX) {
+            return Err(refused("source-recovery", "encoded-image-limit"));
+        }
+        let components = admit_source_components_with_coverage(
+            cx,
+            authority.manifest(),
+            fast,
+            Some(quality),
+            EmbedderTierTag::Fast,
+            authority.lexical_bytes(),
+            &authority.metadata_bytes(),
+            VectorCohortCoverage::PartialQuality,
+            max_image_bytes,
+        )?;
+        let topology = components.partial_quality_topology()?;
+        checkpoint(cx, "native_ann.generation.partial_source_ready")?;
+        Ok(Self {
+            authority,
+            components,
+            primary: fast.clone(),
+            quality: Some(quality.clone()),
+            tier: EmbedderTierTag::Fast,
+            topology,
+        })
+    }
+
     /// Original source capability, including the exact publication expectation.
     #[must_use]
     pub const fn retained_source(&self) -> &Arc<OpenedGenerationSourceV1> {
@@ -395,6 +466,40 @@ impl NativeGenerationSource {
     #[must_use]
     pub const fn quality_binding(&self) -> Option<&FsviV2IdentityBinding> {
         self.quality.as_ref()
+    }
+
+    /// Exact authenticated quality membership for a partial source repair.
+    ///
+    /// IDs are returned in canonical lexicographic order. Membership is proven
+    /// by the source metadata or independently admitted retained vector rows;
+    /// historical physical vector counts alone never establish it.
+    ///
+    /// # Errors
+    /// Refuses nonpartial topology, absent membership, allocation failure or
+    /// cancellation without returning a partial list.
+    pub fn partial_quality_document_ids(&self, cx: &Cx) -> SearchResult<Vec<String>> {
+        checkpoint(cx, "native_ann.generation.partial_source_ids")?;
+        if !matches!(
+            self.topology,
+            NativeGenerationTopology::PartialQuality { .. }
+        ) {
+            return Err(refused("source-recovery", "partial-quality-required"));
+        }
+        let declared = self
+            .components
+            .partial_quality_document_ids
+            .as_ref()
+            .ok_or_else(|| refused("source-recovery", "quality-membership-required"))?;
+        let mut identifiers = Vec::new();
+        identifiers
+            .try_reserve_exact(declared.len())
+            .map_err(|_| refused("source-recovery", "source-allocation-failed"))?;
+        for id in declared {
+            checkpoint(cx, "native_ann.generation.partial_source_id")?;
+            identifiers.push(id.clone());
+        }
+        checkpoint(cx, "native_ann.generation.partial_source_ids_complete")?;
+        Ok(identifiers)
     }
 
     /// Recover all live documents in authenticated lexical generation order.
@@ -511,6 +616,7 @@ impl NativeGenerationQualityCompletionSource {
 struct SourceComponents {
     metadata: GenerationManifest,
     lexical: QuillSnapshotIndex,
+    partial_quality_document_ids: Option<Vec<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,9 +643,9 @@ fn admit_source_components(
     )
 }
 
-// Partial metadata is accepted only for retained-vector admission, which also
-// independently proves the FSVC subset, or explicit source-only full completion,
-// which makes no claim about the old subset and requires both replacement tiers.
+// Partial metadata is admitted for retained-vector repair, explicit full quality
+// completion, or subset-preserving source recovery with declared membership.
+// Present membership is checked even when a caller intends full completion.
 #[allow(clippy::too_many_arguments)]
 fn admit_source_components_with_coverage(
     cx: &Cx,
@@ -626,6 +732,7 @@ fn admit_source_components_with_coverage(
             "quality-coverage-contract-mismatch",
         ));
     }
+    let partial_quality_document_ids = declared_partial_quality_document_ids(cx, &metadata)?;
     let tier_count = if quality.is_some() { 2 } else { 1 };
     if metadata.vector_artifacts.len() != tier_count
         || metadata.lexical_artifacts.len() != 1
@@ -710,15 +817,49 @@ fn admit_source_components_with_coverage(
     );
     checkpoint(cx, "native_ann.generation.recovery_lexical")?;
     let lexical = admitted.map_err(|_| refused("source-recovery", "lexical-admission-failed"))?;
+    if let Some(identifiers) = &partial_quality_document_ids {
+        for id in identifiers {
+            checkpoint(cx, "native_ann.generation.recovery_quality_member")?;
+            if lexical
+                .resolve_document_id(id)
+                .map_err(|_| refused("source-recovery", "quality-membership-lookup-failed"))?
+                .is_none()
+            {
+                return Err(refused("source-recovery", "quality-membership-foreign-id"));
+            }
+        }
+    }
     let reader = QuillSnapshotIndex::new(cx, lexical, QuillConfig::default());
     checkpoint(cx, "native_ann.generation.recovery_reader")?;
     Ok(SourceComponents {
         metadata,
         lexical: reader.map_err(|_| refused("source-recovery", "lexical-reader-failed"))?,
+        partial_quality_document_ids,
     })
 }
 
 impl SourceComponents {
+    fn partial_quality_topology(&self) -> SearchResult<NativeGenerationTopology> {
+        let identifiers = self
+            .partial_quality_document_ids
+            .as_ref()
+            .ok_or_else(|| refused("source-recovery", "quality-membership-required"))?;
+        let quality_documents = u64::try_from(identifiers.len())
+            .map_err(|_| refused("source-recovery", "quality-coverage-overflow"))?;
+        let total_documents = self.metadata.total_documents;
+        if quality_documents == 0 || quality_documents >= total_documents {
+            return Err(refused("source-recovery", "quality-membership-not-partial"));
+        }
+        let coverage_ppm =
+            u32::try_from(u128::from(quality_documents) * 1_000_000 / u128::from(total_documents))
+                .map_err(|_| refused("source-recovery", "quality-coverage-overflow"))?;
+        Ok(NativeGenerationTopology::PartialQuality {
+            quality_documents,
+            total_documents,
+            coverage_ppm,
+        })
+    }
+
     fn source_documents(
         &self,
         cx: &Cx,
@@ -814,6 +955,7 @@ impl SourceComponents {
 
 #[cfg(test)]
 mod tests {
+    use super::super::NATIVE_QUALITY_DOCUMENT_IDS_KEY;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1121,6 +1263,126 @@ mod tests {
             assert!(
                 matches!(error, crate::SearchError::InvalidConfig { value, .. }
                 if value == "partial-quality-repair-unsupported")
+            );
+            assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn partial_source_repair_requires_canonical_authenticated_live_membership() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = fixture_with_coverage(
+                &cx,
+                EmbedderTierTag::Fast,
+                true,
+                NativeBuildRetrieval::Exact,
+                NativeBuildRetrieval::Exact,
+                false,
+                VectorCohortCoverage::PartialQuality,
+            )
+            .await;
+            let lexical = fixture
+                .built
+                .component_bytes(GenerationComponentRole::Lexical)
+                .unwrap();
+            let selected = fixture.candidate.manifest();
+            for encoded in [
+                None,
+                Some("null"),
+                Some("{}"),
+                Some("not-json"),
+                Some("[1]"),
+                Some("[]"),
+                Some("[\"\"]"),
+                Some("[\"alpha\",\"alpha\"]"),
+                Some("[\"beta\",\"alpha\"]"),
+                Some("[\"alpha\",\"beta\"]"),
+                Some("[ \"alpha\" ]"),
+                Some("[\"not-in-source\"]"),
+            ] {
+                let mut metadata = fixture.built.metadata().clone();
+                if let Some(encoded) = encoded {
+                    metadata.metadata.insert(
+                        NATIVE_QUALITY_DOCUMENT_IDS_KEY.to_owned(),
+                        encoded.to_owned(),
+                    );
+                } else {
+                    metadata.metadata.remove(NATIVE_QUALITY_DOCUMENT_IDS_KEY);
+                }
+                metadata.manifest_hash = compute_manifest_hash(&metadata).unwrap();
+                let metadata = serde_json::to_vec(&metadata).unwrap();
+                let manifest = reseal(
+                    &fixture,
+                    &metadata,
+                    selected.source_checkpoint_sha256(),
+                    selected.document_set_sha256(),
+                );
+                let source = admit_source_components_with_coverage(
+                    &cx,
+                    &manifest,
+                    fixture.built.binding(),
+                    fixture.built.quality_binding(),
+                    EmbedderTierTag::Fast,
+                    Arc::clone(&lexical),
+                    &metadata,
+                    VectorCohortCoverage::PartialQuality,
+                    BUDGET,
+                );
+                if encoded.is_none() {
+                    // Missing older metadata may still authorize explicit full
+                    // completion, but cannot claim the lost partial membership.
+                    assert!(matches!(
+                        source.unwrap().partial_quality_topology(),
+                        Err(SearchError::InvalidConfig { value, .. })
+                            if value == "quality-membership-required"
+                    ));
+                } else if encoded == Some("[\"not-in-source\"]") {
+                    assert!(matches!(
+                        source,
+                        Err(SearchError::InvalidConfig { value, .. })
+                            if value == "quality-membership-foreign-id"
+                    ));
+                } else {
+                    assert!(source.is_err(), "malformed membership {encoded:?}");
+                }
+            }
+
+            // Even a syntactically valid live subset cannot replace authenticated
+            // membership without changing the selected metadata receipt.
+            let mut changed = fixture.built.metadata().clone();
+            changed.metadata.insert(
+                NATIVE_QUALITY_DOCUMENT_IDS_KEY.to_owned(),
+                "[\"beta\"]".to_owned(),
+            );
+            changed.manifest_hash = compute_manifest_hash(&changed).unwrap();
+            assert!(matches!(
+                admit_source_components_with_coverage(
+                    &cx,
+                    selected,
+                    fixture.built.binding(),
+                    fixture.built.quality_binding(),
+                    EmbedderTierTag::Fast,
+                    lexical,
+                    &serde_json::to_vec(&changed).unwrap(),
+                    VectorCohortCoverage::PartialQuality,
+                    BUDGET,
+                ),
+                Err(SearchError::InvalidConfig { value, .. })
+                    if value == "component-image-mismatch"
+            ));
+            let valid = fixture.admit_for_completion(&cx, BUDGET).unwrap();
+            assert_eq!(
+                valid.partial_quality_document_ids.as_deref(),
+                Some(["alpha".to_owned()].as_slice()),
+            );
+            assert_eq!(
+                valid.partial_quality_topology().unwrap(),
+                NativeGenerationTopology::PartialQuality {
+                    quality_documents: 1,
+                    total_documents: 2,
+                    coverage_ppm: 500_000,
+                }
             );
             assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
@@ -1610,8 +1872,8 @@ mod tests {
             ExpectedAuthorityPairV1, PublicationOutcomeV1,
         };
         use frankensearch_index::generation_root::generation_reader::{
-            SnapshotHealthV1, SnapshotOpenOutcomeV1, VectorSourceOpenOutcomeV1,
-            activation_manifest_path_v1, component_object_path_v1,
+            SnapshotHealthV1, SnapshotOpenOutcomeV1, SourceOpenOutcomeV1,
+            VectorSourceOpenOutcomeV1, activation_manifest_path_v1, component_object_path_v1,
         };
         use frankensearch_index::generation_root::{
             GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout,
@@ -1771,6 +2033,215 @@ mod tests {
                 assert_eq!(old.flags(), new.flags());
                 assert_eq!(old.vector_bytes(), new.vector_bytes());
             }
+        }
+
+        #[test]
+        fn partial_source_repair_preserves_coverage_after_both_derived_images_are_damaged() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let fixture = fixture_with_coverage(
+                    &cx,
+                    EmbedderTierTag::Fast,
+                    true,
+                    hnsw(11),
+                    hnsw(29),
+                    false,
+                    VectorCohortCoverage::PartialQuality,
+                )
+                .await;
+                let (directory, root) = root();
+                let published = publish(
+                    &cx,
+                    &root,
+                    &fixture.built,
+                    &fixture.candidate,
+                    ExpectedAuthorityPairV1::default(),
+                    PROFILE,
+                    None,
+                )
+                .unwrap();
+                assert!(matches!(
+                    published.publication,
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+                let Some(GenerationActivationV1::Installed(opened)) = published.activation else {
+                    panic!("the partial fixture must publish a complete component closure");
+                };
+                let expected = opened.authority_pair();
+                drop(opened);
+                let selected = fixture.candidate.manifest();
+                let components = selected.components();
+                let vector_path = directory.path().join(component_object_name_v1(
+                    GenerationComponentRole::Vector,
+                    components.vector.sha256,
+                ));
+                let ann_path = directory.path().join(component_object_name_v1(
+                    GenerationComponentRole::Ann,
+                    components.ann.unwrap().sha256,
+                ));
+                damage(&vector_path, b"damaged partial vectors");
+                damage(&ann_path, b"damaged partial graphs");
+                let original_authority = fs::read(directory.path().join("AUTHORITY")).unwrap();
+                assert!(matches!(
+                    root.open_expected_generation_snapshot_with_budget(
+                        ROOT_ID,
+                        PROFILE,
+                        None,
+                        fixture.candidate.authority(),
+                        BUDGET as u64,
+                    )
+                    .unwrap(),
+                    SnapshotOpenOutcomeV1::Refused(_)
+                ));
+                let SourceOpenOutcomeV1::Opened(opened) = root
+                    .open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        PROFILE,
+                        None,
+                        fixture.candidate.authority(),
+                        fixture.built.binding().generation(),
+                        BUDGET as u64,
+                    )
+                    .unwrap()
+                else {
+                    panic!("healthy selected source remains recoverable without derived images");
+                };
+                let image_budget = usize::try_from(opened.retained_image_bytes()).unwrap();
+                let quality_binding = fixture.built.quality_binding().unwrap();
+                assert!(matches!(
+                    NativeGenerationSource::admit_partial_quality(
+                        &cx,
+                        Arc::clone(&opened),
+                        fixture.built.binding(),
+                        quality_binding,
+                        image_budget - 1,
+                    ),
+                    Err(SearchError::InvalidConfig { value, .. })
+                        if value == "encoded-image-limit"
+                ));
+                let source = NativeGenerationSource::admit_partial_quality(
+                    &cx,
+                    Arc::clone(&opened),
+                    fixture.built.binding(),
+                    quality_binding,
+                    image_budget,
+                )
+                .unwrap();
+                assert_eq!(source.retained_source().authority_pair(), expected);
+                assert_eq!(
+                    source.topology(),
+                    NativeGenerationTopology::PartialQuality {
+                        quality_documents: 1,
+                        total_documents: 2,
+                        coverage_ppm: 500_000,
+                    }
+                );
+                assert_eq!(source.partial_quality_document_ids(&cx).unwrap(), ["alpha"]);
+                assert!(source.source_documents(&cx, 1).is_err());
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    NativeGenerationSource::admit_partial_quality(
+                        &cx,
+                        opened,
+                        fixture.built.binding(),
+                        quality_binding,
+                        0,
+                    ),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert!(matches!(
+                    source.partial_quality_document_ids(&cx),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert!(matches!(
+                    source.source_documents(&cx, 0),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    fs::read(directory.path().join("AUTHORITY")).unwrap(),
+                    original_authority
+                );
+
+                let documents = source.source_documents(&cx, BUDGET).unwrap();
+                let repaired = NativeIndexBuilder::new(
+                    fixture.directory.path().join("partial-source-repair"),
+                    ArtifactGenerationIdentityV1::new(8, [0xc6; 16]).unwrap(),
+                    fixture.primary.clone(),
+                )
+                .unwrap()
+                .add_documents(documents)
+                .with_fast_storage(NativeBuildPrecision::F16, hnsw(101))
+                .with_quality_embedder(fixture.quality.clone())
+                .unwrap()
+                .with_quality_storage(NativeBuildPrecision::F32, hnsw(131))
+                .unwrap()
+                .build_partial_quality_generation(
+                    &cx,
+                    source.metadata().commit_range.clone(),
+                    source.partial_quality_document_ids(&cx).unwrap(),
+                    BUDGET,
+                )
+                .await
+                .unwrap();
+                assert_eq!(fixture.primary.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 1);
+                let candidate = repaired
+                    .candidate(
+                        [0xc7; 16],
+                        Some(fixture.candidate.authority()),
+                        GenerationAuthorityActionV1::Repair,
+                        [0xc8; 32],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    candidate.manifest().document_set_sha256(),
+                    selected.document_set_sha256()
+                );
+                assert_eq!(
+                    candidate.manifest().source_checkpoint_sha256(),
+                    selected.source_checkpoint_sha256()
+                );
+                repaired.validate_candidate(&cx, &candidate).unwrap();
+                let outcome =
+                    publish(&cx, &root, &repaired, &candidate, expected, PROFILE, None).unwrap();
+                assert!(matches!(
+                    outcome.publication,
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+                let Some(GenerationActivationV1::Installed(opened)) = outcome.activation else {
+                    panic!("repaired partial generation must publish");
+                };
+                drop(opened);
+                let SnapshotOpenOutcomeV1::Opened(opened) = root
+                    .open_expected_generation_snapshot_with_budget(
+                        ROOT_ID,
+                        PROFILE,
+                        None,
+                        candidate.authority(),
+                        BUDGET as u64,
+                    )
+                    .unwrap()
+                else {
+                    panic!("the repaired partial generation must reopen");
+                };
+                let reader = NativeGenerationSnapshot::admit_partial_quality(
+                    &cx,
+                    opened,
+                    repaired.binding(),
+                    repaired.quality_binding().unwrap(),
+                    DEFAULT_SCHEMA,
+                    QuillConfig::default(),
+                    BUDGET,
+                )
+                .unwrap();
+                assert_eq!(reader.topology(), source.topology());
+                assert_eq!(reader.partial_quality_document_ids(&cx).unwrap(), ["alpha"]);
+                assert_eq!(reader.source_documents(&cx, BUDGET).unwrap().len(), 2);
+                assert_eq!(fs::read(&vector_path).unwrap(), b"damaged partial vectors");
+                assert_eq!(fs::read(&ann_path).unwrap(), b"damaged partial graphs");
+            });
         }
 
         #[test]

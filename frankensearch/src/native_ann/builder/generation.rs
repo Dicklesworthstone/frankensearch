@@ -31,6 +31,7 @@ use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
 use super::super::generation::{
     NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY, NATIVE_QUALITY_COVERAGE_KEY,
+    NATIVE_QUALITY_DOCUMENT_IDS_KEY, encode_partial_quality_document_ids,
 };
 use super::super::{NativeRetrievalMode, checkpoint, invalid, lower_hex};
 use super::scope::PreparedNativeGenerationScope;
@@ -540,6 +541,10 @@ impl NativeIndexBuilder {
                 metadata.metadata.insert(
                     NATIVE_QUALITY_COVERAGE_KEY.to_owned(),
                     "partial_quality".to_owned(),
+                );
+                metadata.metadata.insert(
+                    NATIVE_QUALITY_DOCUMENT_IDS_KEY.to_owned(),
+                    encode_partial_quality_document_ids(cx, cohort.quality())?,
                 );
             }
             metadata.manifest_hash = compute_manifest_hash(&metadata)?;
