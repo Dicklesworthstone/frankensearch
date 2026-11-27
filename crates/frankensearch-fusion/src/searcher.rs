@@ -1602,7 +1602,7 @@ impl TwoTierSearcher {
     ) -> SearchResult<TwoTierMetrics> {
         cancellation_checkpoint(cx, "search_admission")?;
         let mut metrics = TwoTierMetrics::default();
-        let parse_query = || -> SearchResult<_> {
+        let prepare_query_shape = || -> SearchResult<_> {
             let canonical = self.canonicalizer.canonicalize_query(query);
             cancellation_checkpoint(cx, "query_shape_admission")?;
             let parsed = ParsedQuery::parse(&canonical);
@@ -1615,7 +1615,7 @@ impl TwoTierSearcher {
         // once. Empty requests and k=0 keep their strict topology admission.
         let preparsed_quality_query =
             (mode == SearchExecutionMode::QualityOnly && k > 0 && !query.is_empty())
-                .then(parse_query)
+                .then(prepare_query_shape)
                 .transpose()?;
         let quality_lexical_complement = preparsed_quality_query
             .as_ref()
@@ -1654,7 +1654,8 @@ impl TwoTierSearcher {
         }
 
         // Reuse quality-only preflight without running text transforms twice.
-        let (canon_query, parsed_query) = preparsed_quality_query.map_or_else(parse_query, Ok)?;
+        let (canon_query, parsed_query) =
+            preparsed_quality_query.map_or_else(prepare_query_shape, Ok)?;
         let lexical_complement = parsed_query.is_positive_empty() && parsed_query.has_negations();
         let quality_enabled = mode == SearchExecutionMode::Progressive
             && !lexical_complement
