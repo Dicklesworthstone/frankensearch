@@ -18,7 +18,9 @@ use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::adapters::live_search_session::LiveSearchRefreshConfig;
 use frankensearch_fsfs::adapters::retained_live_search::RetainedLiveSearchFrame;
 use frankensearch_fsfs::config::DegradationOverrideMode;
-use frankensearch_fsfs::generation_store::{CompleteGenerationStore, PublishedGeneration};
+use frankensearch_fsfs::generation_store::{
+    CompleteGenerationStore, PublishedGeneration, RETAINED_PREDECESSORS,
+};
 use frankensearch_fsfs::{CliCommand, CliInput, FsfsRuntime, OutputFormat};
 
 use super::hybrid::Subscription;
@@ -156,9 +158,11 @@ fn publication_runtime(runtime: &FsfsRuntime, options: &Options) -> SearchResult
             "lexical source watching requires forced lexical-only indexing",
         ));
     }
-    if options.max_updates.is_none_or(|maximum| maximum == 0) {
+    if options.max_updates == Some(0)
+        || (options.max_updates.is_none() && !options.collect_superseded)
+    {
         return Err(watch_error(
-            "a finite positive update limit is required; generations are retained",
+            "source watching requires a positive publication limit or explicit collection",
         ));
     }
     if runtime.config().search.shadow_mode {
@@ -326,6 +330,12 @@ pub(super) async fn execute_controlled<W: Write + Send>(
             ));
         }
         if publication {
+            // Query edits and failed/torn deliveries never authorize collection.
+            // The lease rechecks the delivered activation and pin before removal.
+            if options.collect_superseded {
+                store.collect_after_publication(cx, &generation, RETAINED_PREDECESSORS)?;
+                budget.check(cx)?;
+            }
             delivered = delivered
                 .checked_add(1)
                 .ok_or_else(|| watch_error("delivered generation counter exhausted"))?;

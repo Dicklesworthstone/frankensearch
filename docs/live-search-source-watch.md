@@ -26,7 +26,7 @@ ordinary indexer. Lexical watching uses the built-in discovery/privacy policies
 with lexical-only indexing forced; it does not load configuration or resolve
 either embedding model. Hybrid watching loads normal fsfs configuration (or
 `--config`) and requires already installed models. Both modes stay offline.
-It never edits source files, rewrites sealed predecessors, or deletes artifacts.
+By default the watcher preserves the source files and every published bundle.
 `--watch-source` is currently Unix-only. Without this explicit flag, `live-search`
 remains a read-only subscriber; `--config` still requires `--hybrid`.
 
@@ -48,19 +48,31 @@ source-stability checks. There is at most one undelivered publication receipt.
 A sink failure stops the entire command; there is no replay on a torn connection
 and no independently running publisher after the command exits.
 
-One of these limits is required: use `--once` to **build and query** one generation,
-or `--max-updates N` to stop
-after N complete publication/query cycles. Neither cuts off refinement just
-because Initial was delivered. `--limit` and `--min-score-delta` control the
+Use `--once` to build and query one generation or `--max-updates N` to stop
+after N complete publication/query cycles. To run continuously, opt into
+collection with `--collect-superseded`. Each mode delivers the complete
+phase sequence. `--limit` and `--min-score-delta` control the
 subscriber window as usual. Source timing belongs to the native watcher, so
 `--poll-ms`, `--debounce-ms` and `--max-wait-ms` are rejected in this mode rather
 than accepted without effect. Normal read-only subscriptions retain those flags.
 
-Every publication retains a complete bundle. The existing unbounded-retention
-issue (`bd-2op1d`) is not solved here: a finite successful-update limit is not a
-byte quota, does not count abandoned candidates, and does not prune old data.
-Budget disk space for full bundles and any failed builds. Indefinite unattended
-source watching is deliberately not enabled by this command.
+```sh
+fsfs live-search --watch-source ./documents --index-dir ./search-store \
+  --query 'connection pool' --collect-superseded
+```
+
+After the command flushes a complete publication update, `--collect-superseded`
+authorizes the store's collector to remove old bundles and abandoned builds.
+It keeps the selected generation, its most recently selected distinct
+predecessor, and bundles pinned by live readers in any process. This policy
+applies to the whole store, including bundles that predate the subscription.
+Query edits alone never run collection. You can combine collection with a
+publication limit. Omitting the flag preserves all bundles.
+
+If another publisher changes the selection before collection acquires the
+writer lease, the watcher stops. The delivered update remains valid for its
+generation. Long-lived reader pins, immutable activation history, and the size
+of a newly built generation can all increase disk use beyond two bundles.
 
 `--timeout-ms` and signals are cooperative, including while waiting for the next
 publication. They cannot preempt a synchronous syscall, query or output write.

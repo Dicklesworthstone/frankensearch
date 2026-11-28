@@ -244,6 +244,41 @@ fn lexical_watch_requires_an_explicit_finite_publication_limit() {
 }
 
 #[test]
+fn collect_superseded_allows_continuous_watch_and_protects_the_predecessor() {
+    let fixture = Fixture::new(None, false);
+    let mut process = Process::start(
+        fixture
+            .lexical_command(&fixture.source, &fixture.store)
+            .args(["--collect-superseded", "--timeout-ms", "120000"]),
+    );
+    let mut generations = Vec::new();
+    for i in 0..4 {
+        if i > 0 {
+            fs::write(
+                fixture.source.join(format!("item{i}.md")),
+                format!("sharedtoken {i}"),
+            )
+            .unwrap();
+        }
+        let frame = process.wait_for_frame(i);
+        assert_eq!(frame["sequence"], i + 1);
+        assert_eq!(frame["result_count"], i + 1);
+        let (id, _) = frame["generation"]
+            .as_str()
+            .unwrap()
+            .split_once('@')
+            .unwrap();
+        generations.push(fixture.store.join("generations").join(id));
+    }
+    // Delivering frame four requires the third publication's pass to finish.
+    // Either side of the fourth pass keeps its actual predecessor.
+    assert!(!generations[0].exists());
+    assert!(generations[2].join("FSFS-BUNDLE.json").is_file());
+    assert!(generations[3].join("FSFS-BUNDLE.json").is_file());
+    assert!(process.child.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn lexical_watch_bootstraps_without_models_or_configuration_and_stops_after_once() {
     let fixture = Fixture::new(None, false);
     let project_config = fixture.directory.path().join(".frankensearch");
@@ -359,6 +394,14 @@ fn lexical_native_watch_streams_creates_updates_and_removals_at_the_publication_
         }
     }
     let removed = &frames[3];
+    for frame in &frames {
+        let (id, _) = frame["generation"]
+            .as_str()
+            .unwrap()
+            .split_once('@')
+            .unwrap();
+        assert!(fixture.store.join("generations").join(id).is_dir());
+    }
     assert_eq!(removed["result_count"], 0);
     assert!(
         removed["changes"]

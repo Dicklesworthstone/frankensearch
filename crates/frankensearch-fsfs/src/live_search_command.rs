@@ -45,6 +45,8 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
   --config FILE           Hybrid configuration/model policy; requires --hybrid
   --tui                   Live terminal view and query editor (Unix terminals required)
   --watch-source DIR      Index and watch DIR, publishing successors (Unix)
+  --collect-superseded    After each delivered publication, collect old bundles;
+                          keep the active bundle, its predecessor and live readers
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
   --debounce-ms N         Quiet period before a refresh, 0..=60000 (default 100)
@@ -109,10 +111,12 @@ fixed-query subscription. Existing limits restore the terminal when they stop it
 It builds the initial generation, then streams each durable publication through
 the selected query pipeline. Default lexical watching needs no models and uses
 built-in discovery/privacy policies without loading configuration. --hybrid uses
-configured policies and already available models. Because complete generations
-are retained, --once or --max-updates is REQUIRED in this mode.
+configured policies and already available models. Choose --once, --max-updates,
+or --collect-superseded. With collection alone the watch runs until stopped.
 --once builds and queries once; --max-updates counts published generations, not
-phases. These limits are not a disk quota or automatic garbage collection.
+phases. These limits alone keep every bundle. Collection applies store-wide,
+including older unpinned generations and abandoned builds. Active reader pins
+defer removal, and activation history is retained. There is no byte quota.
 The native watcher owns source debounce/reconciliation; --poll-ms, --debounce-ms
 and --max-wait-ms are therefore refused in this mode. Query/output backpressure
 pauses new builds, not native change registration. Failed query/output or timeout
@@ -133,6 +137,7 @@ struct Options {
     hybrid: bool,
     config_path: Option<PathBuf>,
     watch_source: Option<PathBuf>,
+    collect_superseded: bool,
     tui: bool,
 }
 
@@ -151,6 +156,7 @@ impl Options {
         let mut hybrid = false;
         let mut config_path = None;
         let mut watch_source = None;
+        let mut collect_superseded = false;
         let mut tui = false;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
@@ -173,6 +179,7 @@ impl Options {
                     | "--hybrid"
                     | "--config"
                     | "--watch-source"
+                    | "--collect-superseded"
                     | "--tui"
             ) {
                 return Err(invalid("unknown argument; run fsfs live-search --help"));
@@ -190,6 +197,10 @@ impl Options {
             }
             if flag == "--tui" {
                 tui = true;
+                continue;
+            }
+            if flag == "--collect-superseded" {
+                collect_superseded = true;
                 continue;
             }
             let value = args
@@ -267,15 +278,18 @@ impl Options {
                 return Err(invalid("--tui cannot be combined with --format"));
             }
         }
+        if collect_superseded && watch_source.is_none() {
+            return Err(invalid("--collect-superseded requires --watch-source"));
+        }
         if watch_source.is_some() {
             if !cfg!(unix) {
                 return Err(invalid(
                     "--watch-source requires a Unix complete-generation watcher",
                 ));
             }
-            if !once && max_updates.is_none() {
+            if !once && max_updates.is_none() && !collect_superseded {
                 return Err(invalid(
-                    "--watch-source requires --once or --max-updates; retained generations are not garbage-collected",
+                    "--watch-source requires --once or --max-updates, or explicit --collect-superseded for continuous watching",
                 ));
             }
             if ["--poll-ms", "--debounce-ms", "--max-wait-ms"]
@@ -300,6 +314,7 @@ impl Options {
             hybrid,
             config_path,
             watch_source,
+            collect_superseded,
             tui,
         })
     }
@@ -599,17 +614,29 @@ mod tests {
         assert!(!options.hybrid);
         assert!(options.config_path.is_none());
         assert!(options.watch_source.is_none());
+        assert!(!options.collect_superseded);
     }
 
     #[cfg(unix)]
     #[test]
-    fn watch_requires_explicit_indexing_and_finite_limits_in_both_search_modes() {
+    fn watch_requires_a_publication_limit_or_explicit_collection_in_both_search_modes() {
         assert!(Options::parse(args(&["--watch-source", "/source"])).is_err());
         assert!(Options::parse(args(&["--watch-source", "/source", "--hybrid"])).is_err());
         let lexical = Options::parse(args(&["--watch-source", "/source", "--once"])).unwrap();
         assert!(!lexical.hybrid);
         assert_eq!(lexical.watch_source, Some(PathBuf::from("/source")));
         assert_eq!(lexical.max_updates, Some(1));
+        assert!(!lexical.collect_superseded);
+        assert!(Options::parse(args(&["--collect-superseded"])).is_err());
+        for hybrid in [false, true] {
+            let mut flags = vec!["--watch-source", "/source", "--collect-superseded"];
+            if hybrid {
+                flags.push("--hybrid");
+            }
+            let continuous = Options::parse(args(&flags)).unwrap();
+            assert!(continuous.collect_superseded);
+            assert!(continuous.max_updates.is_none());
+        }
         let options =
             Options::parse(args(&["--watch-source", "/source", "--hybrid", "--once"])).unwrap();
         assert_eq!(options.watch_source, Some(PathBuf::from("/source")));
