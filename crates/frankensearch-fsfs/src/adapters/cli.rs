@@ -356,10 +356,8 @@ impl CliInput {
             Some("authority receipt search runs locally and cannot use daemon options")
         } else if self.overrides.explain == Some(true) {
             Some("authority receipt search does not yet provide fsfs rank explanations")
-        } else if self.stream {
-            Some(
-                "authority receipt search returns one final page; omit --stream or use frankensearch-native authority-search for progressive streaming",
-            )
+        } else if self.stream && !matches!(self.format, OutputFormat::Jsonl | OutputFormat::Toon) {
+            Some("authority streaming requires --format jsonl or --format toon")
         } else if self.filter.is_some() || self.expand || self.compact {
             Some("authority receipt search does not support --filter, --expand or --compact")
         } else if self.model_name.is_some()
@@ -1652,7 +1650,7 @@ mod tests {
             );
             assert_eq!(input.authority_max_image_bytes, Some(1_048_576));
             assert_eq!(input.authority_max_source_bytes, Some(4096));
-            assert_eq!(input.overrides.limit, Some(0));
+            assert_eq!(input.overrides.limit, Some(usize::MAX));
             assert_eq!(input.overrides.fast_only, Some(false));
             assert_eq!(input.format, OutputFormat::Jsonl);
             assert!(!input.daemon);
@@ -1670,7 +1668,7 @@ mod tests {
         for extra in [
             vec!["--daemon"],
             vec!["--daemon-socket", "socket"],
-            vec!["--stream"],
+            vec!["--stream", "--format", "json"],
             vec!["--explain"],
             vec!["--compact"],
             vec!["--expand"],

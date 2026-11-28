@@ -237,6 +237,9 @@ pub struct StreamFrame<T> {
     pub ts: String,
     /// Command that emitted the frame (`search`).
     pub command: String,
+    /// Retained native selection and candidate evidence for this progress frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_authority: Option<serde_json::Value>,
     /// Event payload.
     #[serde(flatten)]
     pub event: StreamEvent<T>,
@@ -259,6 +262,7 @@ impl<T> StreamFrame<T> {
             seq,
             ts: ts.into(),
             command: command.into(),
+            native_authority: None,
             event,
         }
     }

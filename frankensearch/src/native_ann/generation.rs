@@ -1467,6 +1467,32 @@ impl NativeGenerationSnapshot {
         )
     }
 
+    /// Prepare a fast Initial page and subsequent quality refinement while the
+    /// quality model is still cold. Both vector owners and the lexical reader
+    /// come from this exact snapshot. On partial generations only covered
+    /// quality rows participate in refinement. After Initial, bind the loaded
+    /// provider with [`NativeProgressiveSearch::bind_deferred_quality`].
+    ///
+    /// # Errors
+    /// Refuses a generation without both tiers, a mismatched fast provider,
+    /// invalid budgets, or cancellation.
+    pub fn search_progressive_with_deferred_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let quality = match self.topology() {
+            NativeGenerationTopology::PartialQuality { .. } => self.readers.partial_quality()?,
+            _ => self.readers.full_quality()?,
+        };
+        Ok(self
+            .search_tier_progressive(cx, EmbedderTierTag::Fast, fast, text, k, pool)?
+            .with_deferred_quality(quality))
+    }
+
     /// Search the retained primary tier with vector traversal on the caller's
     /// pool. The job owns the admitted vector image; later publications cannot
     /// alter it. Inference, lexical scoring and hydration stay on their ordinary

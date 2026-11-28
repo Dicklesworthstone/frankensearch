@@ -78,21 +78,28 @@ hydration has a separate 16 MiB budget. `--authority-max-image-bytes` and
 `--authority-max-source-bytes` accept positive byte counts to change these
 bounds. They require `--authority-receipt`, as does `--authority-mode`.
 
-`search.quality_timeout_ms` supplies one quality budget covering model loading
-and every required query phase. Full and partial native queries admit both
-producers before Initial, so their Initial work also consumes this budget. The
-default is 500 ms; increase it in the configuration when cold quality loading
-needs more time. Expiration returns an error before any success payload.
+Buffered full and partial searches admit both producers before Initial.
+`search.quality_timeout_ms` covers quality model loading and every remaining
+required phase, including Initial for buffered queries. The default is 500 ms.
+
+For progressive results, use `--stream --format jsonl` or `--stream --format toon`.
+Full and partial streams admit the generation and fast producer, flush Initial
+results, then start the quality budget and load the quality producer. Refinement
+reuses the original candidate pools. Each progress frame carries a
+`native_authority` object with the phase, immutable selection, candidate counts
+and any partial coverage. Ranked result frames follow in page order. Loader
+failure, identity disagreement or deadline expiry after Initial preserves those
+delivered results and emits a failed terminal frame.
 
 Native publication, updates and recovery remain available through
 `frankensearch-native`. Unsupported ordinary fsfs options are refused before
-model work, including `--stream`, daemon transport, filesystem filters, query
+model work, including daemon transport, filesystem filters, query
 expansion and reranking. JSON, JSONL and TOON return the native result payload
 inside the normal fsfs envelope; table and CSV use the generic envelope
 rendering. The existing `fsfs explain` command is not a native rank-explanation
 adapter: the native fused result does not yet expose the original per-arm rank
-evidence needed by that command. The native CLI remains available for streaming,
-source scopes and retained-source reranking.
+evidence needed by that command. The native CLI also supports source scopes
+and retained-source reranking.
 
 ## Query exclusions
 

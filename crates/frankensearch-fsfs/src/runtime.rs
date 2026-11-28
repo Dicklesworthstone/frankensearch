@@ -30861,8 +30861,9 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               Add --authority-current-receipt HEAD to search an authenticated ancestor selected by --authority-receipt.
               --authority-mode lexical|fast|quality|full|partial selects its query tier; default follows the receipt (partial defaults to fast).
               --authority-max-image-bytes N (default 268435456) and --authority-max-source-bytes N (default 16777216) bound admission and hydration.
-              Native receipt search returns one final page with document IDs and retained-source snippets in any output format.
-              It supports --limit all and --no-fast-only, but not --stream, --explain, daemon, filter, recovery, or mutation options.
+              Native receipt search returns the final page, or emits live phases with --stream --format jsonl|toon.
+              Full and partial streams flush fast hits before loading quality. Each phase uses the same retained generation.
+              It supports --limit all and --no-fast-only, but not --explain, daemon, filter, recovery, or mutation options.
               --recover-source DIR --index-dir STORE always rebuilds locally, verifies the original query, then publishes and searches once.
               Recovery uses installed models by default. Add --acquire-models to download missing required models first; --offline still forbids acquisition.
               After provisioning, recovery captures the current selection; changes during rebuilding or preview prevent publication. It never retries automatically.

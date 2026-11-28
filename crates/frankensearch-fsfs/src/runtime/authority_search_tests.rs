@@ -1040,6 +1040,109 @@ fn authority_search_rejects_unsupported_runtime_policy_and_honors_quality_overri
 }
 
 #[test]
+fn authority_stream_flushes_initial_before_loading_quality_and_never_replays_fast() {
+    use std::io;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Transport {
+        pending: Vec<u8>,
+        flushed: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for Transport {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.pending.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.lock().unwrap().append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    fn frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    run_test_with_cx(|cx| async move {
+        for (topology, mode) in [(Topology::Full, "full"), (Topology::Partial, "partial")] {
+            let fixture = Fixture::new(&cx, topology).await;
+            for failure in [None, Some("load"), Some("identity")] {
+                fixture.fast.reset();
+                fixture.quality.reset();
+                let mut runtime = fixture.runtime(Some(mode), "semantic-query", 1);
+                runtime.cli_input.stream = true;
+                runtime.cli_input.format = OutputFormat::Jsonl;
+                let mut wire = Transport::default();
+                let flushed = Arc::clone(&wire.flushed);
+                let mut quality_loads = 0;
+                let result = runtime
+                    .run_authority_search_with_writer_and_loader(&cx, &mut wire, |tier| {
+                        if tier == EmbedderTierTag::Fast {
+                            return ready(Ok(fixture.fast.clone() as Arc<dyn Embedder>));
+                        }
+                        quality_loads += 1;
+                        let initial = frames(&flushed.lock().unwrap());
+                        let events: Vec<_> = initial
+                            .iter()
+                            .map(|v| v["event"].as_str().unwrap())
+                            .collect();
+                        assert_eq!(events, ["started", "progress", "result"]);
+                        assert_eq!(
+                            initial[1]["native_authority"]["authority"],
+                            serde_json::json!(fixture.receipt.authority)
+                        );
+                        assert_eq!(initial[1]["native_authority"]["phase"], "initial");
+                        assert_eq!(initial[2]["payload"]["item"]["doc_id"], "fast-leader");
+                        assert_eq!(fixture.quality.calls(), 0);
+                        ready(match failure {
+                            Some("load") => Err(SearchError::EmbedderUnavailable {
+                                model: "quality".into(),
+                                reason: "test load failure".into(),
+                            }),
+                            Some(_) => Ok(fixture.fast.clone() as Arc<dyn Embedder>),
+                            None => Ok(fixture.quality.clone() as Arc<dyn Embedder>),
+                        })
+                    })
+                    .await;
+                assert_eq!(quality_loads, 1);
+                assert_eq!(fixture.fast.calls(), 1);
+                let all = frames(&flushed.lock().unwrap());
+                for (seq, frame) in all.iter().enumerate() {
+                    assert_eq!(frame["seq"], seq);
+                    assert_eq!(frame["stream_id"], all[0]["stream_id"]);
+                }
+                let terminal = all.last().unwrap();
+                assert_eq!(terminal["event"], "terminal");
+                if failure.is_some() {
+                    assert!(result.is_err());
+                    assert_eq!(all.len(), 4);
+                    assert_eq!(terminal["payload"]["status"], "failed");
+                    assert_eq!(fixture.quality.calls(), 0);
+                } else {
+                    result.unwrap();
+                    assert_eq!(all.len(), 6);
+                    assert_eq!(all[3]["native_authority"]["phase"], "refined");
+                    assert_eq!(
+                        all[3]["native_authority"]["authority"],
+                        all[1]["native_authority"]["authority"]
+                    );
+                    assert_eq!(all[4]["event"], "result");
+                    assert_eq!(terminal["payload"]["status"], "completed");
+                    assert_eq!(fixture.quality.calls(), 1);
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn authority_search_quality_loading_obeys_the_virtual_deadline() {
     run_test_with_cx(|cx| async move {
         let fixture = Fixture::new(&cx, Topology::Quality).await;

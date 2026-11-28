@@ -62,6 +62,7 @@ impl NativeAnnIndex {
             cx,
             fast_embedder,
             quality,
+            deferred_quality: None,
             primary_quality: false,
             quality_owner: None,
             pool: None,
@@ -118,6 +119,7 @@ impl NativeAnnIndex {
             cx,
             fast_embedder,
             quality: quality.map(|(index, embedder)| (index.as_ref(), embedder)),
+            deferred_quality: None,
             primary_quality: false,
             quality_owner: quality.map(|(index, _)| Arc::clone(index)),
             pool: Some(pool),
@@ -243,6 +245,8 @@ pub struct NativeProgressiveSearch<'a> {
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeAnnIndex, &'a dyn Embedder)>,
+    // An admitted snapshot can pin the quality owner before its provider loads.
+    deferred_quality: Option<&'a Arc<NativeAnnIndex>>,
     // Set only after an admitted composite reader selects its quality owner.
     // This changes provenance, never the producer or owner admission boundary.
     primary_quality: bool,
@@ -270,6 +274,38 @@ pub struct NativeProgressiveSearch<'a> {
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_deferred_quality(
+        mut self,
+        owner: &'a Arc<NativeAnnIndex>,
+    ) -> Self {
+        self.deferred_quality = Some(owner);
+        self
+    }
+
+    /// Bind the provider for a retained snapshot's deferred quality tier.
+    /// The first phase needs only the fast producer. Call this before polling
+    /// refinement to reuse its complete fast and lexical candidate pools.
+    ///
+    /// # Errors
+    /// Refuses cancellation, an unrequested or already bound provider, or any
+    /// disagreement with either retained owner or the two-tier identity contract.
+    #[cfg(feature = "quill")]
+    pub fn bind_deferred_quality(&mut self, producer: &'a dyn Embedder) -> SearchResult<()> {
+        let owner = self.deferred_quality.ok_or_else(|| {
+            invalid(
+                "progressive.quality",
+                "not_deferred",
+                "no retained quality owner awaits a provider",
+            )
+        })?;
+        admit_pair(self.cx, self.fast, self.fast_embedder, (owner, producer))?;
+        self.quality = Some((owner, producer));
+        self.quality_owner = Some(Arc::clone(owner));
+        self.deferred_quality = None;
+        Ok(())
+    }
+
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) fn with_quality_primary(mut self) -> Self {
         debug_assert!(self.quality.is_none());
@@ -762,7 +798,7 @@ impl<'a> NativeProgressiveSearch<'a> {
             crate::native_ann::builder::scope::quality_provenance(self.cx, &mut results)?;
         }
         checkpoint(self.cx, "native_ann.progressive_initial_complete")?;
-        if self.quality.is_some() {
+        if self.quality.is_some() || self.deferred_quality.is_some() {
             self.state = State::Refine(PendingRefinement {
                 fast,
                 batch,
