@@ -3525,17 +3525,14 @@ impl TwoTierSearcher {
                 // check before any backend can manufacture tied zero scores.
                 let search_start = Instant::now();
                 let zero_fast_query = query_vec.iter().all(|&value| value == 0.0);
-                let activated_fast = owner_activation
-                    .as_ref()
-                    .filter(|_| self.uses_activated_fast_retrieval());
                 let mut fast_window = None;
                 let mut retrieve_fast = |limit| -> SearchResult<_> {
-                    let classified = if let Some(activated) = activated_fast {
-                        let (classified, window) = activated.search_with_candidate_window(
-                            EmbedderTierTag::Fast,
-                            limit,
-                            self.search_params,
-                        )?;
+                    let classified = if let Some(activated) = owner_activation.as_ref() {
+                        let (classified, window) = activated
+                            .search_configured_fast_with_candidate_window(
+                                limit,
+                                self.search_params,
+                            )?;
                         fast_window = Some(window);
                         classified
                     } else {
@@ -3714,9 +3711,9 @@ impl TwoTierSearcher {
                     && let Some(window) = fast_window
                 {
                     let coverage_start = Instant::now();
-                    cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
+                    cancellation_checkpoint(cx, "fast_filter_to_coverage")?;
                     metrics.coverage = Some(window.into_coverage(&fast_hits));
-                    cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
+                    cancellation_checkpoint(cx, "fast_coverage_to_fusion")?;
                     // Include coverage assembly without charging graph ranking
                     // to the vector-search timer.
                     metrics.vector_search_ms += coverage_start.elapsed().as_secs_f64() * 1000.0;
@@ -4082,11 +4079,11 @@ impl TwoTierSearcher {
                 revoked,
                 |limit| {
                     let classified = if let Some(evidence) = pools.fast_evidence.as_ref()
-                        && self.uses_activated_fast_retrieval()
+                        && self.index.fast_admitted_binding().is_some()
                     {
                         let embeddings = TieredQueryEmbeddings::fast_only(evidence.query.clone());
                         let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
-                        activated.search_fast_classified_with_params(limit, self.search_params)?
+                        activated.search_configured_fast_classified(limit, self.search_params)?
                     } else {
                         self.index.search_fast_classified_cancellable(
                             cx,
@@ -5279,13 +5276,6 @@ impl TwoTierSearcher {
         if let Some(exporter) = self.config.metrics_exporter.as_ref() {
             exporter.on_error(error);
         }
-    }
-
-    /// An owner without a native graph or exact override uses the configured
-    /// fast candidate generator.
-    fn uses_activated_fast_retrieval(&self) -> bool {
-        self.index.fast_admitted_binding().is_some()
-            && (self.search_params.is_some() || self.index.has_native_fast_hnsw())
     }
 
     /// Whether quality refinement should run.
@@ -10305,8 +10295,7 @@ mod tests {
                             quality.bound_embeds.load(Ordering::Relaxed),
                             u64::from(!fast_only)
                         );
-                        let fast_witnessed = layout == "native-v2" || exact_override;
-                        if layout == "stamped-v1" || (fast_only && !fast_witnessed) {
+                        if layout == "stamped-v1" {
                             assert!(metrics.coverage.is_none());
                             continue;
                         }
@@ -10317,12 +10306,7 @@ mod tests {
                             contributed_candidates: 2,
                         };
                         assert_eq!(
-                            coverage.fast,
-                            if fast_witnessed {
-                                tail_witness.clone()
-                            } else {
-                                frankensearch_core::TierQueryCoverageV1::NotRequested
-                            },
+                            coverage.fast, tail_witness,
                             "{layout}, exact={exact_override}"
                         );
                         assert_eq!(
@@ -13805,29 +13789,25 @@ mod tests {
                     "exact override {exact_override}"
                 );
                 assert!(results[0].fast_score.is_some());
-                if exact_override {
-                    let coverage = metrics
-                        .coverage
-                        .expect("exact fast coverage without a graph");
-                    assert_eq!(
-                        coverage.topology,
-                        frankensearch_core::RetrievalTopology::FastOnly
-                    );
-                    assert_eq!(
-                        coverage.fast,
-                        frankensearch_core::TierQueryCoverageV1::Witnessed {
-                            generation_sequence: 95,
-                            live_count: 2,
-                            contributed_candidates: 1,
-                        }
-                    );
-                    assert_eq!(
-                        coverage.quality,
-                        frankensearch_core::TierQueryCoverageV1::NotRequested
-                    );
-                } else {
-                    assert!(metrics.coverage.is_none());
-                }
+                let coverage = metrics
+                    .coverage
+                    .expect("retained fast owner has coverage without a graph");
+                assert_eq!(
+                    coverage.topology,
+                    frankensearch_core::RetrievalTopology::FastOnly
+                );
+                assert_eq!(
+                    coverage.fast,
+                    frankensearch_core::TierQueryCoverageV1::Witnessed {
+                        generation_sequence: 95,
+                        live_count: 2,
+                        contributed_candidates: 1,
+                    }
+                );
+                assert_eq!(
+                    coverage.quality,
+                    frankensearch_core::TierQueryCoverageV1::NotRequested
+                );
             }
         });
     }
@@ -13903,7 +13883,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut ids = ["a", "b", "c", "d"];
             ids.sort_by_key(|id| frankensearch_core::filter::fnv1a_hash(id.as_bytes()));
-            for layout in ["native-v2", "stamped-v1"] {
+            for layout in ["native-v2", "exact-v2", "stamped-v1"] {
                 let (_directory, mut index) = query_admission_index_with_rows(
                     layout,
                     &[("fast-only", &[1.0, 0.0, 0.0, 0.0])],
@@ -13976,7 +13956,7 @@ mod tests {
                     let SearchPhase::Refined { results, .. } = &phases[1] else {
                         panic!("missing Refined phase: {:?}", phases[1]);
                     };
-                    let exact = layout == "stamped-v1" || params.is_some();
+                    let exact = layout != "native-v2" || params.is_some();
                     assert_eq!(results.len(), 1);
                     assert_eq!(
                         results[0].doc_id,
@@ -14305,7 +14285,23 @@ mod tests {
                     assert!(quality.identity_count() >= 3);
                     assert_eq!(metrics.phase2_vectors_searched, 0);
                     assert_eq!(metrics.quality_search_ms.to_bits(), 0.0_f64.to_bits());
-                    assert!(metrics.coverage.is_none());
+                    let coverage = metrics.coverage.expect("Initial fast coverage");
+                    assert_eq!(
+                        coverage.topology,
+                        frankensearch_core::RetrievalTopology::FastOnly
+                    );
+                    assert_eq!(
+                        coverage.fast,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            generation_sequence: 59,
+                            live_count: 2,
+                            contributed_candidates: 2,
+                        }
+                    );
+                    assert_eq!(
+                        coverage.quality,
+                        frankensearch_core::TierQueryCoverageV1::NotRequested
+                    );
                 }
             }
         });
@@ -22057,10 +22053,7 @@ mod tests {
                         if mode != "progressive" {
                             assert_eq!(metrics.semantic_candidates, 2);
                         }
-                        if mode == "fast"
-                            && layout != "stamped-v1"
-                            && (exact_override || layout == "native-v2")
-                        {
+                        if mode == "fast" && layout != "stamped-v1" {
                             assert_eq!(
                                 metrics
                                     .coverage

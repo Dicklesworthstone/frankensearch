@@ -3488,17 +3488,29 @@ pub struct RankedCandidateWindow {
 }
 
 impl RankedCandidateWindow {
+    fn capture(
+        role: EmbedderTierTag,
+        tier: &ActivatedTier<'_, '_>,
+        hits: &[VectorHit],
+    ) -> SearchResult<Self> {
+        let window = Self {
+            tier: role,
+            hash_control: tier.query.identity().space.kind == EmbeddingSpaceKindV1::HashControl,
+            generation_sequence: tier.generation_sequence(),
+            live_count: tier.live_count(),
+            candidates: hits.iter().map(|hit| hit.doc_id.clone()).collect(),
+        };
+        tier_checkpoint(&tier.cx, "search_activation.candidate_window")?;
+        Ok(window)
+    }
+
     /// Count only distinct retained documents from this ranked window.
     #[must_use]
-    pub fn into_coverage(mut self, retained: &[VectorHit]) -> SearchCoverageV1 {
-        let contributed_candidates = retained
-            .iter()
-            .filter(|hit| self.candidates.remove(&hit.doc_id))
-            .count() as u64;
+    pub fn into_coverage(self, retained: &[VectorHit]) -> SearchCoverageV1 {
         let witnessed = TierQueryCoverageV1::Witnessed {
             generation_sequence: self.generation_sequence,
             live_count: self.live_count,
-            contributed_candidates,
+            contributed_candidates: count_contributed_candidates(self.candidates, retained),
         };
         let absent = TierQueryCoverageV1::NotRequested;
         let (topology, fast, quality) = match self.tier {
@@ -3515,6 +3527,13 @@ impl RankedCandidateWindow {
             quality,
         )
     }
+}
+
+fn count_contributed_candidates(mut served: BTreeSet<DocId>, retained: &[VectorHit]) -> u64 {
+    retained
+        .iter()
+        .filter(|hit| served.remove(&hit.doc_id))
+        .count() as u64
 }
 
 /// A validated activation over one or both tiers (bd-ctzo).
@@ -3650,19 +3669,70 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         params: Option<SearchParams>,
     ) -> SearchResult<(ClassifiedHits, RankedCandidateWindow)> {
         let (classified, tier) = self.search_tier_classified(role, k, params)?;
-        let window = RankedCandidateWindow {
-            tier: role,
-            hash_control: tier.query.identity().space.kind == EmbeddingSpaceKindV1::HashControl,
-            generation_sequence: tier.generation_sequence(),
-            live_count: tier.live_count(),
-            candidates: classified
-                .hits
-                .iter()
-                .map(|hit| hit.doc_id.clone())
-                .collect(),
-        };
-        tier_checkpoint(&tier.cx, "search_activation.candidate_window")?;
+        let window = RankedCandidateWindow::capture(role, tier, &classified.hits)?;
         Ok((classified, window))
+    }
+
+    /// Retrieve from the bound fast owner with the index's configured fast
+    /// backend. Explicit parameters select exact retrieval. Otherwise a
+    /// retained native graph takes priority over the regular fast backend.
+    /// # Errors
+    /// Returns the same errors as [`Self::search_fast`], or cancellation.
+    pub fn search_configured_fast_classified(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<ClassifiedHits> {
+        self.search_configured_fast(k, params)
+            .map(|(classified, _)| classified)
+    }
+
+    /// Capture the candidates served by [`Self::search_configured_fast_classified`].
+    /// # Errors
+    /// Returns the same errors as that search, or cancellation while capturing.
+    pub fn search_configured_fast_with_candidate_window(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<(ClassifiedHits, RankedCandidateWindow)> {
+        let (classified, tier) = self.search_configured_fast(k, params)?;
+        let window = RankedCandidateWindow::capture(EmbedderTierTag::Fast, tier, &classified.hits)?;
+        Ok((classified, window))
+    }
+
+    fn search_configured_fast(
+        &self,
+        k: usize,
+        params: Option<SearchParams>,
+    ) -> SearchResult<(ClassifiedHits, &ActivatedTier<'index, 'query>)> {
+        if params.is_some() || self.index.has_native_fast_hnsw() {
+            return self.search_tier_classified(EmbedderTierTag::Fast, k, params);
+        }
+        let tier = self.requested_tier(EmbedderTierTag::Fast)?;
+        // Activation and the configured search both read this index's single
+        // retained fast source. Use the query admitted to that source.
+        let classified = self.index.search_fast_classified_cancellable(
+            &tier.cx,
+            tier.query.vector(),
+            k,
+            None,
+        )?;
+        Ok((classified, tier))
+    }
+
+    fn requested_tier(
+        &self,
+        role: EmbedderTierTag,
+    ) -> SearchResult<&ActivatedTier<'index, 'query>> {
+        let (tier, name) = match role {
+            EmbedderTierTag::Fast => (self.fast.as_ref(), "fast"),
+            EmbedderTierTag::Quality => (self.quality.as_ref(), "quality"),
+        };
+        tier.ok_or_else(|| SearchError::InvalidConfig {
+            field: format!("search_activation.{name}"),
+            value: format!("{:?}", self.topology),
+            reason: format!("{name} retrieval requires an activated {name} tier"),
+        })
     }
 
     fn search_tier_classified(
@@ -3671,15 +3741,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<(ClassifiedHits, &ActivatedTier<'index, 'query>)> {
-        let (tier, name) = match role {
-            EmbedderTierTag::Fast => (self.fast.as_ref(), "fast"),
-            EmbedderTierTag::Quality => (self.quality.as_ref(), "quality"),
-        };
-        let tier = tier.ok_or_else(|| SearchError::InvalidConfig {
-            field: format!("search_activation.{name}"),
-            value: format!("{:?}", self.topology),
-            reason: format!("{name} retrieval requires an activated {name} tier"),
-        })?;
+        let tier = self.requested_tier(role)?;
         let classified = params.map_or_else(
             || tier.search_candidates(k),
             |params| tier.search_exact_classified(k, Some(params)),
@@ -3694,7 +3756,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// witnesses and the candidates actually returned (bd-ctzo C4).
     ///
     /// `returned` is the result set the caller is about to serve. Each tier's
-    /// contribution is COUNTED against it by canonical `doc_id` — not predicted
+    /// contribution counts distinct canonical `doc_id` values — not predicted
     /// from the requested `k`, not taken from a caller-supplied scalar, and
     /// not inferred from which tiers were activated. A tier that was
     /// activated but whose documents all lost the blend contributes zero, and
@@ -3743,38 +3805,30 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         let Some(tier) = tier else {
             return Ok(TierQueryCoverageV1::NotRequested);
         };
-        let served: BTreeSet<String> = params
+        let served = params
             .map_or_else(
                 || tier.search_candidates(k),
                 |params| tier.search_exact_classified(k, Some(params)),
             )?
             .hits
             .into_iter()
-            .map(|hit| hit.doc_id.to_string())
+            .map(|hit| hit.doc_id)
             .collect();
-        Ok(Self::coverage_from_candidates(
-            Some(tier),
-            &served,
-            returned,
-        ))
+        Ok(Self::coverage_from_candidates(Some(tier), served, returned))
     }
 
     fn coverage_from_candidates(
         tier: Option<&ActivatedTier<'index, 'query>>,
-        served: &BTreeSet<String>,
+        served: BTreeSet<DocId>,
         returned: &[VectorHit],
     ) -> TierQueryCoverageV1 {
         let Some(tier) = tier else {
             return TierQueryCoverageV1::NotRequested;
         };
-        let contributed = returned
-            .iter()
-            .filter(|hit| served.contains(hit.doc_id.as_str()))
-            .count();
         TierQueryCoverageV1::Witnessed {
             generation_sequence: tier.generation_sequence(),
             live_count: tier.live_count(),
-            contributed_candidates: contributed as u64,
+            contributed_candidates: count_contributed_candidates(served, returned),
         }
     }
 
@@ -3815,11 +3869,12 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         let mut served = [BTreeSet::new(), BTreeSet::new()];
         let union = self.search_union_by(k, |slot, tier| {
             let candidates = tier.search_top_k_filtered(k, filter, params)?;
-            served[slot].extend(candidates.hits.iter().map(|hit| hit.doc_id.to_string()));
+            served[slot].extend(candidates.hits.iter().map(|hit| hit.doc_id.clone()));
             Ok(candidates)
         })?;
-        let fast = Self::coverage_from_candidates(self.fast.as_ref(), &served[0], &union);
-        let quality = Self::coverage_from_candidates(self.quality.as_ref(), &served[1], &union);
+        let [fast_served, quality_served] = served;
+        let fast = Self::coverage_from_candidates(self.fast.as_ref(), fast_served, &union);
+        let quality = Self::coverage_from_candidates(self.quality.as_ref(), quality_served, &union);
         self.checkpoint()?;
         Ok((union, SearchCoverageV1::new(self.topology, fast, quality)))
     }
@@ -11678,6 +11733,18 @@ mod tests {
         assert_eq!(native_candidates.hits, approximate);
         assert_eq!(exact_candidates.hits, exact);
         assert_eq!(activated.topology(), RetrievalTopology::HashControl);
+        let retained = [exact[0].clone(), exact[0].clone(), approximate[0].clone()];
+        let replayed = activated
+            .coverage_with_params(&retained, 1, Some(SearchParams::default()))
+            .unwrap();
+        assert_eq!(
+            replayed.quality,
+            TierQueryCoverageV1::Witnessed {
+                generation_sequence: 72,
+                live_count: 4,
+                contributed_candidates: 1,
+            }
+        );
         // Coverage remains available after releasing the reader. A candidate
         // outside the native window and a repeated ID cannot inflate it.
         drop(index);

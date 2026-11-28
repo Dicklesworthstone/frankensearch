@@ -45,6 +45,14 @@
       "slice": "5 (C4)"
     },
     {
+      "crate": "frankensearch-index",
+      "file": "crates/frankensearch-index/src/two_tier.rs",
+      "symbol": "pub fn search_configured_fast_with_candidate_window",
+      "kind": "capture-configured-fast-candidates",
+      "consumes": ["ActivatedTierSearch", "RankedCandidateWindow"],
+      "slice": "5 (C4)"
+    },
+    {
       "crate": "frankensearch-fusion",
       "file": "crates/frankensearch-fusion/src/refresh.rs",
       "symbol": "pub fn activate_search",
@@ -67,12 +75,12 @@
       "kind": "async-fast-retrieval",
       "consumes": ["TieredQueryEmbeddings", "ActivatedTierSearch"],
       "slice": "4a (C1)",
-      "note": "The single fast activation admits the actual response and serves native or explicitly requested full-width retrieval."
+      "note": "The fast activation admits the actual response and serves the configured backend or an explicit exact override."
     },
     {
       "crate": "frankensearch-fusion",
       "file": "crates/frankensearch-fusion/src/searcher.rs",
-      "symbol": "async fn reconcile_refinement_vectors",
+      "symbol": "async fn reconcile_refinement_fast",
       "kind": "async-fast-refill",
       "consumes": ["BoundQueryEmbedding", "ActivatedTierSearch"],
       "slice": "4a (C1)",
@@ -106,7 +114,7 @@
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": "activate_owner_backed_search",
       "count": 5,
-      "note": "run_phase1 reuses the activation that admitted the fast response. reconcile_refinement_vectors activates the original fast query for native or explicit exact refills. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation."
+      "note": "run_phase1 reuses the activation that admitted the fast response. reconcile_refinement_fast activates the original bound query for fast refills. run_phase2 admits the quality response before PRF and activates the final quality query for retrieval, eligibility reconciliation, and coverage. Direct quality-only retrieval has its own activation."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
@@ -122,8 +130,20 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".search_with_candidate_window(",
-      "count": 3,
-      "note": "Phase 1 fast, direct quality-only, and progressive quality retain the ranked candidates from the last admitted retrieval."
+      "count": 2,
+      "note": "Direct quality-only and progressive quality retain the ranked candidates from the last admitted retrieval."
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "callee": ".search_configured_fast_with_candidate_window(",
+      "count": 1,
+      "note": "Phase 1 fast captures the candidates served by the configured backend."
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "callee": ".search_configured_fast_classified(",
+      "count": 1,
+      "note": "Late fast refills replay the configured backend using the request's original bound embedding."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
