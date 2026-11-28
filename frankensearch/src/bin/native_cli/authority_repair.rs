@@ -121,45 +121,55 @@ pub(super) fn validate_options(options: &Options) -> Result<()> {
             "--reuse-vectors cannot be combined with model options, --complete-quality, or --migrate-model",
         ));
     }
-    match options.retrieval {
-        Some(NativeBuildRetrieval::Exact)
-            if vectors.primary_seed.is_none() && vectors.quality_seed.is_none() =>
-        {
-            Ok(())
+    requested_policies(options).map(|_| ())
+}
+
+/// Both source and retained-vector repairs need an explicit seed for each graph.
+/// Two graphs may share the requested primary seed for backwards compatibility.
+fn requested_policies(options: &Options) -> Result<(NativeBuildRetrieval, NativeBuildRetrieval)> {
+    let primary = options
+        .retrieval
+        .ok_or_else(|| bad("authority-repair requires explicit --retrieval exact or hnsw"))?;
+    let quality = options.quality_retrieval.unwrap_or(primary);
+    let primary_seed = options.repair_vectors.primary_seed;
+    let quality_seed = options.repair_vectors.quality_seed;
+    let primary = match (primary, primary_seed) {
+        (NativeBuildRetrieval::Exact, None) => NativeBuildRetrieval::Exact,
+        (NativeBuildRetrieval::Hnsw { params, .. }, Some(seed)) => {
+            NativeBuildRetrieval::Hnsw { params, seed }
         }
-        Some(NativeBuildRetrieval::Hnsw { .. }) if vectors.primary_seed.is_some() => Ok(()),
-        _ => Err(bad(
-            "authority-repair requires explicit --retrieval exact without seeds or --retrieval hnsw with --hnsw-seed",
-        )),
-    }
+        _ => {
+            return Err(bad(
+                "--hnsw-seed is required for primary HNSW repair and forbidden for primary exact repair",
+            ));
+        }
+    };
+    let quality = match quality {
+        NativeBuildRetrieval::Exact if quality_seed.is_none() => NativeBuildRetrieval::Exact,
+        NativeBuildRetrieval::Exact => {
+            return Err(bad("--quality-hnsw-seed requires quality HNSW retrieval"));
+        }
+        NativeBuildRetrieval::Hnsw { params, .. } => NativeBuildRetrieval::Hnsw {
+            params,
+            seed: quality_seed.or(primary_seed).ok_or_else(|| {
+                bad("quality HNSW repair with an exact primary requires --quality-hnsw-seed")
+            })?,
+        },
+    };
+    Ok((primary, quality))
 }
 
 fn vector_policies(
     options: &Options,
     selected: &Receipt,
 ) -> Result<(NativeBuildRetrieval, Option<NativeBuildRetrieval>)> {
-    if options.repair_vectors.quality_seed.is_some() && selected.quality_identity.is_none() {
+    let two_tiers = selected.quality_identity.is_some();
+    options.validate_quality_retrieval(two_tiers)?;
+    if options.repair_vectors.quality_seed.is_some() && !two_tiers {
         return Err(bad("--quality-hnsw-seed requires a two-tier selection"));
     }
-    let primary = match options.retrieval {
-        Some(NativeBuildRetrieval::Exact) => NativeBuildRetrieval::Exact,
-        Some(NativeBuildRetrieval::Hnsw { params, .. }) => NativeBuildRetrieval::Hnsw {
-            params,
-            seed: options
-                .repair_vectors
-                .primary_seed
-                .ok_or_else(|| bad("missing --hnsw-seed"))?,
-        },
-        None => return Err(bad("missing explicit repair retrieval policy")),
-    };
-    let quality = selected.quality_identity.as_ref().map(|_| match primary {
-        NativeBuildRetrieval::Exact => NativeBuildRetrieval::Exact,
-        NativeBuildRetrieval::Hnsw { params, seed } => NativeBuildRetrieval::Hnsw {
-            params,
-            seed: options.repair_vectors.quality_seed.unwrap_or(seed),
-        },
-    });
-    Ok((primary, quality))
+    let (primary, quality) = requested_policies(options)?;
+    Ok((primary, two_tiers.then_some(quality)))
 }
 
 pub(super) async fn run(

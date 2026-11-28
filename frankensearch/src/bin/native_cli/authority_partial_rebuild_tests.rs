@@ -19,6 +19,103 @@ fn options(parent: &Path, predecessor: &Path, label: &str) -> Options {
 }
 
 #[test]
+fn mixed_retrieval_index_and_rebuild_reopen_and_search_partial_coverage() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let parent = private_parent();
+        let fast = provider(false);
+        let quality = provider(true);
+        let mut index_args = index_arguments();
+        let tier = index_args
+            .iter()
+            .position(|value| *value == "fast")
+            .unwrap();
+        index_args[tier] = "partial";
+        index_args.extend([
+            "--quality-ids",
+            r#"["quality"]"#,
+            "--retrieval",
+            "hnsw",
+            "--quality-retrieval",
+            "exact",
+        ]);
+        let mut initial = parse(&index_args).unwrap().unwrap();
+        let fixture = partial_index_options(&parent, false);
+        initial.root = fixture.root;
+        initial.work = fixture.work;
+        initial.receipt = fixture.receipt;
+        initial.input = fixture.input;
+        let mut output = Vec::new();
+        index_with_loader(&cx, &initial, &mut output, |_| Ok(models(&fast, &quality)))
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["retrieval"], "mixed");
+        assert_eq!(
+            report["retrieval_by_tier"],
+            serde_json::json!({"fast":"hnsw","quality":"exact"})
+        );
+        let original = Receipt::read(&initial.receipt)
+            .unwrap()
+            .open(&cx, DEFAULT_IMAGE_BYTES)
+            .unwrap();
+        let graph = original.retrieval_configuration();
+        assert!(matches!(graph, NativeBuildRetrieval::Hnsw { .. }));
+        assert_eq!(
+            original.quality_retrieval_configuration(),
+            Some(NativeBuildRetrieval::Exact)
+        );
+
+        let mut rebuild_args = retained_rebuild_arguments();
+        rebuild_args.extend(["--retrieval", "exact", "--quality-retrieval", "hnsw"]);
+        let mut rebuild = parse(&rebuild_args).unwrap().unwrap();
+        rebuild.work = Some(parent.join("reverse-work"));
+        rebuild.from_receipt = Some(initial.receipt);
+        rebuild.receipt = parent.join("reverse.json");
+        let before = calls(&fast, &quality);
+        output.clear();
+        rebuild_with_loader(&cx, &rebuild, &mut output, |_| Ok(models(&fast, &quality)))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls(&fast, &quality),
+            before,
+            "changing graphs reuses partial embeddings"
+        );
+        let reopened = Receipt::read(&rebuild.receipt)
+            .unwrap()
+            .open(&cx, DEFAULT_IMAGE_BYTES)
+            .unwrap();
+        assert_eq!(
+            reopened.retrieval_configuration(),
+            NativeBuildRetrieval::Exact
+        );
+        assert_eq!(reopened.quality_retrieval_configuration(), Some(graph));
+        assert_eq!(
+            reopened.partial_quality_document_ids(&cx).unwrap(),
+            ["quality"]
+        );
+        output.clear();
+        let query = partial_search_options(&rebuild.receipt, Some(QueryMode::Partial));
+        search_with_loader(&cx, &query, &mut output, |tier| {
+            Ok(if tier == EmbedderTierTag::Fast {
+                fast.clone()
+            } else {
+                quality.clone()
+            })
+        })
+        .await
+        .unwrap();
+        let phases = frames(&output);
+        assert_eq!(phases[1]["phase"], "refined");
+        assert_eq!(
+            phases[1]["retrieval_by_tier"],
+            serde_json::json!({"fast":"exact","quality":"hnsw"})
+        );
+        assert_eq!(phases[1]["results"].as_array().unwrap().len(), 3);
+    });
+}
+
+#[test]
 fn partial_retained_rebuild_migrates_each_producer_without_expanding_coverage() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         for ann in [false, true] {

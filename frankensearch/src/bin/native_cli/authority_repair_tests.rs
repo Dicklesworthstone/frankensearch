@@ -186,6 +186,43 @@ fn retained_vector_repair_requires_explicit_graph_seeds_and_excludes_models() {
     );
 }
 
+#[test]
+fn mixed_retrieval_repair_requires_seeds_for_exactly_the_graph_tiers() {
+    for (primary, quality, seed_flag) in [
+        ("exact", "hnsw", "--quality-hnsw-seed"),
+        ("hnsw", "exact", "--hnsw-seed"),
+    ] {
+        let mut args = arguments();
+        *args.last_mut().unwrap() = primary.into();
+        args.extend(["--quality-retrieval", quality].map(str::to_owned));
+        assert!(Options::parse(args.clone()).is_err());
+        args.extend([seed_flag, "77"].map(str::to_owned));
+        let options = Options::parse(args.clone()).unwrap().unwrap();
+        let (fast_policy, quality_policy) = requested_policies(&options).unwrap();
+        for (requested, actual) in [(primary, fast_policy), (quality, quality_policy)] {
+            match actual {
+                NativeBuildRetrieval::Exact => assert_eq!(requested, "exact"),
+                NativeBuildRetrieval::Hnsw { seed, .. } => {
+                    assert_eq!(requested, "hnsw");
+                    assert_eq!(seed, 77);
+                }
+            }
+        }
+        args.extend(
+            [
+                if primary == "exact" {
+                    "--hnsw-seed"
+                } else {
+                    "--quality-hnsw-seed"
+                },
+                "88",
+            ]
+            .map(str::to_owned),
+        );
+        assert!(Options::parse(args).is_err());
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod lifecycle {
     use super::super::super::{
@@ -1496,6 +1533,61 @@ mod lifecycle {
                     }
                 );
             }
+        });
+    }
+
+    #[test]
+    fn mixed_retrieval_repair_replaces_damaged_graph_and_reopens_both_arms() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture =
+                fixture(&cx, NativeGenerationTopology::FullProgressive, true, false).await;
+            damage(&cx, &fixture, GenerationComponentRole::Ann, true);
+            assert!(fixture.selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            let mut args = arguments();
+            args.extend(
+                [
+                    "--quality-retrieval",
+                    "hnsw",
+                    "--quality-hnsw-seed",
+                    "871",
+                    "--reuse-vectors",
+                ]
+                .map(str::to_owned),
+            );
+            let mut options = Options::parse(args).unwrap().unwrap();
+            options.from_receipt = Some(fixture.parent.join("selected.json"));
+            options.work = Some(fixture.parent.join("mixed-repair-work"));
+            options.receipt = fixture.parent.join("mixed-repair.json");
+            let mut output = Vec::new();
+            with_loader(&cx, &options, &mut output, |_| {
+                Err(bad("unexpected model loading"))
+            })
+            .await
+            .unwrap();
+            let restored = Receipt::read(&options.receipt)
+                .unwrap()
+                .open(&cx, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            assert_eq!(
+                restored.retrieval_configuration(),
+                NativeBuildRetrieval::Exact
+            );
+            assert!(matches!(
+                restored.quality_retrieval_configuration(),
+                Some(NativeBuildRetrieval::Hnsw { seed: 871, .. })
+            ));
+            let quality = fixture.quality.as_ref().unwrap();
+            let hits = restored
+                .search_refined_text(&cx, fixture.primary.as_ref(), quality.as_ref(), "retry", 2)
+                .await
+                .unwrap();
+            assert_eq!(hits[0].doc_id, "retry");
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                report["retrieval_by_tier"],
+                serde_json::json!({"fast":"exact", "quality":"hnsw"})
+            );
+            assert_eq!(report["vectors_reused"], true);
         });
     }
 

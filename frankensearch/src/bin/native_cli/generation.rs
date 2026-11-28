@@ -90,7 +90,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--quality-ids '[\"document-a\",\"document-b\"]' (required for partial)]\n\
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
-      [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
+      [--quality-model-dir DIR] [--retrieval exact|hnsw] [--quality-retrieval exact|hnsw]\n\
+      [--max-image-bytes N]\n\n\
   authority-complete-quality --from-receipt INCOMPLETE_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       [--quality-ids '[\"document-a\",\"document-b\"]' (complete successor subset)]\n\
       [--max-new-quality-documents N (automatic next batch; excludes --quality-ids)]\n\
@@ -101,7 +102,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       (--source-low N --source-high N [--input JSONL] | --retained-source)\n\
       [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\
+      [--migrate-model] [--retrieval exact|hnsw] [--quality-retrieval exact|hnsw]\n\
+      [--max-image-bytes N]\n\
       [--query TEXT --rollback-receipt NEW_JSON [--mode partial]\n\
        [--filter JSON] [--limit N] [--stream] [--timeout-ms N]\n\
        [--full-query JSON] [--reranker-dir DIR] [--rerank-window N]]\n\n\
@@ -111,7 +113,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, full, or par
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-repair --from-receipt DAMAGED_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --retrieval exact|hnsw [--reuse-vectors]\n\
+      --retrieval exact|hnsw [--quality-retrieval exact|hnsw] [--reuse-vectors]\n\
       [--complete-quality] [--migrate-model]\n\
       [--hnsw-seed N] [--quality-hnsw-seed N]\n\
       [--model-dir DIR] [--quality-backend BACKEND]\n\
@@ -165,7 +167,10 @@ Lexical requests skip reranking. Request tuning requires request_overrides:true\
 in the server --full-query and an envelope {\"op\":\"search\",\"request\":{...},\n\
 \"full_query\":{...}}. Overrides cannot increase server candidate, beam or rerank\n\
 limits, change models/source scope, or extend its timeout ceiling.\n\
---retrieval selects both configured tiers; sharded authority cohorts remain unsupported.\n\
+For index, rebuild and repair, --retrieval sets the shared policy. In full or\n\
+partial generations, --quality-retrieval overrides it for the quality tier.\n\
+Rebuild with only --quality-retrieval retains the prior primary configuration.\n\
+New tiers default to exact. Sharded authority cohorts remain unsupported.\n\
 --tier partial requires --quality-ids with a nonempty proper subset of source IDs.\n\
 Fast vectors and stored source cover every document; quality vectors cover exactly\n\
 the selected IDs. Failed inference aborts the build without dropping requested IDs.\n\
@@ -243,10 +248,10 @@ uses authenticated quality membership in metadata, embedding every fast document
 and only the original quality subset. Historical metadata without membership\n\
 requires healthy --reuse-vectors or explicit --complete-quality. The latter\n\
 rebuilds full coverage even when the original partial vectors are damaged.\n\
-HNSW requires\n\
---hnsw-seed: choose a fresh seed so the rebuilt graph has a new immutable object\n\
-address. --quality-hnsw-seed selects an independent full-tier seed; otherwise it\n\
-uses --hnsw-seed. A repeated old whole-graph receipt is refused before staging.\n\
+For primary HNSW supply --hnsw-seed. A quality graph accepts its own\n\
+--quality-hnsw-seed, required when the primary uses exact retrieval. If both\n\
+tiers use HNSW they may share the primary seed. Choose fresh seeds to give\n\
+the repaired graph a new immutable address before staging.\n\
 Seed flags require HNSW, and --reuse-vectors excludes model directory/backend\n\
 options, --complete-quality and --migrate-model. Repair accepts no replacement\n\
 input or source advancement. Topology changes require explicit partial completion.\n\
@@ -497,6 +502,7 @@ struct Options {
     rerank_window: usize,
     query_cache: query_cache::Config,
     retrieval: Option<NativeBuildRetrieval>,
+    quality_retrieval: Option<NativeBuildRetrieval>,
     repair_vectors: repair::RetainedVectorOptions,
     source_low: Option<u64>,
     source_high: Option<u64>,
@@ -582,6 +588,7 @@ impl Options {
             rerank_window: 50,
             query_cache: query_cache::Config::default(),
             retrieval: None,
+            quality_retrieval: None,
             repair_vectors: repair::RetainedVectorOptions::default(),
             source_low: None,
             source_high: None,
@@ -809,23 +816,23 @@ impl Options {
                 {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
-                "--retrieval"
-                    if matches!(
-                        command,
-                        Command::Index
-                            | Command::CompleteQuality
-                            | Command::Rebuild
-                            | Command::Repair
-                    ) =>
+                "--retrieval" | "--quality-retrieval"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Repair)
+                        || (command == Command::CompleteQuality && flag == "--retrieval") =>
                 {
-                    options.retrieval = Some(match value(&mut args)?.as_str() {
+                    let policy = match value(&mut args)?.as_str() {
                         "exact" => NativeBuildRetrieval::Exact,
                         "hnsw" => NativeBuildRetrieval::Hnsw {
                             params: HnswParams::default(),
                             seed: 42,
                         },
                         _ => return Err(bad("authority retrieval must be exact or hnsw")),
-                    });
+                    };
+                    if flag == "--quality-retrieval" {
+                        options.quality_retrieval = Some(policy);
+                    } else {
+                        options.retrieval = Some(policy);
+                    }
                 }
                 "--reuse-vectors" if command == Command::Repair => {
                     options.repair_vectors.reuse_vectors = true;
@@ -968,6 +975,7 @@ impl Options {
                 if options.partial_quality != options.quality_ids.is_some() {
                     return Err(bad("--tier partial and --quality-ids require each other"));
                 }
+                options.validate_quality_retrieval(options.progressive || options.partial_quality)?;
                 options.quality.validate_usage(
                     tier == EmbedderTierTag::Quality
                         || options.progressive
@@ -1094,6 +1102,23 @@ impl Options {
 
     fn build_retrieval(&self, previous: Option<NativeBuildRetrieval>) -> NativeBuildRetrieval {
         self.retrieval.or(previous).unwrap_or_default()
+    }
+
+    fn build_quality_retrieval(
+        &self,
+        previous: Option<NativeBuildRetrieval>,
+    ) -> NativeBuildRetrieval {
+        self.quality_retrieval
+            .or(self.retrieval)
+            .or(previous)
+            .unwrap_or_default()
+    }
+
+    fn validate_quality_retrieval(&self, two_tiers: bool) -> Result<()> {
+        if self.quality_retrieval.is_some() && !two_tiers {
+            return Err(bad("--quality-retrieval requires a two-tier selection"));
+        }
+        Ok(())
     }
 
     fn rebuild_source_cut(&self, previous: &CommitRange) -> Result<CommitRange> {
@@ -2117,7 +2142,7 @@ where
     if let Some(quality) = loaded.quality {
         builder = builder
             .with_quality_embedder(quality)?
-            .with_quality_storage(NativeBuildPrecision::F32, options.build_retrieval(None))?;
+            .with_quality_storage(NativeBuildPrecision::F32, options.build_quality_retrieval(None))?;
     }
     let built = if options.partial_quality {
         builder
@@ -2374,6 +2399,7 @@ where
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
     let partial_quality = selected.quality_documents.is_some();
+    options.validate_quality_retrieval(selected.quality_identity.is_some())?;
     if partial_quality && !options.retained_source {
         return Err(serve_refused(
             "partial_quality_rebuild_requires_retained_source",
@@ -2415,7 +2441,7 @@ where
     let retrieval = options.build_retrieval(Some(snapshot.retrieval_configuration()));
     let quality_retrieval = snapshot
         .quality_retrieval_configuration()
-        .map(|previous| options.build_retrieval(Some(previous)));
+        .map(|previous| options.build_quality_retrieval(Some(previous)));
     let source = options.rebuild_source_cut(&snapshot.metadata().commit_range)?;
     validate_successor_source(&snapshot.metadata().commit_range, &source)?;
     let sequence = selected

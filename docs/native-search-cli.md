@@ -205,8 +205,11 @@ vector and lexical images together, including deferred result metadata.
 Choose `--tier fast`, `--tier quality`, `--tier full`, or explicit `--tier partial`
 with `--quality-ids`. Full generations contain both complete tiers; partial
 generations retain the complete fast corpus and the selected quality subset.
-`--retrieval exact|hnsw` selects the vector search policy for
-every stored tier; new indexes default to `exact`. HNSW uses the native engine's
+`--retrieval exact|hnsw` selects the shared vector search policy. Full and
+partial generations also accept `--quality-retrieval exact|hnsw` to choose
+independently for the quality tier. For example, `--retrieval hnsw
+--quality-retrieval exact` builds a graph for fast retrieval and scans the
+quality vectors exactly. New indexes default to `exact`. HNSW uses the native engine's
 default parameters and deterministic seed 42. Graphs are published through the
 optional ANN component. For a full generation, a versioned image contains each
 selected tier's graph. Each graph's complete native receipt is authenticated
@@ -615,7 +618,9 @@ its full HNSW parameter set and seed authenticated by its native receipt. A full
 generation with exact fast retrieval and HNSW quality retrieval keeps that pair
 when no override is supplied. Supply `--retrieval exact` to deliberately select
 exact scans for every tier, or `--retrieval hnsw` to select the default HNSW
-configuration for every tier. Replacement graphs are built from the new complete
+configuration for every tier. On a two-tier rebuild, an explicit
+`--quality-retrieval` takes precedence for the quality tier. Specifying it alone
+keeps the primary tier's existing graph parameters and seed. Replacement graphs are built from the new complete
 cohort; retained previous readers keep their original graphs and vectors.
 
 Every loaded provider must match its selected complete identity before embedding
@@ -858,11 +863,14 @@ Choose retrieval explicitly. To restore native ANN retrieval after vector loss:
 
 Both full and partial two-tier generations require their matching quality model
 options.
-`--quality-hnsw-seed` optionally selects an independent quality graph seed;
-otherwise both tiers use `--hnsw-seed`. HNSW uses the default construction
+For primary HNSW, supply `--hnsw-seed`. An HNSW quality tier accepts a separate
+`--quality-hnsw-seed` or uses the primary graph's seed. For example, repair with
+`--retrieval exact --quality-retrieval hnsw --quality-hnsw-seed 31` builds only
+a quality graph. Each exact tier excludes its corresponding seed flag.
+HNSW uses the default construction
 parameters. Select a fresh seed: reproducing the selected ANN component's old
 immutable address is refused before staging, even if a new embedding pass was
-completed. `--retrieval exact` remains available and excludes seed flags.
+completed.
 
 If the vectors still authenticate and only the graphs need rebuilding, add
 `--reuse-vectors` and omit model options. This route preserves the exact vector

@@ -1343,6 +1343,7 @@ fn parser_requires_explicit_topology_source_and_security_profile() {
     assert!(parse(&absent_profile).is_err());
     for extra in [
         vec!["--quality-backend", "onnx"],
+        vec!["--quality-retrieval", "exact"],
         vec!["--root", "different-root"],
         vec!["--mode", "full"],
         vec!["--shard-size", "5"],
