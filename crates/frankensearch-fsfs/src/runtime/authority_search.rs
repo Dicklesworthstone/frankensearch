@@ -19,7 +19,7 @@ use frankensearch_fusion::RrfConfig;
 use serde::Serialize;
 
 use super::{
-    FsfsRuntime, SearchStreamWriter, iso_timestamp_now, pressure_timestamp_ms,
+    FsfsRuntime, SearchFilterExpr, SearchStreamWriter, iso_timestamp_now, pressure_timestamp_ms,
     retained_search_checkpoint,
 };
 use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
@@ -392,6 +392,7 @@ impl FsfsRuntime {
         if query.is_empty() {
             return Err(refused("query", "search query must not be empty"));
         }
+        let filter = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or_default())?;
         let receipt = NativeGenerationReceipt::read(path)?;
         let mode = AuthorityMode::select(&receipt, self.cli_input.authority_mode.as_deref())?;
         self.validate_authority_policy(mode)?;
@@ -403,35 +404,44 @@ impl FsfsRuntime {
             .cli_input
             .authority_max_source_bytes
             .unwrap_or(DEFAULT_SOURCE_BYTES);
-        let current = self.cli_input.authority_current_receipt.as_deref();
-        let (_root, snapshot) = if cx.blocking_pool_handle().is_some() {
-            let selected = receipt.clone();
-            let context = cx.clone();
-            let current = current.map(std::path::Path::to_path_buf);
-            Self::search_blocking(cx, move || {
-                selected.open_read_selection(&context, current.as_deref(), max_image_bytes)
-            })
-            .await??
+        let current = self.cli_input.authority_current_receipt.clone();
+        let selected = receipt.clone();
+        let context = cx.clone();
+        let open = move || {
+            let (root, snapshot) =
+                selected.open_read_selection(&context, current.as_deref(), max_image_bytes)?;
+            // Evaluate the ordinary filesystem predicate on the pinned document
+            // inventory. Stored fields are read only to hydrate ranked winners.
+            let scope = filter
+                .map(|expr| snapshot.scope_by_doc_id(&context, |id| expr.matches_doc_id(id)))
+                .transpose()?;
+            Ok::<_, SearchError>((root, snapshot, scope))
+        };
+        let (_root, snapshot, scope) = if cx.blocking_pool_handle().is_some() {
+            Self::search_blocking(cx, open).await??
         } else {
-            receipt.open_read_selection(cx, current, max_image_bytes)?
+            open()?
         };
         retained_search_checkpoint(cx)?;
-        let total_documents =
-            usize::try_from(snapshot.metadata().total_documents).map_err(|_| {
+        let eligible_documents = scope.as_ref().map(|scope| scope.len());
+        let available = match eligible_documents {
+            Some(count) => count,
+            None => usize::try_from(snapshot.metadata().total_documents).map_err(|_| {
                 refused(
                     "limit",
                     "the admitted live document count does not fit this platform",
                 )
-            })?;
+            })?,
+        };
         let requested = self
             .cli_input
             .overrides
             .limit
             .unwrap_or(self.config.search.default_limit);
         let limit = if requested == 0 {
-            total_documents
+            available
         } else {
-            requested.min(total_documents)
+            requested.min(available)
         };
         let fast = if mode.needs_fast() {
             Some(load(EmbedderTierTag::Fast).await?)
@@ -475,6 +485,7 @@ impl FsfsRuntime {
                         results,
                         candidates,
                         max_source_bytes,
+                        eligible_documents,
                     )
                 })
                 .await?
@@ -489,13 +500,17 @@ impl FsfsRuntime {
                     results,
                     candidates,
                     max_source_bytes,
+                    eligible_documents,
                 )
             }
         };
         let (phase, results, candidates) = if mode == AuthorityMode::Lexical {
             (
                 "initial",
-                snapshot.search_lexical_text(cx, &query, limit).await?,
+                match &scope {
+                    Some(scope) => scope.search_lexical_text(cx, &query, limit).await?,
+                    None => snapshot.search_lexical_text(cx, &query, limit).await?,
+                },
                 None,
             )
         } else {
@@ -511,48 +526,35 @@ impl FsfsRuntime {
                     } else {
                         (EmbedderTierTag::Fast, fast.as_deref())
                     };
-                    snapshot.search_tier_progressive(
-                        cx,
-                        tier,
-                        producer.ok_or_else(|| {
-                            refused("producer", "selected producer is unavailable")
-                        })?,
-                        &query,
-                        limit,
-                        pool,
-                    )?
+                    let producer = producer
+                        .ok_or_else(|| refused("producer", "selected producer is unavailable"))?;
+                    match &scope {
+                        Some(scope) => scope
+                            .search_tier_progressive(cx, tier, producer, &query, limit, pool)?,
+                        None => snapshot
+                            .search_tier_progressive(cx, tier, producer, &query, limit, pool)?,
+                    }
                 }
-                AuthorityMode::Full | AuthorityMode::Partial if defer_quality => snapshot
-                    .search_progressive_with_deferred_quality(
-                        cx,
-                        fast.as_deref()
-                            .ok_or_else(|| refused("producer", "fast producer is unavailable"))?,
-                        &query,
-                        limit,
-                        pool,
-                    )?,
                 AuthorityMode::Full | AuthorityMode::Partial => {
                     let fast = fast
                         .as_deref()
                         .ok_or_else(|| refused("producer", "fast producer is unavailable"))?;
-                    let quality = quality
-                        .as_deref()
-                        .ok_or_else(|| refused("producer", "quality producer is unavailable"))?;
-                    match (mode, pool) {
-                        (AuthorityMode::Partial, Some(pool)) => snapshot
-                            .search_progressive_with_partial_quality_and_pool(
-                                cx, fast, quality, &query, limit, pool,
-                            )?,
-                        (AuthorityMode::Partial, None) => snapshot
-                            .search_progressive_with_partial_quality(
-                                cx, fast, quality, &query, limit,
-                            )?,
-                        (_, Some(pool)) => snapshot.search_progressive_with_quality_and_pool(
-                            cx, fast, quality, &query, limit, pool,
+                    let mut search = match &scope {
+                        Some(scope) => scope.search_progressive_with_deferred_quality(
+                            cx, fast, &query, limit, pool,
                         )?,
-                        (_, None) => snapshot
-                            .search_progressive_with_quality(cx, fast, quality, &query, limit)?,
+                        None => snapshot.search_progressive_with_deferred_quality(
+                            cx, fast, &query, limit, pool,
+                        )?,
+                    };
+                    if !defer_quality {
+                        // Buffered queries verify both producers before the first
+                        // phase; streams bind quality after delivering Initial.
+                        search.bind_deferred_quality(quality.as_deref().ok_or_else(|| {
+                            refused("producer", "quality producer is unavailable")
+                        })?)?;
                     }
+                    search
                 }
                 AuthorityMode::Lexical => {
                     return Err(refused(
@@ -643,6 +645,7 @@ fn authority_payload(
     results: Vec<ScoredResult>,
     candidates: Option<NativePhaseCandidates>,
     max_source_bytes: usize,
+    eligible_documents: Option<usize>,
 ) -> SearchResult<AuthorityPage> {
     let ids: Vec<&str> = results
         .iter()
@@ -689,6 +692,11 @@ fn authority_payload(
         "total_documents": snapshot.metadata().total_documents,
         "returned_hits": hits.len(),
     });
+    if let Some(count) = eligible_documents {
+        payload["scope"] = serde_json::json!({
+            "filtered": true, "eligible_documents": count,
+        });
+    }
     if let Some(candidates) = candidates {
         payload["candidates"] = serde_json::json!({
             "fast": candidates.fast, "quality": candidates.quality, "lexical": candidates.lexical,

@@ -91,9 +91,25 @@ and any partial coverage. Ranked result frames follow in page order. Loader
 failure, identity disagreement or deadline expiry after Initial preserves those
 delivered results and emits a failed terminal frame.
 
+Receipt-backed searches also accept the ordinary fsfs filesystem filter. For
+example, this streams results from Rust files whose indexed document IDs contain
+`src/`:
+
+```sh
+fsfs search "retry budget" --authority-receipt /path/to/receipts/g3.json \
+  --authority-mode full --filter 'path:src/ lang:rust' --stream --format jsonl
+```
+
+The filter runs against live IDs from the selected generation, including for
+historical queries. Path terms must all match. Extension, type and language
+terms select the union of their extensions. The scope applies before lexical
+and vector retrieval limits in every phase. Its construction reads no document
+bodies, so unrelated large files consume none of the source hydration budget.
+Filtered output includes the eligible document count alongside the corpus total.
+
 Native publication, updates and recovery remain available through
 `frankensearch-native`. Unsupported ordinary fsfs options are refused before
-model work, including daemon transport, filesystem filters, query
+model work, including daemon transport, query
 expansion and reranking. JSON, JSONL and TOON return the native result payload
 inside the normal fsfs envelope; table and CSV use the generic envelope
 rendering. The existing `fsfs explain` command is not a native rank-explanation

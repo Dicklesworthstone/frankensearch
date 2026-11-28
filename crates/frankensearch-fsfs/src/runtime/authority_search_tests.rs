@@ -380,6 +380,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(cx: &Cx, topology: Topology) -> Self {
+        Self::with_documents(cx, topology, documents("original")).await
+    }
+
+    async fn with_documents(cx: &Cx, topology: Topology, source: Vec<IndexableDocument>) -> Self {
         let base = std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
             .or_else(|| std::env::var_os("HOME"))
             .expect("a qualified test directory or HOME is required");
@@ -397,7 +401,7 @@ impl Fixture {
             topology,
             1,
             (&fast, &quality),
-            documents("original"),
+            source,
         )
         .await;
         let receipt_path = parent.path().join("selected.json");
@@ -503,6 +507,148 @@ fn authority_search_lexical_reads_retained_source_without_loading_models() {
             fs::read(fixture.root_path.join("AUTHORITY")).unwrap(),
             authority_before
         );
+    });
+}
+
+#[test]
+fn authority_filters_rank_only_matching_ids_in_every_lane_and_phase() {
+    run_test_with_cx(|cx| async move {
+        for topology in [Topology::Full, Topology::Partial] {
+            let winner = "src/lib/selected.RS";
+            let docs = vec![
+                IndexableDocument::new(winner, "ordinary-anchor retry")
+                    .with_metadata("path", "presentation-only.txt"),
+                // Strong out-of-scope hits in each lane must not displace the
+                // eligible hit. A stored path cannot impersonate its ID.
+                IndexableDocument::new("vendor/lib/fast.rs", "fast-anchor retry ".repeat(200))
+                    .with_metadata("path", winner),
+                IndexableDocument::new("quality-leader", "quality-anchor retry"),
+                IndexableDocument::new("src/lib/other.txt", "retry"),
+            ];
+            let fixture = Fixture::with_documents(&cx, topology, docs).await;
+            let modes: &[&str] = match topology {
+                Topology::Full => &["lexical", "fast", "quality", "full"],
+                Topology::Partial => &["partial"],
+                _ => unreachable!(),
+            };
+            for &mode in modes {
+                for stream in [false, true] {
+                    let text = if mode == "lexical" {
+                        "retry"
+                    } else {
+                        "semantic-query"
+                    };
+                    let mut runtime = fixture.runtime(Some(mode), text, 1);
+                    runtime.cli_input.filter = Some("path:SRC lib lang:rust ext:py".into());
+                    runtime.cli_input.authority_max_source_bytes = Some(128);
+                    runtime.cli_input.stream = stream;
+                    if stream {
+                        runtime.cli_input.format = OutputFormat::Jsonl;
+                    }
+                    let mut output = Vec::new();
+                    runtime
+                        .run_authority_search_with_writer_and_loader(&cx, &mut output, |tier| {
+                            assert_ne!(mode, "lexical");
+                            let producer: Arc<dyn Embedder> = match tier {
+                                EmbedderTierTag::Fast => fixture.fast.clone(),
+                                EmbedderTierTag::Quality => fixture.quality.clone(),
+                            };
+                            ready(Ok(producer))
+                        })
+                        .await
+                        .unwrap();
+                    let assert_scope = |page: &serde_json::Value| {
+                        assert_eq!(page["total_documents"], 4);
+                        assert_eq!(page["scope"]["eligible_documents"], 1);
+                        assert_eq!(page["returned_hits"], 1);
+                        if mode == "partial" {
+                            assert_eq!(page["quality_coverage"]["quality_documents"], 1);
+                            assert_eq!(page["candidates"]["quality"], 0);
+                        }
+                    };
+                    let assert_hit = |hit: &serde_json::Value| {
+                        assert_eq!(hit["doc_id"], winner);
+                        assert_eq!(hit["source_path"], "presentation-only.txt");
+                        assert_eq!(hit["snippet"], "ordinary-anchor retry");
+                    };
+                    if stream {
+                        let mut pages = 0;
+                        let mut hits = 0;
+                        let frames: Vec<serde_json::Value> = std::str::from_utf8(&output)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                        for frame in &frames {
+                            match frame["event"].as_str() {
+                                Some("progress") => {
+                                    assert_scope(&frame["native_authority"]);
+                                    pages += 1;
+                                }
+                                Some("result") => {
+                                    assert_hit(&frame["payload"]["item"]);
+                                    hits += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                        assert_eq!(
+                            pages,
+                            if matches!(mode, "full" | "partial") {
+                                2
+                            } else {
+                                1
+                            }
+                        );
+                        assert_eq!(hits, pages);
+                        assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+                    } else {
+                        let page = payload(&output);
+                        assert_scope(&page);
+                        assert_hit(&page["results"][0]);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn authority_filter_rejects_unknown_grammar_and_admits_empty_membership() {
+    run_test_with_cx(|cx| async move {
+        let fixture = Fixture::new(&cx, Topology::Full).await;
+        let mut runtime = fixture.runtime(Some("full"), "semantic-query", 1);
+        runtime.cli_input.filter = Some("metadata:lang".into());
+        let mut output = Vec::new();
+        let result = runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| {
+                panic!("invalid filter loaded a model")
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SearchError::InvalidConfig { field, .. }) if field == "cli.search.filter")
+        );
+        assert!(output.is_empty());
+
+        runtime.cli_input.filter = Some("path:no-matching-id".into());
+        runtime.cli_input.authority_max_source_bytes = Some(1);
+        let mut loaded = Vec::new();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut output, |tier| {
+                loaded.push(tier);
+                let producer: Arc<dyn Embedder> = match tier {
+                    EmbedderTierTag::Fast => fixture.fast.clone(),
+                    EmbedderTierTag::Quality => fixture.quality.clone(),
+                };
+                ready(Ok(producer))
+            })
+            .await
+            .unwrap();
+        let page = payload(&output);
+        assert_eq!(page["scope"]["eligible_documents"], 0);
+        assert_eq!(page["results"], serde_json::json!([]));
+        assert_eq!(loaded, [EmbedderTierTag::Fast, EmbedderTierTag::Quality]);
+        assert_eq!((fixture.fast.calls(), fixture.quality.calls()), (0, 0));
     });
 }
 
@@ -806,6 +952,9 @@ fn authority_search_reads_authenticated_history_with_one_total_budget() {
             head = receipt.open(&cx, IMAGE_BUDGET).unwrap();
             let mut search = fixture.runtime(Some("fast"), "semantic-query", 1);
             search.cli_input.authority_current_receipt = Some(head_path.clone());
+            // The head has no matching ID. Both membership and source must
+            // come from the exact historical reader admitted for this request.
+            search.cli_input.filter = Some("path:FAST".into());
             let mut output = Vec::new();
             search
                 .run_authority_search_with_writer_and_loader(&cx, &mut output, |tier| {
@@ -816,6 +965,7 @@ fn authority_search_reads_authenticated_history_with_one_total_budget() {
                 .unwrap();
             let page = payload(&output);
             assert_eq!(page["selection_kind"], kind);
+            assert_eq!(page["scope"]["eligible_documents"], 1);
             assert_eq!(
                 page["selected_history_of"],
                 serde_json::json!(receipt.authority)

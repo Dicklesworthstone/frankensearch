@@ -358,8 +358,8 @@ impl CliInput {
             Some("authority receipt search does not yet provide fsfs rank explanations")
         } else if self.stream && !matches!(self.format, OutputFormat::Jsonl | OutputFormat::Toon) {
             Some("authority streaming requires --format jsonl or --format toon")
-        } else if self.filter.is_some() || self.expand || self.compact {
-            Some("authority receipt search does not support --filter, --expand or --compact")
+        } else if self.expand || self.compact {
+            Some("authority receipt search does not support --expand or --compact")
         } else if self.model_name.is_some()
             || self.download_list
             || self.download_verify
@@ -1634,6 +1634,7 @@ mod tests {
                 mode,
                 "--authority-max-image-bytes=1048576",
                 "--authority-max-source-bytes=4096",
+                "--filter=path:src lang:rust",
                 "--limit=all",
                 "--format=jsonl",
                 "--no-fast-only",
@@ -1650,6 +1651,7 @@ mod tests {
             );
             assert_eq!(input.authority_max_image_bytes, Some(1_048_576));
             assert_eq!(input.authority_max_source_bytes, Some(4096));
+            assert_eq!(input.filter.as_deref(), Some("path:src lang:rust"));
             assert_eq!(input.overrides.limit, Some(usize::MAX));
             assert_eq!(input.overrides.fast_only, Some(false));
             assert_eq!(input.format, OutputFormat::Jsonl);
@@ -1672,7 +1674,6 @@ mod tests {
             vec!["--explain"],
             vec!["--compact"],
             vec!["--expand"],
-            vec!["--filter", "path:src"],
             vec!["--fast-only"],
             vec!["--quality-only"],
             vec!["--index-dir", "other-root"],
