@@ -295,6 +295,59 @@ fn message(stream: bool) -> serde_json::Value {
     serde_json::json!({"query":"needle","mode":"full","limit":1,"stream":stream})
 }
 
+#[test]
+fn exact_id_scope_refills_global_lexical_ranks_without_exporting_unrelated_bodies() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let f = fixture(&cx, true, false).await;
+        let snapshot = &f.session.snapshot;
+        let global = snapshot
+            .search_lexical_text(&cx, "needle", 10)
+            .await
+            .unwrap();
+        assert!(global.len() >= 2);
+        let winner = global.last().unwrap();
+        let id = winner.doc_id.as_str();
+        let filter = serde_json::json!({"ids":[id,"missing"],"metadata":{"source_id":id}});
+        let selected = Filter::parse(&filter.to_string()).unwrap();
+        assert!(snapshot.source_documents(&cx, 512).is_err());
+        let mut output = Vec::new();
+        let mut one_shot = parsed(&["--mode", "lexical"]).unwrap().unwrap();
+        one_shot.receipt = f.receipt.clone();
+        one_shot.limit = 1;
+        one_shot.max_source_bytes = 512;
+        one_shot.filter = Some(selected.clone());
+        search_with_loader(&cx, &one_shot, &mut output, |_| {
+            panic!("lexical query loaded a model")
+        })
+        .await
+        .unwrap();
+        let result = &frames(&output)[0];
+        assert_eq!(result["scope"]["eligible_documents"], 1);
+        assert_eq!(result["results"][0]["doc_id"], id);
+        let hit: ScoredResult = serde_json::from_value(result["results"][0].clone()).unwrap();
+        assert_eq!(hit.score.to_bits(), winner.score.to_bits());
+
+        let mut session = f.session.with_filter(&cx, Some(selected), 512).unwrap();
+        let messages = [
+            serde_json::json!({"query":"needle","mode":"full","limit":1}),
+            serde_json::json!({"query":"needle","mode":"lexical","filter":{"ids":["huge"]}}),
+        ];
+        let response = exchange(&cx, &mut session, &messages).await;
+        assert_eq!(response[1]["results"][0]["doc_id"], id);
+        assert_eq!(response[2]["scope"]["eligible_documents"], 0);
+        assert_eq!(response[2]["results"], serde_json::json!([]));
+        let missing = Filter::parse(r#"{"ids":["absent"]}"#).unwrap();
+        assert!(
+            prepare_scope(&cx, &session.snapshot, Some(&missing), 0)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        let huge = Filter::parse(r#"{"ids":["huge"]}"#).unwrap();
+        assert!(prepare_scope(&cx, &session.snapshot, Some(&huge), 512).is_err());
+    });
+}
+
 fn parsed(extra: &[&str]) -> Result<Option<Options>> {
     let mut arguments = vec![
         "authority-search",

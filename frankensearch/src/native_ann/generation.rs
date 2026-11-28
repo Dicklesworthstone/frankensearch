@@ -560,6 +560,10 @@ impl NativeGenerationPreview {
         &self.readers.lexical
     }
 
+    pub(in crate::native_ann) fn scope_readers(&self) -> &CompositeReaders {
+        &self.readers
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::native_ann) fn scoped_progressive<'a>(
         &'a self,
@@ -1723,6 +1727,10 @@ impl NativeGenerationSnapshot {
         &self.readers.lexical
     }
 
+    pub(in crate::native_ann) fn scope_readers(&self) -> &CompositeReaders {
+        &self.readers
+    }
+
     // Keep the raw vector owner private while using the ordinary phase engine's
     // identity admission, filtered traversal and winner hydration. Clamp before
     // candidate-budget multiplication, including for empty scopes and usize::MAX.
@@ -2282,6 +2290,44 @@ impl CompositeReaders {
         Ok(documents)
     }
 
+    pub(super) fn has_live_document(&self, id: &str) -> SearchResult<bool> {
+        self.vector
+            .owner
+            .find_live_row_by_doc_id(id)
+            .map(|row| row.is_some())
+            .map_err(|_| refused("source", "invalid-vector-row"))
+    }
+
+    /// An explicit ID set bounds stored-field reads before a source predicate
+    /// runs. Absent and tombstoned IDs carry no source cost or membership.
+    pub(super) fn scope_documents(
+        &self,
+        cx: &Cx,
+        ids: Option<&BTreeSet<String>>,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        let Some(ids) = ids else {
+            return self.source_documents(cx, max_source_bytes);
+        };
+        let (snapshot, _, fields) = self.source_context(cx)?;
+        let mut remaining = max_source_bytes;
+        let mut documents = Vec::new();
+        for id in ids {
+            checkpoint(cx, "native_ann.generation.scope_source_id")?;
+            if self.has_live_document(id)? {
+                documents.push(self.read_source_document(
+                    cx,
+                    &snapshot,
+                    fields,
+                    id,
+                    &mut remaining,
+                )?);
+            }
+        }
+        checkpoint(cx, "native_ann.generation.scope_source_complete")?;
+        Ok(documents)
+    }
+
     fn source_documents_by_ids(
         &self,
         cx: &Cx,
@@ -2296,20 +2342,15 @@ impl CompositeReaders {
         let mut remaining_bytes = max_source_bytes;
         for doc_id in doc_ids {
             checkpoint(cx, "native_ann.generation.source_row")?;
-            let Some(row) = self
-                .vector
-                .owner
-                .find_live_row_by_doc_id(doc_id)
-                .map_err(|_| refused("source", "invalid-vector-row"))?
-            else {
+            if !self.has_live_document(doc_id)? {
                 documents.push(None);
                 continue;
-            };
+            }
             documents.push(Some(self.read_source_document(
                 cx,
                 &snapshot,
                 field_ids,
-                row.doc_id(),
+                doc_id,
                 &mut remaining_bytes,
             )?));
         }

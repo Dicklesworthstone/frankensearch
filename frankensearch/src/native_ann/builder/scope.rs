@@ -56,8 +56,8 @@ pub struct NativeScopedHybridIndex<'a> {
 
 /// An owned source scope over one authority-admitted native generation.
 ///
-/// The handle retains the admitted vector and lexical images, its complete
-/// bounded source inventory, and its selected document IDs. Later publication,
+/// The handle retains the admitted vector and lexical images, bounded source
+/// documents for the initial selection, and its eligible IDs. Later publication,
 /// activation, rollback or pathname changes cannot alter this scope. Narrowing
 /// shares those original images and source documents and can only remove IDs.
 ///
@@ -212,8 +212,28 @@ impl NativeGenerationSnapshot {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<NativeScopedGenerationSnapshot> {
+        self.scope_with_ids(cx, None, max_source_bytes, accept)
+    }
+
+    /// Freeze a predicate over the live members of an optional exact ID set.
+    /// With IDs supplied, only those documents' stored fields consume the
+    /// source budget. The full retained corpus still determines lexical ranks.
+    /// A missing or deleted ID is ineligible. An empty set selects no rows.
+    ///
+    /// # Errors
+    /// Propagates source, budget, cancellation and predicate errors before
+    /// returning a scope. No predicate runs until all selected fields fit.
+    pub fn scope_with_ids(
+        self: &Arc<Self>,
+        cx: &Cx,
+        ids: Option<&BTreeSet<String>>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationSnapshot> {
         checkpoint(cx, "native_ann.generation_scope.start")?;
-        let source = self.source_documents(cx, max_source_bytes)?;
+        let source = self
+            .scope_readers()
+            .scope_documents(cx, ids, max_source_bytes)?;
         let membership = prepare_generation_membership(cx, source, accept)?;
         Ok(NativeScopedGenerationSnapshot::from_membership(
             Arc::clone(self),
@@ -238,8 +258,25 @@ impl NativeGenerationPreview {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<NativeScopedGenerationPreview> {
+        self.scope_with_ids(cx, None, max_source_bytes, accept)
+    }
+
+    /// Preview a predicate using the same exact ID selection and source budget
+    /// as [`NativeGenerationSnapshot::scope_with_ids`].
+    ///
+    /// # Errors
+    /// Refuses invalid source, budget exhaustion, cancellation and predicate errors.
+    pub fn scope_with_ids(
+        self: &Arc<Self>,
+        cx: &Cx,
+        ids: Option<&BTreeSet<String>>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationPreview> {
         checkpoint(cx, "native_ann.generation_preview_scope.start")?;
-        let source = self.source_documents(cx, max_source_bytes)?;
+        let source = self
+            .scope_readers()
+            .scope_documents(cx, ids, max_source_bytes)?;
         let membership = prepare_generation_membership(cx, source, accept)?;
         Ok(NativeScopedGenerationPreview {
             preview: Arc::clone(self),
@@ -1446,11 +1483,24 @@ impl ScopeSource<'_> {
         }
     }
 
-    fn document_count(&self) -> usize {
+    // All lexical windows are global. A selective source cache neither bounds
+    // how deep to refill nor proves a noneligible global candidate is invalid.
+    fn document_count(&self) -> SearchResult<usize> {
+        let count = match self {
+            Self::Single(index) => return Ok(index.vectors().documents().len()),
+            Self::Sharded(index) => return Ok(index.vectors().document_count()),
+            Self::Authority { snapshot, .. } => snapshot.metadata().total_documents,
+            Self::Preview { preview, .. } => preview.metadata().total_documents,
+        };
+        usize::try_from(count)
+            .map_err(|_| invalid("scope.source", "count-overflow", "live count exceeds usize"))
+    }
+
+    fn has_live_document(&self, id: &str) -> SearchResult<bool> {
         match self {
-            Self::Single(index) => index.vectors().documents().len(),
-            Self::Sharded(index) => index.vectors().document_count(),
-            Self::Authority { documents, .. } | Self::Preview { documents, .. } => documents.len(),
+            Self::Authority { snapshot, .. } => snapshot.scope_readers().has_live_document(id),
+            Self::Preview { preview, .. } => preview.scope_readers().has_live_document(id),
+            Self::Single(_) | Self::Sharded(_) => Ok(self.document(id).is_some()),
         }
     }
 
@@ -1506,7 +1556,7 @@ impl LexicalRead for ScopedLexical<'_> {
             if target == 0 {
                 return Ok(LexicalCandidateBatch::eager(Vec::new()));
             }
-            let ceiling = self.index.document_count();
+            let ceiling = self.index.document_count()?;
             let mut width = limit.min(ceiling);
             loop {
                 checkpoint(cx, "native_ann.scope.lexical_window")?;
@@ -1529,7 +1579,7 @@ impl LexicalRead for ScopedLexical<'_> {
                 for result in batch.results() {
                     checkpoint(cx, "native_ann.scope.lexical_candidate")?;
                     if !result.score.is_finite()
-                        || self.index.document(result.doc_id.as_str()).is_none()
+                        || !self.index.has_live_document(result.doc_id.as_str())?
                         || !seen.insert(result.doc_id.as_str())
                     {
                         return Err(invalid(

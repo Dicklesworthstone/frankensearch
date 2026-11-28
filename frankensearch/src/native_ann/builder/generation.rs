@@ -755,8 +755,26 @@ impl NativeBuiltExactGeneration {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<PreparedNativeGenerationScope> {
+        self.prepare_scope_with_ids(cx, candidate, None, max_source_bytes, accept)
+    }
+
+    /// Prepare source membership for publication from the live members of an
+    /// optional exact ID set. Only selected fields consume the source budget.
+    /// Publication still requires admission of every candidate component.
+    ///
+    /// # Errors
+    /// Refuses candidate drift, invalid source, budget exhaustion, predicate
+    /// failure and cancellation before publication.
+    pub fn prepare_scope_with_ids(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+        ids: Option<&BTreeSet<String>>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<PreparedNativeGenerationScope> {
         let readers = self.admit_candidate(cx, candidate)?;
-        let source = readers.source_documents(cx, max_source_bytes)?;
+        let source = readers.scope_documents(cx, ids, max_source_bytes)?;
         PreparedNativeGenerationScope::from_source(
             cx,
             candidate.authority(),

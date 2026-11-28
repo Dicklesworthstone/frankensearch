@@ -69,6 +69,10 @@ impl Filter {
         Ok(())
     }
 
+    pub(super) fn ids(&self) -> Option<&BTreeSet<String>> {
+        self.ids.as_ref()
+    }
+
     pub(super) fn matches(&self, document: &IndexableDocument) -> bool {
         self.ids
             .as_ref()

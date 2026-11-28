@@ -404,6 +404,8 @@ Search requests may include a filter object; it intersects the server's fixed\n\
 filter and cannot widen it. Membership filters vector and lexical candidates\n\
 before fusion. Hybrid queries, including empty scopes, require the selected producer.\n\
 Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
+An exact ids list reads only the listed live documents before applying other\n\
+constraints. Prefix or metadata filters alone inspect the complete source.\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
@@ -1823,7 +1825,7 @@ fn stage_prepared_and_publish(
     // Scope preparation uses the actual completed images, including stored
     // metadata encoding. Any budget or predicate refusal precedes publication.
     let prepared_scope = if let Some((filter, budget)) = options.scope {
-        Some(built.prepare_scope(cx, &candidate, budget, |document| {
+        Some(built.prepare_scope_with_ids(cx, &candidate, filter.ids(), budget, |document| {
             Ok(filter.matches(document))
         })?)
     } else {
@@ -3614,9 +3616,14 @@ fn prepare_scope(
         return Ok(None);
     };
     filter.validate()?;
-    Ok(Some(snapshot.scope(cx, max_source_bytes, |document| {
+    Ok(Some(snapshot.scope_with_ids(
+        cx,
+        filter.ids(),
+        max_source_bytes,
+        |document| {
         Ok(filter.matches(document))
-    })?))
+    },
+    )?))
 }
 
 fn annotate_scope(response: &mut serde_json::Value, eligible_documents: Option<usize>) {

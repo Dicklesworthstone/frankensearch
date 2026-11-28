@@ -221,6 +221,49 @@ fn empty_support_does_not_turn_missing_embedding_outputs_into_an_empty_generatio
 }
 
 #[test]
+fn exact_ids_bound_prepublication_and_preview_source_with_the_same_budget() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let built = NativeIndexBuilder::new(directory.path().join("work"), generation(), provider)
+            .unwrap()
+            .add_documents(documents())
+            .build_exact_generation(&cx, EmbedderTierTag::Fast, SOURCE, BUDGET)
+            .await
+            .unwrap();
+        let candidate = candidate(&built);
+        let preview = Arc::new(built.preview_candidate(&cx, &candidate).unwrap());
+        let selected = BTreeSet::from(["a".to_owned(), "absent".to_owned()]);
+        let budget = "a".len() + "horizontal".len() + "{}".len();
+
+        assert!(preview.source_documents(&cx, budget).is_err());
+        let scope = preview
+            .scope_with_ids(&cx, Some(&selected), budget, |_| Ok(true))
+            .unwrap();
+        assert_eq!(scope.len(), 1);
+        assert_eq!(scope.document("a").unwrap().content, "horizontal");
+        assert!(scope.document("b").is_none());
+
+        let mut observed = Vec::new();
+        built
+            .prepare_scope_with_ids(&cx, &candidate, Some(&selected), budget, |doc| {
+                observed.push(doc.id.clone());
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(observed, ["a"]);
+        let selected = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        assert!(
+            built
+                .prepare_scope_with_ids(&cx, &candidate, Some(&selected), budget, |_| {
+                    panic!("all selected source fields must fit before the first predicate")
+                })
+                .is_err()
+        );
+    });
+}
+
+#[test]
 fn progressive_generation_retains_independent_tiers_and_one_complete_source_cohort() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         // The second case deliberately has identical explicit providers and

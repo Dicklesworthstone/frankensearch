@@ -1506,7 +1506,7 @@ The response includes the new `authority`, `selection`, `receipt`, final
 queries use that selection without reloading the models. Update requests are
 serialized with queries, so a long build occupies the request loop.
 
-When the session has a fixed filter, the complete successor source and its
+When the session has a fixed filter, its successor source selection and
 eligible membership are prepared before publication under the configured query
 source budget. The acknowledged update installs the new receipt, reader and
 scope together. Metadata-only changes can therefore move a document into or out
@@ -1635,11 +1635,14 @@ completed top-k page. HNSW remains approximate, and lexical scoring retains
 whole-corpus statistics. A selective lexical query can examine the full matching
 cohort.
 
-`--max-source-bytes` bounds complete stored-source export using the raw-field
-accounting described for retained-source rebuilds, with a 256 MiB default. It
-does not bound total process memory. A fixed server scope retains that source
-once and reuses it for narrowed requests. Without a fixed scope, a filtered
-request exports its own bounded source; unfiltered searches export none.
+`--max-source-bytes` bounds the stored fields read to evaluate a filter, with
+a 256 MiB default. An explicit `ids` list reads only the live documents named
+in that list. Missing IDs consume zero bytes. An empty list selects nothing.
+Prefix and metadata filters without an ID list evaluate the entire corpus.
+The same source budget applies when a successor is prepared for activation.
+A fixed server scope retains the selected source and reuses it for narrower
+requests. Without a fixed scope, each filtered request reads its own bounded
+selection.
 Requests cannot increase the configured budget. Filters retain the existing
 limits of 4096 IDs, 64 metadata fields, and 64 KiB of decoded filter text.
 Invalid filters fail the request without producing an unrestricted result.
@@ -1650,8 +1653,10 @@ policy failure preserves the previous reader and its membership. Previously
 retained library scopes likewise keep their original source and authority
 across publication and rollback; they are not live revocation mechanisms.
 Library callers can retain an `Arc<NativeGenerationSnapshot>`, call
-`snapshot.scope(&cx, max_source_bytes, predicate)`, and use `narrow` to derive
-an intersected scope without exporting the source again.
+`snapshot.scope_with_ids(&cx, Some(&ids), max_source_bytes, predicate)` for an
+exact ID set or `snapshot.scope(&cx, max_source_bytes, predicate)` for the
+entire corpus. Use `narrow` to intersect that scope with another predicate
+without exporting the source again.
 
 ### Fetch document text from the selected authority
 

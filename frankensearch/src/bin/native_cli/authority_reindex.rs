@@ -587,7 +587,7 @@ impl Inputs<'_> {
             .filter
             .as_ref()
             .map(|filter| {
-                preview.scope(cx, self.options.max_source_bytes, |document| {
+                preview.scope_with_ids(cx, filter.ids(), self.options.max_source_bytes, |document| {
                     Ok(filter.matches(document))
                 })
             })
