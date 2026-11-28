@@ -8412,6 +8412,31 @@ mod qualified_rollback {
                 drop(narrowed);
                 drop(scope);
                 drop(prepared_scope);
+                // A retained ID scope can still serve and hydrate a ranked page
+                // after its original reader and every source-based scope are gone.
+                let last_page = id_scope
+                    .search_tier_progressive(&cx, tier, provider.as_ref(), "needle", 2, None)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_same_scored_results(&last_page, &filtered);
+                let ids: Vec<_> = last_page.iter().map(|hit| hit.doc_id.as_str()).collect();
+                let snapshot = pin.upgrade().expect("the ID scope pins its source image");
+                assert_source_refused(
+                    snapshot.source_documents_by_ids(&cx, &ids, 256),
+                    "stored-payload-limit",
+                );
+                let previews = snapshot.source_snippets_by_ids(&cx, &ids, 11, 256).unwrap();
+                assert_eq!(previews.len(), ids.len());
+                for (preview, expected_id) in previews.into_iter().zip(ids) {
+                    let preview = preview.unwrap();
+                    assert_eq!(preview.id, expected_id);
+                    assert_eq!(preview.snippet, "kept needle");
+                    assert_eq!(preview.metadata["tenant"], "blue");
+                }
+                drop(snapshot);
+                drop(id_scope);
                 assert!(pin.upgrade().is_none());
             }
         });
