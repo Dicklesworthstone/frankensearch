@@ -8246,7 +8246,10 @@ mod qualified_rollback {
                     let expected = &expected_keyword[..k.min(expected_keyword.len())];
                     let keyword = scope.search_lexical_text(&cx, "needle", k).await.unwrap();
                     assert_same_scored_results(&keyword, expected);
-                    let keyword = id_scope.search_lexical_text(&cx, "needle", k).await.unwrap();
+                    let keyword = id_scope
+                        .search_lexical_text(&cx, "needle", k)
+                        .await
+                        .unwrap();
                     assert_same_scored_results(&keyword, expected);
                     assert_same_scored_results(
                         &prepared_scope

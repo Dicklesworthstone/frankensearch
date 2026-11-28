@@ -27410,6 +27410,7 @@ impl FsfsRuntime {
         F: Future<Output = SearchResult<T>>,
     {
         let budget_ms = self.config.search.quality_timeout_ms;
+        let budget = Duration::from_millis(budget_ms);
         let started_at = self.quality_budget_started_at.unwrap_or_else(|| cx.now());
         let timeout_error = || SearchError::SearchTimeout {
             elapsed_ms: cx.now().duration_since(started_at) / 1_000_000,
@@ -27418,12 +27419,17 @@ impl FsfsRuntime {
         with_cancellation(cx, "quality_refinement", async {
             let now = cx.now();
             let elapsed = Duration::from_nanos(now.duration_since(started_at));
-            let remaining = Duration::from_millis(budget_ms)
-                .checked_sub(elapsed)
-                .ok_or_else(timeout_error)?;
-            asupersync::time::timeout(now, remaining, work)
+            let remaining = budget.checked_sub(elapsed).ok_or_else(timeout_error)?;
+            let value = asupersync::time::timeout(now, remaining, work)
                 .await
-                .unwrap_or_else(|_| Err(timeout_error()))
+                .map_err(|_| timeout_error())??;
+            // A synchronous provider can finish late in one successful poll.
+            // Keep the timer's ready-at-the-exact-boundary behavior while
+            // refusing a late page even when no subsequent phase will poll.
+            if Duration::from_nanos(cx.now().duration_since(started_at)) > budget {
+                return Err(timeout_error());
+            }
+            Ok(value)
         })
         .await
     }
@@ -44371,6 +44377,46 @@ mod tests {
                 cx.set_cancel_requested(false);
             });
         }
+    }
+
+    #[test]
+    fn ready_quality_work_must_finish_within_the_original_budget() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let scheduler = RuntimeBuilder::current_thread()
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        scheduler.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 10;
+            let mut runtime = FsfsRuntime::new(config);
+            for (work_nanos, on_time) in [(999_999, true), (1_000_000, true), (1_000_001, false)] {
+                runtime.quality_budget_started_at = Some(cx.now());
+                // Earlier admission and inference spent nine of ten milliseconds.
+                clock.advance(9_000_000);
+                let result = runtime
+                    .with_quality_deadline(&cx, async {
+                        clock.advance(work_nanos);
+                        Ok(42)
+                    })
+                    .await;
+                if on_time {
+                    assert_eq!(result.unwrap(), 42);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::SearchTimeout {
+                            elapsed_ms: 10,
+                            budget_ms: 10
+                        })
+                    ));
+                }
+            }
+        });
     }
 
     #[test]
