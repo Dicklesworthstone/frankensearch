@@ -424,13 +424,13 @@ fn parsed(extra: &[&str]) -> Result<Option<Options>> {
 
 /// Observe actual flushes independently of the writer borrowed by the command.
 #[derive(Default)]
-struct PhaseOutput {
+struct FlushRecorder {
     pending: Vec<u8>,
     flushed: Arc<Mutex<Vec<serde_json::Value>>>,
     fail_flush: bool,
 }
 
-impl io::Write for PhaseOutput {
+impl io::Write for FlushRecorder {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -500,7 +500,7 @@ fn one_shot_streams_load_quality_only_after_a_successful_initial_flush() {
                 options.query = Some("retry".to_owned());
                 options.filter = filter.map(|text| Filter::parse(text).unwrap());
                 let empty = filter == Some(r#"{"ids":[]}"#);
-                let mut wire = PhaseOutput {
+                let mut wire = FlushRecorder {
                     fail_flush: failure == "transport",
                     ..Default::default()
                 };
@@ -1553,7 +1553,7 @@ fn request_overrides_need_the_server_grant_and_cannot_widen_limits_or_source() {
 }
 
 #[test]
-fn full_controls_refuse_incomplete_topology_before_loading_any_provider() {
+fn full_controls_refuse_single_tier_search_before_loading_any_provider() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let f = fixture(&cx, false, false).await;
         let mut options = parsed(&["--full-query", TUNED]).unwrap().unwrap();
@@ -1563,7 +1563,12 @@ fn full_controls_refuse_incomplete_topology_before_loading_any_provider() {
         })
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("complete full generation"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires two-tier search in full or partial mode"),
+            "{error}"
+        );
     });
 }
 
@@ -1734,7 +1739,8 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
                     for request in &requests {
                         // Unrestricted reranking may select the large document.
                         // Exact-ID requests fit the original small source budget.
-                        let unrestricted_rerank = tuned && !scoped && request.get("filter").is_none();
+                        let unrestricted_rerank =
+                            tuned && !scoped && request.get("filter").is_none();
                         f.session.max_source_bytes = if unrestricted_rerank {
                             MAX_INPUT_BYTES
                         } else {

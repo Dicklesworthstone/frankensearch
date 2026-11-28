@@ -2232,6 +2232,15 @@ fn indexed_report_exposes_the_realized_retrieval_without_changing_the_receipt() 
 }
 
 #[cfg(target_os = "linux")]
+fn qualified_fixture_base() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
+            .or_else(|| std::env::var_os("HOME"))
+            .unwrap(),
+    )
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() {
     use frankensearch::IndexableDocument;
@@ -2244,7 +2253,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+    let parent = qualified_fixture_base().join(format!(
         ".frankensearch-authority-cli-tests-{}-{stamp}",
         std::process::id(),
     ));
@@ -2507,7 +2516,7 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+    let parent = qualified_fixture_base().join(format!(
         ".frankensearch-authority-rebuild-tests-{}-{stamp}",
         std::process::id(),
     ));
@@ -2874,12 +2883,7 @@ mod warm_authority {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let parent = PathBuf::from(
-            std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
-                .or_else(|| std::env::var_os("HOME"))
-                .unwrap(),
-        )
-        .join(format!(
+        let parent = qualified_fixture_base().join(format!(
             ".frankensearch-authority-serve-{label}-{}-{stamp}",
             std::process::id()
         ));
@@ -7843,12 +7847,7 @@ mod progressive_authority {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let parent = PathBuf::from(
-            std::env::var_os("FRANKENSEARCH_TEST_TMPDIR")
-                .or_else(|| std::env::var_os("HOME"))
-                .unwrap(),
-        )
-        .join(format!(
+        let parent = qualified_fixture_base().join(format!(
             ".frankensearch-authority-full-{}-{stamp}",
             std::process::id(),
         ));
@@ -10365,16 +10364,23 @@ mod progressive_authority {
             ])
             .unwrap()
             .unwrap();
-            repair_options.from_receipt = Some(options.receipt.clone());
+            // Two of three is a structurally valid receipt claim, but the
+            // authenticated source contains just one quality document.
+            let mut forged = selected.clone();
+            forged.quality_documents = Some(2);
+            let forged_path = parent.join("forged-partial.json");
+            save_receipt(&forged, &forged_path).unwrap();
+            repair_options.from_receipt = Some(forged_path);
             repair_options.work = Some(parent.join("forbidden-repair-work"));
             repair_options.receipt = parent.join("forbidden-repair.json");
             let repair_error = repair::run(&cx, &repair_options, &mut output, None)
                 .await
-                .expect_err("unsupported partial repair must refuse");
+                .expect_err("repair must refuse forged partial coverage");
             assert!(
-                repair_error
-                    .to_string()
-                    .contains("partial_quality_mutation_unsupported")
+                repair_error.to_string().contains(
+                    "the repair source differs from the selected topology or document count"
+                ),
+                "{repair_error}"
             );
             assert!(!repair_options.work.as_ref().unwrap().exists());
             assert!(!repair_options.receipt.exists());

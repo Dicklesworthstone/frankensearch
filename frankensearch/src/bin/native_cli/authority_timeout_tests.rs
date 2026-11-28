@@ -537,9 +537,15 @@ fn one_shot_search_times_pending_inference_after_startup_and_before_final_delive
             let mut output = Vec::new();
             let mut searching = Box::pin(search_with_loader(&cx, &options, &mut output, |tier| {
                 loads.fetch_add(1, Ordering::SeqCst);
-                // Loading is startup work. Both full-mode loads can take
-                // longer than the entire subsequent query budget.
-                clock.advance(20_000_000);
+                // Eager models load before the deadline. In a progressive
+                // stream the cold quality load consumes part of the same
+                // budget as its pending inference after Initial delivery.
+                let load_ns = if stream && tier == EmbedderTierTag::Quality {
+                    3_000_000
+                } else {
+                    20_000_000
+                };
+                clock.advance(load_ns);
                 let model: Arc<dyn Embedder> = if tier == EmbedderTierTag::Fast {
                     fast.clone()
                 } else {
@@ -552,10 +558,6 @@ fn one_shot_search_times_pending_inference_after_startup_and_before_final_delive
                     .as_mut()
                     .poll(&mut Context::from_waker(Waker::noop()))
                     .is_pending()
-            );
-            assert_eq!(
-                loads.load(Ordering::SeqCst),
-                if mode == QueryMode::Full { 2 } else { 1 }
             );
             // Full mode can first wait for fast-tier vector work on the
             // caller's pool. Drive that real work before timing the pending
@@ -571,14 +573,22 @@ fn one_shot_search_times_pending_inference_after_startup_and_before_final_delive
                 }
             })
             .await;
+            assert_eq!(
+                loads.load(Ordering::SeqCst),
+                if mode == QueryMode::Full { 2 } else { 1 }
+            );
             assert_eq!(pending.calls.load(Ordering::SeqCst), before_calls + 1);
             assert_eq!(timer.pending_count(), 1);
-            clock.advance(10_000_000);
+            clock.advance(if stream { 7_000_000 } else { 10_000_000 });
             let _ = timer.process_timers();
             let error = searching.await.unwrap_err();
             assert_timeout(error.as_ref(), 10, 10);
             assert_eq!(query::failure(error.as_ref())["code"], "search_timeout");
-            assert_eq!(frames(&output).len(), usize::from(stream));
+            let delivered = frames(&output);
+            assert_eq!(delivered.len(), usize::from(stream));
+            if stream {
+                assert_eq!(delivered[0]["phase"], "initial");
+            }
             assert_eq!(pending.drops.load(Ordering::SeqCst), before + 1);
             assert!(timer.is_empty());
             assert!(!cx.is_cancel_requested());

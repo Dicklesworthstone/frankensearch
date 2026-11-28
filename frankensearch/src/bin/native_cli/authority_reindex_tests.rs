@@ -619,18 +619,18 @@ fn bound_partial_reindex_preview_and_replay_failures_preserve_exact_partial_auth
 }
 
 #[test]
-fn bound_partial_reindex_rejects_implicit_mode_and_policy_before_model_loading() {
+fn bound_partial_reindex_requires_explicit_partial_mode_and_retained_source_before_loading_models() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
         let authority = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
-        for refusal in 0..4 {
+        for (mode, retained_source) in [
+            (None, true),
+            (Some(QueryMode::Full), true),
+            (Some(QueryMode::Partial), false),
+        ] {
             let mut options = fixture.options();
-            match refusal {
-                0 => options.mode = None,
-                1 => options.mode = Some(QueryMode::Full),
-                2 => options.retained_source = false,
-                _ => options.full_query = Some(query::FullQuery::parse(REINDEX_TUNING).unwrap()),
-            }
+            options.mode = mode;
+            options.retained_source = retained_source;
             let mut loads = 0;
             let mut output = Vec::new();
             assert!(
@@ -749,18 +749,14 @@ fn bound_partial_reindex_refuses_same_count_quality_membership_substitution_befo
 }
 
 #[test]
-fn bound_partial_reindex_preserves_reranking_and_reports_partial_terminal_coverage() {
+fn bound_partial_reindex_preserves_tuning_and_reranking_and_reports_partial_coverage() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let fixture = ReindexFixture::new(&cx, PARTIAL_REINDEX_TOPOLOGY, false).await;
         let (primary, quality, loaded) = fixture.replacements();
         let built = fixture.build(&cx, &loaded, false).await;
         let mut options = fixture.options();
         options.stream = true;
-        let (mut policy, reranker) = tuned_reindex_policy(&cx, &mut options, 0, [4_000_000; 2]);
-        // Partial mode supports the same bounded reranker, while complete-tier
-        // full-query tuning remains an explicit refusal.
-        options.full_query = None;
-        policy.full_query = None;
+        let (policy, reranker) = tuned_reindex_policy(&cx, &mut options, 0, [4_000_000; 2]);
         let mut output = Vec::new();
         reindex::execute_with_policy(
             &cx,
@@ -1454,7 +1450,7 @@ fn bound_reindex_full_query_policy_refuses_single_tier_before_loading_models() {
             })
             .await
             .expect_err("full query policy requires both stored tiers");
-            assert!(error.to_string().contains("complete full generation"));
+            assert!(error.to_string().contains("requires two-tier search"));
             assert!(output.is_empty());
             assert!(!options.work.as_ref().unwrap().exists());
             assert!(!options.receipt.exists());
