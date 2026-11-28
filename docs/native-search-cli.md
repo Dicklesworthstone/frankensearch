@@ -429,6 +429,20 @@ explicit permission to replace either independently identified producer. The
 unchanged tier reuses its vectors; changed quality inference covers only the
 retained subset. Each producer must preserve its own prepared-input contract.
 
+### Stream a full or partial authority search from a cold start
+
+`frankensearch-native authority-search --stream` flushes the initial fast and
+lexical page before it loads the quality embedder for `--mode full` or
+`--mode partial`. Refinement uses the same retained candidates, document
+scope and query deadline. A failed initial write stops the command before
+quality loading. If quality loading, identity admission or refinement fails,
+the command exits with an error and the already delivered initial page remains
+valid. With an empty scope the quality producer must still pass admission
+before the command emits the empty refined page.
+
+Buffered one-shot queries admit both producers up front. A warm
+`authority-serve` session reuses its loaded producers across requests.
+
 ### Rerank an individual authority tier
 
 `authority-search` and `authority-serve` can apply an explicitly selected local

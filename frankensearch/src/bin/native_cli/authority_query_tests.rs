@@ -422,6 +422,150 @@ fn parsed(extra: &[&str]) -> Result<Option<Options>> {
     parse(&arguments)
 }
 
+/// Observe actual flushes independently of the writer borrowed by the command.
+#[derive(Default)]
+struct PhaseOutput {
+    pending: Vec<u8>,
+    flushed: Arc<Mutex<Vec<serde_json::Value>>>,
+    fail_flush: bool,
+}
+
+impl io::Write for PhaseOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.fail_flush {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"));
+        }
+        self.flushed
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&self.pending)?);
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+#[test]
+fn one_shot_streams_load_quality_only_after_a_successful_initial_flush() {
+    let clock = Arc::new(VirtualClock::new());
+    let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+    let runtime = RuntimeBuilder::current_thread()
+        .with_timer_driver(timer)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap().with_blocking_pool_handle(None);
+        for mode in ["full", "partial"] {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let receipt = if mode == "partial" {
+                publish_partial_cli(&cx, &parent, &fast, &quality, false)
+                    .await
+                    .0
+                    .receipt
+            } else {
+                publish_full(
+                    &cx,
+                    &parent,
+                    &fast,
+                    &quality,
+                    vec![
+                        IndexableDocument::new("fast-only", "retry fallback"),
+                        IndexableDocument::new("quality", "retry network"),
+                    ],
+                    [NativeBuildRetrieval::Exact; 2],
+                )
+                .await;
+                parent.join("initial.json")
+            };
+            for (filter, failure) in [
+                (None, "success"),
+                (Some(r#"{"ids":["quality"]}"#), "success"),
+                (Some(r#"{"ids":[]}"#), "success"),
+                (Some(r#"{"ids":[]}"#), "identity"),
+                (None, "load"),
+                (None, "identity"),
+                (None, "timeout"),
+                (None, "transport"),
+            ] {
+                let mut options = parsed(&["--mode", mode, "--stream", "--full-query", TUNED])
+                    .unwrap()
+                    .unwrap();
+                options.receipt = receipt.clone();
+                options.query = Some("retry".to_owned());
+                options.filter = filter.map(|text| Filter::parse(text).unwrap());
+                let empty = filter == Some(r#"{"ids":[]}"#);
+                let mut wire = PhaseOutput {
+                    fail_flush: failure == "transport",
+                    ..Default::default()
+                };
+                let flushed = Arc::clone(&wire.flushed);
+                options.timeout_ms = Some(1000);
+                let before = calls(&fast, &quality);
+                let mut quality_loads = 0;
+                let result = search_with_loader(&cx, &options, &mut wire, |tier| {
+                    if tier == EmbedderTierTag::Fast {
+                        assert!(flushed.lock().unwrap().is_empty());
+                        return Ok(fast.clone() as Arc<dyn Embedder>);
+                    }
+                    let initial = flushed.lock().unwrap();
+                    assert_eq!(initial.len(), 1);
+                    assert_eq!(initial[0]["phase"], "initial");
+                    assert_eq!(initial[0]["results"].as_array().unwrap().is_empty(), empty);
+                    assert_eq!(
+                        calls(&fast, &quality),
+                        (before.0 + usize::from(!empty), before.1)
+                    );
+                    quality_loads += 1;
+                    match failure {
+                        "identity" => Ok(fast.clone() as Arc<dyn Embedder>),
+                        "load" => Err(bad("quality unavailable")),
+                        "timeout" => {
+                            clock.advance(1_000_000_001);
+                            Ok(quality.clone() as Arc<dyn Embedder>)
+                        }
+                        _ => Ok(quality.clone() as Arc<dyn Embedder>),
+                    }
+                })
+                .await;
+                let pages = flushed.lock().unwrap();
+                assert_eq!(quality_loads, usize::from(failure != "transport"));
+                assert_eq!(
+                    result.is_ok(),
+                    failure == "success",
+                    "{mode} {failure}: {result:?}"
+                );
+                if failure == "success" {
+                    assert_eq!(pages.len(), 2);
+                    assert_eq!(pages[1]["phase"], "refined");
+                    assert_eq!(pages[0]["authority"], pages[1]["authority"]);
+                    assert_eq!(pages[1]["results"].as_array().unwrap().is_empty(), empty);
+                } else {
+                    assert_eq!(pages.len(), usize::from(failure != "transport"));
+                    if failure == "timeout" {
+                        assert!(matches!(
+                            result.unwrap_err().downcast_ref::<SearchError>(),
+                            Some(SearchError::SearchTimeout { .. })
+                        ));
+                    }
+                }
+                assert_eq!(
+                    calls(&fast, &quality),
+                    (
+                        before.0 + usize::from(!empty),
+                        before.1 + usize::from(!empty && failure == "success")
+                    )
+                );
+            }
+        }
+    });
+}
+
 const EXCLUSIONS: &str =
     r#"not "vector source" nOt "quality source" -excluded -"outside source budget""#;
 

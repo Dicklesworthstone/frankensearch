@@ -22,7 +22,7 @@ use frankensearch::native_ann::builder::{
 };
 use frankensearch::native_ann::{
     NativeGenerationReceipt as Receipt, NativeGenerationSavedAttempt as SavedAttempt,
-    NativeGenerationSnapshot, NativeGenerationTopology, NativeSearchPhase,
+    NativeGenerationSnapshot, NativeGenerationTopology, NativeProgressiveSearch, NativeSearchPhase,
 };
 use frankensearch::{
     Cx, Embedder, GenerationActivationV1, GenerationCandidateV1, GenerationPublisherV1,
@@ -3271,9 +3271,7 @@ where
             || plan.stream
             || plan.policy.is_some_and(query_controls::configured)
         {
-            let mut empty_initial_without_refinement = false;
-            let mut buffered = None;
-            let mut query = query::within(cx, plan.deadline, async {
+            let query = query::within(cx, plan.deadline, async {
                 let search = if plan.mode == QueryMode::Partial {
                     selection.partial_progressive(
                         cx,
@@ -3299,56 +3297,7 @@ where
                 }
             })
             .await?;
-            // Do not poll again after a terminal phase was delivered: slow
-            // output must not retroactively reject a completed final page.
-            while !query.is_finished() {
-                let Some(phase) = Box::pin(query::within(cx, plan.deadline, async {
-                    Ok(query.next_phase().await?)
-                }))
-                .await?
-                else {
-                    break;
-                };
-                let (name, results) = match phase {
-                    NativeSearchPhase::Initial { results, .. } => {
-                        empty_initial_without_refinement = results.is_empty();
-                        ("initial", results)
-                    }
-                    NativeSearchPhase::Refined { results, .. } => {
-                        empty_initial_without_refinement = false;
-                        ("refined", results)
-                    }
-                    NativeSearchPhase::RefinementFailed { error, .. }
-                    | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
-                    NativeSearchPhase::Reranked { results, .. } => {
-                        empty_initial_without_refinement = false;
-                        ("reranked", results)
-                    }
-                };
-                if plan.stream {
-                    deliver(name, &results)?;
-                } else {
-                    buffered = Some((name, results));
-                }
-            }
-            if empty_initial_without_refinement {
-                // A zero-sized scope admits both identities, then the native
-                // iterator completes after empty Initial without inference.
-                // Finish the CLI's two-frame contract on a persistent stream.
-                // Native computation is already complete. Delivering its
-                // synthetic final frame must not recheck elapsed output time.
-                checkpoint(cx)?;
-                if plan.stream {
-                    deliver("refined", &[])?;
-                } else {
-                    buffered = Some(("refined", Vec::new()));
-                }
-            }
-            if !plan.stream {
-                let (phase, results) =
-                    buffered.ok_or_else(|| serve_refused("missing_full_query_phase"))?;
-                deliver(phase, &results)?;
-            }
+            Box::pin(deliver_progressive(cx, query, &plan, false, &mut deliver)).await?;
         } else {
             let results = query::within(cx, plan.deadline, async {
                 selection
@@ -3443,6 +3392,68 @@ where
     Ok(())
 }
 
+/// Deliver the remaining phases of a two-tier query. A cold one-shot stream
+/// has already delivered Initial and may have exhausted an empty scope.
+async fn deliver_progressive(
+    cx: &Cx,
+    mut query: NativeProgressiveSearch<'_>,
+    plan: &QueryPlan<'_>,
+    mut empty_initial_without_refinement: bool,
+    deliver: &mut impl FnMut(&'static str, &[ScoredResult]) -> Result<()>,
+) -> Result<()> {
+    let mut buffered = None;
+    // Do not poll again after a terminal phase was delivered: slow
+    // output must not retroactively reject a completed final page.
+    while !query.is_finished() {
+        let Some(phase) = Box::pin(query::within(cx, plan.deadline, async {
+            Ok(query.next_phase().await?)
+        }))
+        .await?
+        else {
+            break;
+        };
+        let (name, results) = match phase {
+            NativeSearchPhase::Initial { results, .. } => {
+                empty_initial_without_refinement = results.is_empty();
+                ("initial", results)
+            }
+            NativeSearchPhase::Refined { results, .. } => {
+                empty_initial_without_refinement = false;
+                ("refined", results)
+            }
+            NativeSearchPhase::RefinementFailed { error, .. }
+            | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
+            NativeSearchPhase::Reranked { results, .. } => {
+                empty_initial_without_refinement = false;
+                ("reranked", results)
+            }
+        };
+        if plan.stream {
+            deliver(name, &results)?;
+        } else {
+            buffered = Some((name, results));
+        }
+    }
+    if empty_initial_without_refinement {
+        // A zero-sized scope admits both identities, then the native
+        // iterator completes after empty Initial without inference.
+        // Finish the CLI's two-frame contract on a persistent stream.
+        // Native computation is already complete. Delivering its
+        // synthetic final frame must not recheck elapsed output time.
+        checkpoint(cx)?;
+        if plan.stream {
+            deliver("refined", &[])?;
+        } else {
+            buffered = Some(("refined", Vec::new()));
+        }
+    }
+    if !plan.stream {
+        let (phase, results) = buffered.ok_or_else(|| serve_refused("missing_full_query_phase"))?;
+        deliver(phase, &results)?;
+    }
+    Ok(())
+}
+
 async fn search(
     cx: &Cx,
     options: &Options,
@@ -3507,6 +3518,7 @@ where
         options.filter.as_ref(),
         options.max_source_bytes,
     )?;
+    let cold_quality = options.stream && mode.is_progressive();
     let loaded = if mode == QueryMode::Lexical {
         AuthorityModels::Lexical
     } else {
@@ -3516,7 +3528,7 @@ where
             } else {
                 EmbedderTierTag::Fast
             })?,
-            quality: if matches!(mode, QueryMode::Full | QueryMode::Partial) {
+            quality: if mode.is_progressive() && !cold_quality {
                 Some(load_model(EmbedderTierTag::Quality)?)
             } else {
                 None
@@ -3524,9 +3536,8 @@ where
         }
         .into()
     };
-    // Opening the selected images, fixed scope and models is startup work,
-    // matching the ordinary native CLI. Every query phase then shares this
-    // absolute deadline, including synchronous retrieval and hydration.
+    // Admitting the images, scope and initial models is startup. A streaming
+    // two-tier query loads quality under this deadline after Initial flushes.
     let policy = query_controls::load_policy(cx, options)?;
     let deadline = policy.start(cx, None)?;
     let plan = QueryPlan {
@@ -3538,32 +3549,77 @@ where
         policy: Some(&policy),
         max_source_bytes: options.max_source_bytes,
     };
-    query_selected(
-        cx,
-        &snapshot,
-        scope.as_ref(),
-        &loaded,
-        plan,
-        |phase, results| {
-            let mut response = serde_json::json!({
-                "schema": SCHEMA, "ok": true, "event": "results",
-                "tier": mode.as_str(), "mode": mode.as_str(), "topology": receipt.topology_name(),
-                "phase": phase, "generation": receipt.generation,
-                "authority": snapshot.authority().canonical_bytes().as_slice(),
-                "profile": receipt.profile, "results": results,
-            });
-            annotate_snapshot_retrieval(&mut response, &snapshot, Some(mode));
-            annotate_selection(&mut response, &snapshot);
-            annotate_scope(
-                &mut response,
-                scope.as_ref().map(NativeScopedGenerationSnapshot::len),
-            );
-            annotate_execution(&mut response, mode);
-            query_controls::annotate(&policy, mode, &mut response);
-            emit(output, &response)
-        },
-    )
-    .await
+    let mut deliver = |phase: &'static str, results: &[ScoredResult]| {
+        let mut response = serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "results",
+            "tier": mode.as_str(), "mode": mode.as_str(), "topology": receipt.topology_name(),
+            "phase": phase, "generation": receipt.generation,
+            "authority": snapshot.authority().canonical_bytes().as_slice(),
+            "profile": receipt.profile, "results": results,
+        });
+        annotate_snapshot_retrieval(&mut response, &snapshot, Some(mode));
+        annotate_selection(&mut response, &snapshot);
+        annotate_scope(
+            &mut response,
+            scope.as_ref().map(NativeScopedGenerationSnapshot::len),
+        );
+        annotate_execution(&mut response, mode);
+        query_controls::annotate(&policy, mode, &mut response);
+        emit(output, &response)
+    };
+    if cold_quality {
+        // Declared before the iterator so the provider lives through every phase.
+        let owned_quality;
+        let fast = loaded.models()?.fast.as_ref();
+        let mut search = query::within(cx, plan.deadline, async {
+            let selection =
+                query_controls::RetainedQuery::new(&snapshot, scope.as_ref(), Some(&policy));
+            let search = selection.deferred_progressive(cx, fast, plan.text, plan.limit)?;
+            query_controls::configure(search, &policy, plan.max_source_bytes)
+        })
+        .await?;
+        let empty_initial = {
+            let Some(NativeSearchPhase::Initial { results, .. }) =
+                Box::pin(query::within(cx, plan.deadline, async {
+                    Ok(search.next_phase().await?)
+                }))
+                .await?
+            else {
+                return Err(serve_refused("missing_initial_query_phase"));
+            };
+            deliver("initial", &results)?;
+            results.is_empty()
+        };
+        // A failed Initial write never reaches the loader. Admission, cold
+        // loading and refinement share the original absolute query deadline.
+        owned_quality = query::within(cx, plan.deadline, async {
+            checkpoint(cx)?;
+            load_model(EmbedderTierTag::Quality)
+        })
+        .await?;
+        query::within(cx, plan.deadline, async {
+            Ok(search.bind_deferred_quality(owned_quality.as_ref())?)
+        })
+        .await?;
+        Box::pin(deliver_progressive(
+            cx,
+            search,
+            &plan,
+            empty_initial,
+            &mut deliver,
+        ))
+        .await
+    } else {
+        Box::pin(query_selected(
+            cx,
+            &snapshot,
+            scope.as_ref(),
+            &loaded,
+            plan,
+            deliver,
+        ))
+        .await
+    }
 }
 
 fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
