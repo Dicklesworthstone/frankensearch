@@ -1187,6 +1187,35 @@ impl QuillSearchSnapshot {
         self.materialize_stored_value_bounded(field_ord, global_docid, max_bytes)
     }
 
+    /// Copy at most `max_chars` Unicode scalar values from a live stored text
+    /// column. The byte limit applies to that prefix. A missing field returns
+    /// `None` and a present empty prefix fits a zero-byte budget.
+    ///
+    /// # Errors
+    /// Refuses malformed sections, invalid UTF-8 anywhere in the column,
+    /// insufficient space for the requested prefix, and allocation failure.
+    pub fn stored_text_prefix_bounded(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+        max_chars: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        let Some(stored) = self.stored_field_bytes(field_ord, global_docid)? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(stored)
+            .map_err(|_| invalid_state("stored text column contains invalid UTF-8"))?;
+        let end = if max_chars >= text.len() {
+            text.len()
+        } else {
+            text.char_indices()
+                .nth(max_chars)
+                .map_or(text.len(), |(offset, _)| offset)
+        };
+        copy_stored_field_bounded(field_ord, Some(&stored[..end]), max_bytes)
+    }
+
     fn materialize_metadata(
         &self,
         global_docid: u32,
@@ -5973,6 +6002,23 @@ impl QuillSnapshotIndex {
         self.reader
             .checked_published_snapshot()?
             .stored_field_value_bounded(field_ord, global_docid, max_bytes)
+    }
+
+    /// Read a Unicode-safe prefix of a text column from this retained image.
+    ///
+    /// # Errors
+    /// Propagates snapshot, field, UTF-8 and byte-budget errors from
+    /// [`QuillSearchSnapshot::stored_text_prefix_bounded`].
+    pub fn stored_text_prefix_bounded(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+        max_chars: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.reader
+            .checked_published_snapshot()?
+            .stored_text_prefix_bounded(field_ord, global_docid, max_chars, max_bytes)
     }
 }
 
@@ -25457,6 +25503,46 @@ mod tests {
                 None
             );
             assert_eq!(snapshot.stored_field_value_bounded(1, 1, 0).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn stored_text_prefix_applies_byte_budget_after_unicode_selection() {
+        let content = format!("a🦀é{}", " skip".repeat(4096));
+        let source = typed_delta_snapshot(0, 0, "bounded-preview", &content, 1);
+        for sealed in [false, true] {
+            let index = if sealed {
+                typed_residency_index(&[Arc::clone(&source)], &[], deterministic_config())
+            } else {
+                typed_residency_index(&[], &[Arc::clone(&source)], deterministic_config())
+            };
+            let snapshot = index.search_snapshot().unwrap();
+            assert_eq!(
+                snapshot.stored_text_prefix_bounded(1, 0, 2, 5).unwrap(),
+                Some("a🦀".as_bytes().to_vec())
+            );
+            assert!(matches!(
+                snapshot.stored_text_prefix_bounded(1, 0, 2, 4),
+                Err(QuillIndexError::StoredFieldBudgetExceeded {
+                    required: 5,
+                    limit: 4,
+                    ..
+                })
+            ));
+            assert_eq!(
+                snapshot.stored_text_prefix_bounded(1, 0, 0, 0).unwrap(),
+                Some(Vec::new())
+            );
+            assert_eq!(
+                snapshot.stored_text_prefix_bounded(1, 1, 2, 5).unwrap(),
+                None
+            );
+            assert_eq!(
+                snapshot
+                    .stored_text_prefix_bounded(1, 0, usize::MAX, content.len())
+                    .unwrap(),
+                Some(content.as_bytes().to_vec())
+            );
         }
     }
 
