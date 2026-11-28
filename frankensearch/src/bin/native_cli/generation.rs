@@ -977,7 +977,8 @@ impl Options {
                 if options.partial_quality != options.quality_ids.is_some() {
                     return Err(bad("--tier partial and --quality-ids require each other"));
                 }
-                options.validate_quality_retrieval(options.progressive || options.partial_quality)?;
+                options
+                    .validate_quality_retrieval(options.progressive || options.partial_quality)?;
                 options.quality.validate_usage(
                     tier == EmbedderTierTag::Quality
                         || options.progressive
@@ -2149,7 +2150,10 @@ where
     if let Some(quality) = loaded.quality {
         builder = builder
             .with_quality_embedder(quality)?
-            .with_quality_storage(NativeBuildPrecision::F32, options.build_quality_retrieval(None))?;
+            .with_quality_storage(
+                NativeBuildPrecision::F32,
+                options.build_quality_retrieval(None),
+            )?;
     }
     let built = if options.partial_quality {
         builder

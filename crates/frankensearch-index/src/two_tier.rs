@@ -3777,6 +3777,10 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// Reconstruct coverage using the exact same retrieval policy that served
     /// the candidates. An explicit scan override must not replay a native
     /// graph and misattribute candidates that only the exact scan returned.
+    /// This replays the activated native or exact policy. For the configured
+    /// fast backend use the window from
+    /// [`Self::search_configured_fast_with_candidate_window`], which retains
+    /// the candidates served by that backend.
     ///
     /// # Errors
     ///

@@ -9435,9 +9435,8 @@ mod progressive_authority {
                         .unwrap()
                         .with_updates(2, MAX_INPUT_BYTES)
                         .unwrap();
-                        session.query_policy.full_query = Some(
-                            query::FullQuery::parse(r#"{"request_overrides":true}"#).unwrap(),
-                        );
+                        session.query_policy.full_query =
+                            Some(query::FullQuery::parse(r#"{"request_overrides":true}"#).unwrap());
                         let raw = session.models.models().unwrap().clone();
                         let cached = session.query_models().models().unwrap().clone();
                         let primed = exchange(
@@ -10072,7 +10071,10 @@ mod progressive_authority {
             let output = exchange(
                 &cx,
                 &mut session,
-                &[outside, serde_json::json!({"query":"retry","mode":"lexical"})],
+                &[
+                    outside,
+                    serde_json::json!({"query":"retry","mode":"lexical"}),
+                ],
             )
             .await;
             assert_eq!(output[1]["event"], "updated");

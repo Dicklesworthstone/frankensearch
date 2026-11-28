@@ -7002,8 +7002,11 @@ mod tests {
                     builder
                 };
                 builder.build(&cx).await.unwrap();
-                std::fs::rename(built.path().join("lexical"), restored.path().join("lexical"))
-                    .unwrap();
+                std::fs::rename(
+                    built.path().join("lexical"),
+                    restored.path().join("lexical"),
+                )
+                .unwrap();
                 let vector = restored.path().join(VECTOR_INDEX_FAST_FILENAME);
                 for corrupt_vector in [false, true] {
                     if corrupt_vector {
