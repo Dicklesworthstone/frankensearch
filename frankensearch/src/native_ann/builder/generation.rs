@@ -773,8 +773,27 @@ impl NativeBuiltExactGeneration {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<PreparedNativeGenerationScope> {
+        self.prepare_scope_with_id_selection(cx, candidate, ids, None, max_source_bytes, accept)
+    }
+
+    /// Prepare candidate membership using the same literal prefix and exact ID
+    /// intersection as [`crate::native_ann::NativeGenerationSnapshot::scope_with_id_selection`].
+    /// Only live selected rows' stored fields are read and charged.
+    ///
+    /// # Errors
+    /// Refuses candidate drift, invalid source, budget exhaustion, cancellation
+    /// and predicate errors before returning a prepared scope.
+    pub fn prepare_scope_with_id_selection(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+        ids: Option<&BTreeSet<String>>,
+        id_prefix: Option<&str>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<PreparedNativeGenerationScope> {
         let readers = self.admit_candidate(cx, candidate)?;
-        let source = readers.scope_documents(cx, ids, max_source_bytes)?;
+        let source = readers.scope_documents(cx, ids, id_prefix, max_source_bytes)?;
         PreparedNativeGenerationScope::from_source(
             cx,
             candidate.authority(),

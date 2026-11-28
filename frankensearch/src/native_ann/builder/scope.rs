@@ -230,10 +230,30 @@ impl NativeGenerationSnapshot {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<NativeScopedGenerationSnapshot> {
+        self.scope_with_id_selection(cx, ids, None, max_source_bytes, accept)
+    }
+
+    /// Restrict source reads to live IDs matching an optional literal prefix
+    /// and exact set before evaluating the predicate. With a prefix alone,
+    /// only the vector row IDs are scanned across the complete generation.
+    /// The byte budget covers only matching stored source fields. Lexical
+    /// scoring retains its original corpus statistics.
+    ///
+    /// # Errors
+    /// Refuses invalid source, budget exhaustion, cancellation and predicate
+    /// failures. All matching source fields must fit before any predicate runs.
+    pub fn scope_with_id_selection(
+        self: &Arc<Self>,
+        cx: &Cx,
+        ids: Option<&BTreeSet<String>>,
+        id_prefix: Option<&str>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationSnapshot> {
         checkpoint(cx, "native_ann.generation_scope.start")?;
         let source = self
             .scope_readers()
-            .scope_documents(cx, ids, max_source_bytes)?;
+            .scope_documents(cx, ids, id_prefix, max_source_bytes)?;
         let membership = prepare_generation_membership(cx, source, accept)?;
         Ok(NativeScopedGenerationSnapshot::from_membership(
             Arc::clone(self),
@@ -273,10 +293,27 @@ impl NativeGenerationPreview {
         max_source_bytes: usize,
         accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<NativeScopedGenerationPreview> {
+        self.scope_with_id_selection(cx, ids, None, max_source_bytes, accept)
+    }
+
+    /// Preview the same literal prefix, exact ID intersection and source
+    /// budget as [`NativeGenerationSnapshot::scope_with_id_selection`].
+    ///
+    /// # Errors
+    /// Refuses invalid source, budget exhaustion, cancellation and predicate
+    /// failures. All matching source fields must fit before any predicate runs.
+    pub fn scope_with_id_selection(
+        self: &Arc<Self>,
+        cx: &Cx,
+        ids: Option<&BTreeSet<String>>,
+        id_prefix: Option<&str>,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationPreview> {
         checkpoint(cx, "native_ann.generation_preview_scope.start")?;
         let source = self
             .scope_readers()
-            .scope_documents(cx, ids, max_source_bytes)?;
+            .scope_documents(cx, ids, id_prefix, max_source_bytes)?;
         let membership = prepare_generation_membership(cx, source, accept)?;
         Ok(NativeScopedGenerationPreview {
             preview: Arc::clone(self),

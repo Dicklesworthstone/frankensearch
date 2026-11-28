@@ -348,6 +348,68 @@ fn exact_id_scope_refills_global_lexical_ranks_without_exporting_unrelated_bodie
     });
 }
 
+#[test]
+fn literal_prefix_scopes_read_only_live_matching_source_before_querying() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let f = fixture(&cx, true, false).await;
+        for (filter, expected) in [
+            (r#"{"id_prefix":"key"}"#, Some("keyword")),
+            (
+                r#"{"ids":["keyword","huge"],"id_prefix":"key","metadata":{"source_id":"keyword"}}"#,
+                Some("keyword"),
+            ),
+            (
+                r#"{"ids":["keyword","huge"],"id_prefix":"key","metadata":{"source_id":"huge"}}"#,
+                None,
+            ),
+            (r#"{"id_prefix":"Key"}"#, None),
+        ] {
+            let mut options = parsed(&[
+                "--mode",
+                "lexical",
+                "--filter",
+                filter,
+                "--max-source-bytes",
+                "512",
+            ])
+            .unwrap()
+            .unwrap();
+            options.receipt = f.receipt.clone();
+            let mut output = Vec::new();
+            search_with_loader(&cx, &options, &mut output, |_| {
+                panic!("lexical search loaded a model")
+            })
+            .await
+            .unwrap();
+            let page = &frames(&output)[0];
+            let hits = page["results"].as_array().unwrap();
+            assert_eq!(
+                page["scope"]["eligible_documents"],
+                usize::from(expected.is_some()),
+                "{filter}"
+            );
+            assert_eq!(hits.len(), usize::from(expected.is_some()), "{filter}");
+            if let Some(id) = expected {
+                assert_eq!(hits[0]["doc_id"], id);
+            }
+        }
+        let missing = Filter::parse(r#"{"id_prefix":"Key"}"#).unwrap();
+        assert!(
+            prepare_scope(&cx, &f.session.snapshot, Some(&missing), 0)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        for filter in [
+            r#"{"id_prefix":"hu"}"#,
+            r#"{"metadata":{"source_id":"keyword"}}"#,
+        ] {
+            let filter = Filter::parse(filter).unwrap();
+            assert!(prepare_scope(&cx, &f.session.snapshot, Some(&filter), 512).is_err());
+        }
+    });
+}
+
 fn parsed(extra: &[&str]) -> Result<Option<Options>> {
     let mut arguments = vec![
         "authority-search",
@@ -1500,12 +1562,10 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
         for ann in [false, true] {
             for scoped in [false, true] {
                 let mut f = fixture(&cx, true, ann).await;
+                let scoped_budget = f.session.max_source_bytes;
                 if !scoped {
                     f.session.scope = None;
                     f.session.fixed_filter = None;
-                    // Request filters must first admit the full source cohort;
-                    // this fixture's small cap only suits its prepared scope.
-                    f.session.max_source_bytes = MAX_INPUT_BYTES;
                 }
                 let pool = BlockingPool::new(0, 2);
                 let pooled_cx = cx.clone().with_blocking_pool_handle(Some(pool.handle()));
@@ -1528,6 +1588,14 @@ fn caller_pool_reaches_every_authority_query_mode_and_preserves_retained_results
                             "full_query":{"candidate_multiplier":1,"rerank":false}}));
                     }
                     for request in &requests {
+                        // Unrestricted reranking may select the large document.
+                        // Exact-ID requests fit the original small source budget.
+                        let unrestricted_rerank = tuned && !scoped && request.get("filter").is_none();
+                        f.session.max_source_bytes = if unrestricted_rerank {
+                            MAX_INPUT_BYTES
+                        } else {
+                            scoped_budget
+                        };
                         f.session.query_policy.query_pool = None;
                         let inline =
                             exchange(&cx, &mut f.session, std::slice::from_ref(request)).await;

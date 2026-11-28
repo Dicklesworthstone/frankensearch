@@ -2254,16 +2254,29 @@ impl CompositeReaders {
         cx: &Cx,
         max_source_bytes: usize,
     ) -> SearchResult<Vec<IndexableDocument>> {
+        self.scan_source_documents(cx, None, max_source_bytes)
+    }
+
+    fn scan_source_documents(
+        &self,
+        cx: &Cx,
+        id_prefix: Option<&str>,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        let prefix = id_prefix.unwrap_or_default();
         let (snapshot, live_count, field_ids) = self.source_context(cx)?;
         // Every admitted FSVI identifier is nonempty. Reject an impossible
         // budget before reserving the output collection.
-        if live_count > max_source_bytes {
-            return Err(refused("source", "stored-payload-limit"));
-        }
         let mut documents = Vec::new();
-        documents
-            .try_reserve_exact(live_count)
-            .map_err(|_| refused("source", "allocation-failed"))?;
+        if prefix.is_empty() {
+            if live_count > max_source_bytes {
+                return Err(refused("source", "stored-payload-limit"));
+            }
+            documents
+                .try_reserve_exact(live_count)
+                .map_err(|_| refused("source", "allocation-failed"))?;
+        }
+        let mut seen_live = 0;
         let mut remaining_bytes = max_source_bytes;
         for physical_row in 0..self.vector.owner.record_count() {
             checkpoint(cx, "native_ann.generation.source_row")?;
@@ -2275,6 +2288,10 @@ impl CompositeReaders {
             if !row.flags().is_live() {
                 continue;
             }
+            seen_live += 1;
+            if !row.doc_id().starts_with(prefix) {
+                continue;
+            }
             documents.push(self.read_source_document(
                 cx,
                 &snapshot,
@@ -2283,7 +2300,7 @@ impl CompositeReaders {
                 &mut remaining_bytes,
             )?);
         }
-        if documents.len() != live_count {
+        if seen_live != live_count {
             return Err(refused("source", "live-count-mismatch"));
         }
         checkpoint(cx, "native_ann.generation.source_complete")?;
@@ -2298,23 +2315,25 @@ impl CompositeReaders {
             .map_err(|_| refused("source", "invalid-vector-row"))
     }
 
-    /// An explicit ID set bounds stored-field reads before a source predicate
-    /// runs. Absent and tombstoned IDs carry no source cost or membership.
+    /// Resolve exact IDs directly when available, otherwise inspect live vector
+    /// row IDs. Only the intersection with the literal prefix may read source.
     pub(super) fn scope_documents(
         &self,
         cx: &Cx,
         ids: Option<&BTreeSet<String>>,
+        id_prefix: Option<&str>,
         max_source_bytes: usize,
     ) -> SearchResult<Vec<IndexableDocument>> {
         let Some(ids) = ids else {
-            return self.source_documents(cx, max_source_bytes);
+            return self.scan_source_documents(cx, id_prefix, max_source_bytes);
         };
         let (snapshot, _, fields) = self.source_context(cx)?;
+        let prefix = id_prefix.unwrap_or_default();
         let mut remaining = max_source_bytes;
         let mut documents = Vec::new();
         for id in ids {
             checkpoint(cx, "native_ann.generation.scope_source_id")?;
-            if self.has_live_document(id)? {
+            if id.starts_with(prefix) && self.has_live_document(id)? {
                 documents.push(self.read_source_document(
                     cx,
                     &snapshot,

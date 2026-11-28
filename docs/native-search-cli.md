@@ -1636,9 +1636,14 @@ whole-corpus statistics. A selective lexical query can examine the full matching
 cohort.
 
 `--max-source-bytes` bounds the stored fields read to evaluate a filter, with
-a 256 MiB default. An explicit `ids` list reads only the live documents named
-in that list. Missing IDs consume zero bytes. An empty list selects nothing.
-Prefix and metadata filters without an ID list evaluate the entire corpus.
+a 256 MiB default. An explicit `ids` list selects live documents by ID.
+A literal `id_prefix` selects live documents whose IDs start with that prefix.
+When both are present, only IDs matching both conditions consume source bytes.
+For example, `{"id_prefix":"src/","metadata":{"language":"rust"}}` reads
+stored fields under `src/` and then tests the language. A large document
+under `vendor/` consumes none of this budget. A prefix without an ID list
+scans the generation's ID inventory. Missing IDs and empty selections consume
+zero source bytes. Metadata-only filters evaluate the entire corpus.
 The same source budget applies when a successor is prepared for activation.
 A fixed server scope retains the selected source and reuses it for narrower
 requests. Without a fixed scope, each filtered request reads its own bounded
@@ -1652,11 +1657,11 @@ generation before replacing any session state. Source validation, budget, or
 policy failure preserves the previous reader and its membership. Previously
 retained library scopes likewise keep their original source and authority
 across publication and rollback; they are not live revocation mechanisms.
-Library callers can retain an `Arc<NativeGenerationSnapshot>`, call
-`snapshot.scope_with_ids(&cx, Some(&ids), max_source_bytes, predicate)` for an
-exact ID set or `snapshot.scope(&cx, max_source_bytes, predicate)` for the
-entire corpus. Use `narrow` to intersect that scope with another predicate
-without exporting the source again.
+Library callers can retain an `Arc<NativeGenerationSnapshot>` and call
+`snapshot.scope_with_id_selection(&cx, ids, id_prefix, max_source_bytes, predicate)`.
+Both selectors are optional. `snapshot.scope(&cx, max_source_bytes, predicate)`
+evaluates the predicate over the entire corpus. Use `narrow` to intersect a
+retained scope with another predicate without exporting source again.
 
 ### Fetch document text from the selected authority
 

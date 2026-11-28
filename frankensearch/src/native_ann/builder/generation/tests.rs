@@ -264,6 +264,77 @@ fn exact_ids_bound_prepublication_and_preview_source_with_the_same_budget() {
 }
 
 #[test]
+fn literal_id_prefix_bounds_source_in_preview_and_prepublication() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let prefix = "src/[x]/";
+        let first = "src/[x]/a";
+        let second = "src/[x]/b";
+        let unrelated = "src/x/large";
+        let built = NativeIndexBuilder::new(directory.path().join("work"), generation(), provider)
+            .unwrap()
+            .add_documents([
+                IndexableDocument::new(first, "horizontal"),
+                IndexableDocument::new(second, "vertical"),
+                IndexableDocument::new(unrelated, "large ".repeat(1024)),
+            ])
+            .build_exact_generation(&cx, EmbedderTierTag::Fast, SOURCE, BUDGET)
+            .await
+            .unwrap();
+        let candidate = candidate(&built);
+        let preview = Arc::new(built.preview_candidate(&cx, &candidate).unwrap());
+        // These documents have an empty stored title and canonical {} metadata.
+        let one = first.len() + "horizontal".len() + 2;
+        let both = one + second.len() + "vertical".len() + 2;
+        assert!(preview.source_documents(&cx, both).is_err());
+        let scoped = preview
+            .scope_with_id_selection(&cx, None, Some(prefix), both, |_| Ok(true))
+            .unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped.document(first).unwrap().content, "horizontal");
+        assert_eq!(scoped.document(second).unwrap().content, "vertical");
+        assert!(scoped.document(unrelated).is_none());
+        assert!(
+            preview
+                .scope_with_id_selection(&cx, None, Some(prefix), both - 1, |_| {
+                    panic!("the full matching selection must fit before the predicate runs")
+                })
+                .is_err()
+        );
+        assert!(
+            preview
+                .scope_with_id_selection(&cx, None, Some("other/"), 0, |_| {
+                    panic!("no matching source rows")
+                })
+                .unwrap()
+                .is_empty()
+        );
+
+        let ids = BTreeSet::from([
+            first.to_owned(),
+            unrelated.to_owned(),
+            format!("{prefix}gone"),
+        ]);
+        let mut visited = Vec::new();
+        built
+            .prepare_scope_with_id_selection(
+                &cx,
+                &candidate,
+                Some(&ids),
+                Some(prefix),
+                one,
+                |doc| {
+                    visited.push(doc.id.clone());
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(visited, [first]);
+    });
+}
+
+#[test]
 fn progressive_generation_retains_independent_tiers_and_one_complete_source_cohort() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         // The second case deliberately has identical explicit providers and

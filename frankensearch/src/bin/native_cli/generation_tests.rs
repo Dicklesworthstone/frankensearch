@@ -9993,7 +9993,7 @@ mod progressive_authority {
             let authority = fs::read(selected.root.join("AUTHORITY")).unwrap();
             let before = calls(&fast, &quality);
             // The edits realize fast-only coverage, preparing quality retirement,
-            // but the candidate's source exceeds the fixed scope's export budget.
+            // but the selected fast-only document exceeds the fixed scope's budget.
             // Its unchanged content still reuses the original document vector.
             let request = serde_json::json!({
                 "op":"update", "expected_authority":selected.authority,
@@ -10006,6 +10006,7 @@ mod progressive_authority {
                      "metadata":{"note":"x".repeat(1_024)}}
                 ]
             });
+            let mut outside = request.clone();
             let output = exchange(&cx, &mut session, &[request, query]).await;
             assert_eq!(output[1]["event"], "failed");
             assert_eq!(output[1]["publication"], "not_committed");
@@ -10061,6 +10062,30 @@ mod progressive_authority {
                     .iter()
                     .all(|document| !document.metadata.contains_key("note"))
             );
+
+            // Move the same oversized metadata outside the fixed ID set. The
+            // warm publisher can now commit the transition and bind the scope.
+            outside["work_dir"] = serde_json::json!(parent.join("outside-scope-work"));
+            outside["new_receipt"] = serde_json::json!(parent.join("outside-scope.json"));
+            outside["changes"][1]["id"] = serde_json::json!("garden");
+            outside["changes"][1]["content"] = serde_json::json!("garden flowers");
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[outside, serde_json::json!({"query":"retry","mode":"lexical"})],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "updated");
+            assert_eq!(output[1]["publication"], "committed");
+            assert_eq!(output[1]["serving"], "activated");
+            assert_eq!(output[1]["topology"], "fast_only");
+            assert_eq!(output[1]["scope"]["eligible_documents"], 1);
+            assert_eq!(output[2]["event"], "results");
+            assert_eq!(output[2]["authority"], output[1]["authority"]);
+            assert_eq!(output[2]["results"][0]["doc_id"], "fast-only");
+            assert_eq!(calls(&fast, &quality), before);
+            assert!(session.snapshot.source_documents(&cx, 512).is_err());
+            assert!(session.scope.as_ref().unwrap().document("garden").is_none());
         });
     }
 

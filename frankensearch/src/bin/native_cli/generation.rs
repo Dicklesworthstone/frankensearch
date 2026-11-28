@@ -404,8 +404,8 @@ Search requests may include a filter object; it intersects the server's fixed\n\
 filter and cannot widen it. Membership filters vector and lexical candidates\n\
 before fusion. Hybrid queries, including empty scopes, require the selected producer.\n\
 Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
-An exact ids list reads only the listed live documents before applying other\n\
-constraints. Prefix or metadata filters alone inspect the complete source.\n\
+Exact IDs and literal ID prefixes restrict stored-field reads before metadata\n\
+filtering. A metadata-only filter inspects the complete source.\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
@@ -1825,9 +1825,14 @@ fn stage_prepared_and_publish(
     // Scope preparation uses the actual completed images, including stored
     // metadata encoding. Any budget or predicate refusal precedes publication.
     let prepared_scope = if let Some((filter, budget)) = options.scope {
-        Some(built.prepare_scope_with_ids(cx, &candidate, filter.ids(), budget, |document| {
-            Ok(filter.matches(document))
-        })?)
+        Some(built.prepare_scope_with_id_selection(
+            cx,
+            &candidate,
+            filter.ids(),
+            filter.id_prefix(),
+            budget,
+            |document| Ok(filter.matches(document)),
+        )?)
     } else {
         built.validate_candidate(cx, &candidate)?;
         None
@@ -3616,13 +3621,12 @@ fn prepare_scope(
         return Ok(None);
     };
     filter.validate()?;
-    Ok(Some(snapshot.scope_with_ids(
+    Ok(Some(snapshot.scope_with_id_selection(
         cx,
         filter.ids(),
+        filter.id_prefix(),
         max_source_bytes,
-        |document| {
-        Ok(filter.matches(document))
-    },
+        |document| Ok(filter.matches(document)),
     )?))
 }
 
@@ -4344,8 +4348,8 @@ impl AuthoritySession {
             response["scope"] = serde_json::json!({ "filtered": true });
         }
         if let Some(scope) = &self.scope {
-            // The fixed membership and complete bounded source inventory were
-            // prepared with this exact retained authority. Excluded IDs remain
+            // The fixed membership and its source documents were prepared
+            // with this exact retained authority. Excluded IDs remain
             // unavailable without reading their fields or checking their offsets.
             source::render_documents(
                 cx,

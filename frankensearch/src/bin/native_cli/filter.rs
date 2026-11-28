@@ -73,6 +73,10 @@ impl Filter {
         self.ids.as_ref()
     }
 
+    pub(super) fn id_prefix(&self) -> Option<&str> {
+        self.id_prefix.as_deref()
+    }
+
     pub(super) fn matches(&self, document: &IndexableDocument) -> bool {
         self.ids
             .as_ref()

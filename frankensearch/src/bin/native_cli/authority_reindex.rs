@@ -587,9 +587,13 @@ impl Inputs<'_> {
             .filter
             .as_ref()
             .map(|filter| {
-                preview.scope_with_ids(cx, filter.ids(), self.options.max_source_bytes, |document| {
-                    Ok(filter.matches(document))
-                })
+                preview.scope_with_id_selection(
+                    cx,
+                    filter.ids(),
+                    filter.id_prefix(),
+                    self.options.max_source_bytes,
+                    |document| Ok(filter.matches(document)),
+                )
             })
             .transpose()?;
         let mut phases = Phases::new();
