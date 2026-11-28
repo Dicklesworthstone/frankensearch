@@ -46,8 +46,8 @@ use frankensearch_core::traits::{
     SearchFuture,
 };
 use frankensearch_core::types::{
-    BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
-    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
+    BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult,
+    SearchCoverageV1, SearchMetrics, SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
 use frankensearch_core::{
     DocId, EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus,
@@ -612,6 +612,11 @@ struct RefinementPools {
 struct FastRefinementEvidence {
     query: BoundQueryEmbedding,
     hits: Vec<VectorHit>,
+}
+
+struct FastRefinementReplacement {
+    raw_hits: Vec<VectorHit>,
+    coverage: Option<SearchCoverageV1>,
 }
 
 /// What the quality tier contributed to a refinement (bd-ctzo C2).
@@ -3948,7 +3953,7 @@ impl TwoTierSearcher {
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         request_filter: &mut RequestFilter<'_>,
         mut retrieve_quality: impl FnMut(usize) -> SearchResult<Vec<VectorHit>>,
-    ) -> SearchResult<Option<Vec<VectorHit>>> {
+    ) -> SearchResult<Option<FastRefinementReplacement>> {
         if !request_filter.is_active() {
             return Ok(None);
         }
@@ -4040,7 +4045,7 @@ impl TwoTierSearcher {
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         request_filter: &mut RequestFilter<'_>,
         revoked: &mut AHashSet<DocId>,
-        replacement_evidence: &mut Option<Vec<VectorHit>>,
+        replacement_evidence: &mut Option<FastRefinementReplacement>,
     ) -> SearchResult<bool> {
         if !request_filter.is_active() {
             return Ok(false);
@@ -4064,6 +4069,7 @@ impl TwoTierSearcher {
             request_filter.retain_vectors(cx, fast_hits)?;
             return Ok(previous != fast_hits.len());
         };
+        let mut fast_window = None;
         let replaced = request_filter
             .reconcile_vectors_with_history(
                 cx,
@@ -4083,7 +4089,13 @@ impl TwoTierSearcher {
                     {
                         let embeddings = TieredQueryEmbeddings::fast_only(evidence.query.clone());
                         let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
-                        activated.search_configured_fast_classified(limit, self.search_params)?
+                        let (classified, window) = activated
+                            .search_configured_fast_with_candidate_window(
+                                limit,
+                                self.search_params,
+                            )?;
+                        fast_window = Some(window);
+                        classified
                     } else {
                         self.index.search_fast_classified_cancellable(
                             cx,
@@ -4098,7 +4110,10 @@ impl TwoTierSearcher {
             )
             .await?;
         if replaced {
-            *replacement_evidence = Some(fast_hits.clone());
+            *replacement_evidence = Some(FastRefinementReplacement {
+                raw_hits: fast_hits.clone(),
+                coverage: fast_window.map(|window| window.into_coverage(fast_hits)),
+            });
             self.apply_score_calibration_to_hits(fast_hits);
             *fast_hits = self.correct_phase1_pool(std::mem::take(fast_hits));
         }
@@ -4600,11 +4615,11 @@ impl TwoTierSearcher {
                 if !supplemental.is_empty() {
                     // Rebuild from raw observations: calibration and hubness
                     // apply once, and graph diffusion sees the full refined
-                    // fast evidence pool. Initial ranks and retrieval coverage
-                    // still describe only the original Phase-1 candidates.
+                    // fast evidence pool. Supplemental scores leave the
+                    // ranked retrieval coverage unchanged.
                     refined_fast_hits = replacement_fast_evidence
                         .as_ref()
-                        .unwrap_or(&evidence.hits)
+                        .map_or(&evidence.hits, |replacement| &replacement.raw_hits)
                         .clone();
                     refined_fast_hits.extend(supplemental);
                     request_filter.retain_vectors(cx, &mut refined_fast_hits)?;
@@ -4616,22 +4631,27 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         cancellation_checkpoint(cx, "quality_search_to_calibration")?;
-        let completed_coverage = quality_coverage.map(|mut coverage| {
-            if let Some(previous) = metrics.coverage.as_ref()
+        let replacement_coverage = replacement_fast_evidence
+            .as_ref()
+            .and_then(|replacement| replacement.coverage.clone());
+        let completed_coverage = if let Some(mut coverage) = quality_coverage {
+            if let Some(fast) = replacement_coverage.as_ref().or(metrics.coverage.as_ref())
                 && matches!(
-                    previous.fast,
+                    fast.fast,
                     frankensearch_core::TierQueryCoverageV1::Witnessed { .. }
                 )
             {
-                coverage.topology = if previous.is_hash_control() || coverage.is_hash_control() {
+                coverage.topology = if fast.is_hash_control() || coverage.is_hash_control() {
                     frankensearch_core::RetrievalTopology::HashControl
                 } else {
                     frankensearch_core::RetrievalTopology::FullProgressive
                 };
-                coverage.fast = previous.fast.clone();
+                coverage.fast = fast.fast.clone();
             }
-            coverage
-        });
+            Some(coverage)
+        } else {
+            replacement_coverage
+        };
 
         // Calibration is a pure per-element score transform, so it is applied
         // in whichever shape the pool arrived in — never by converting between
@@ -12772,25 +12792,26 @@ mod tests {
             // number in it comes from the owner witness or the returned
             // candidates.
             let coverage = metrics.coverage.as_ref().expect("owner-backed coverage");
-            match &coverage.quality {
-                frankensearch_core::TierQueryCoverageV1::Witnessed {
-                    generation_sequence,
-                    live_count,
-                    contributed_candidates,
-                } => {
-                    assert_eq!(*generation_sequence, 31, "read from the owner's witness");
-                    assert_eq!(*live_count, 3, "the quality tier holds three live docs");
-                    assert!(
-                        *contributed_candidates > 0,
-                        "the quality tier served candidates, so it must be credited with them"
-                    );
-                }
-                other => panic!("quality tier must be witnessed, got {other:?}"),
-            }
+            assert_eq!(
+                coverage.topology,
+                frankensearch_core::RetrievalTopology::FullProgressive
+            );
             assert_eq!(
                 coverage.fast,
-                frankensearch_core::TierQueryCoverageV1::NotRequested,
-                "phase 2 activates the quality arm only; the fast pool came from phase 1"
+                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 31,
+                    live_count: 2,
+                    contributed_candidates: 2,
+                },
+                "the retained Phase 1 fast pool contributed to refinement"
+            );
+            assert_eq!(
+                coverage.quality,
+                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    generation_sequence: 31,
+                    live_count: 3,
+                    contributed_candidates: 3,
+                }
             );
             assert!(
                 !coverage.redacted_summary().contains("doc-"),
@@ -22751,6 +22772,36 @@ mod tests {
                         } else if case == "eligible" {
                             assert_eq!(lexical.lookups.load(Ordering::Relaxed), 2);
                         }
+                        if layout == "stamped-v1" {
+                            assert!(metrics.coverage.is_none());
+                        } else {
+                            let coverage = metrics.coverage.expect("retained refinement coverage");
+                            assert_eq!(
+                                coverage.topology,
+                                frankensearch_core::RetrievalTopology::FullProgressive
+                            );
+                            assert_eq!(
+                                coverage.fast,
+                                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                    generation_sequence: 79,
+                                    live_count: fast_rows.len() as u64,
+                                    contributed_candidates: u64::from(case != "exhausted"),
+                                },
+                                "fast coverage for {layout}/{case}/{parallel}"
+                            );
+                            assert_eq!(
+                                coverage.quality,
+                                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                                    generation_sequence: 79,
+                                    live_count: 1,
+                                    contributed_candidates: u64::from(matches!(
+                                        case,
+                                        "eligible" | "unfiltered"
+                                    )),
+                                },
+                                "quality coverage for {layout}/{case}/{parallel}"
+                            );
+                        }
                     }
                 }
             }
@@ -22828,6 +22879,16 @@ mod tests {
                 assert!(discovered.quality_score.is_some());
                 assert!(discovered.index.is_some());
                 assert_eq!(metrics.incomplete_embeddings, 2);
+                if layout != "stamped-v1" {
+                    let coverage = metrics.coverage.expect("retained refinement coverage");
+                    assert!(matches!(
+                        coverage.fast,
+                        frankensearch_core::TierQueryCoverageV1::Witnessed {
+                            contributed_candidates: 2,
+                            ..
+                        }
+                    ));
+                }
             }
         });
     }

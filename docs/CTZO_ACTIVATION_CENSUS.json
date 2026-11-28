@@ -82,9 +82,9 @@
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "symbol": "async fn reconcile_refinement_fast",
       "kind": "async-fast-refill",
-      "consumes": ["BoundQueryEmbedding", "ActivatedTierSearch"],
+      "consumes": ["BoundQueryEmbedding", "ActivatedTierSearch", "RankedCandidateWindow"],
       "slice": "4a (C1)",
-      "note": "A fast refill after revocation uses the original bound query and the same activated retrieval policy as Phase 1."
+      "note": "A fast refill after revocation uses the original bound query, serves the same activated retrieval policy as Phase 1, and captures the replacement window for the refined receipt."
     },
     {
       "crate": "frankensearch-fusion",
@@ -136,19 +136,13 @@
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".search_configured_fast_with_candidate_window(",
-      "count": 1,
-      "note": "Phase 1 fast captures the candidates served by the configured backend."
-    },
-    {
-      "file": "crates/frankensearch-fusion/src/searcher.rs",
-      "callee": ".search_configured_fast_classified(",
-      "count": 1,
-      "note": "Late fast refills replay the configured backend using the request's original bound embedding."
+      "count": 2,
+      "note": "Phase 1 fast and any late fast refill capture the candidates served by the configured backend."
     },
     {
       "file": "crates/frankensearch-fusion/src/searcher.rs",
       "callee": ".into_coverage(",
-      "count": 3,
+      "count": 4,
       "note": "Each path counts retained candidates after eligibility reconciliation, without searching again."
     }
   ]

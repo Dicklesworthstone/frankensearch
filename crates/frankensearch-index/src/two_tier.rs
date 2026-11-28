@@ -3673,51 +3673,32 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
         Ok((classified, window))
     }
 
-    /// Retrieve from the bound fast owner with the index's configured fast
+    /// Capture the candidates served by the bound owner's configured fast
     /// backend. Explicit parameters select exact retrieval. Otherwise a
     /// retained native graph takes priority over the regular fast backend.
     /// # Errors
     /// Returns the same errors as [`Self::search_fast`], or cancellation.
-    pub fn search_configured_fast_classified(
-        &self,
-        k: usize,
-        params: Option<SearchParams>,
-    ) -> SearchResult<ClassifiedHits> {
-        self.search_configured_fast(k, params)
-            .map(|(classified, _)| classified)
-    }
-
-    /// Capture the candidates served by [`Self::search_configured_fast_classified`].
-    /// # Errors
-    /// Returns the same errors as that search, or cancellation while capturing.
     pub fn search_configured_fast_with_candidate_window(
         &self,
         k: usize,
         params: Option<SearchParams>,
     ) -> SearchResult<(ClassifiedHits, RankedCandidateWindow)> {
-        let (classified, tier) = self.search_configured_fast(k, params)?;
+        let (classified, tier) = if params.is_some() || self.index.has_native_fast_hnsw() {
+            self.search_tier_classified(EmbedderTierTag::Fast, k, params)?
+        } else {
+            let tier = self.requested_tier(EmbedderTierTag::Fast)?;
+            // Activation and configured retrieval read the same retained
+            // fast source. Use the query admitted to that source.
+            let classified = self.index.search_fast_classified_cancellable(
+                &tier.cx,
+                tier.query.vector(),
+                k,
+                None,
+            )?;
+            (classified, tier)
+        };
         let window = RankedCandidateWindow::capture(EmbedderTierTag::Fast, tier, &classified.hits)?;
         Ok((classified, window))
-    }
-
-    fn search_configured_fast(
-        &self,
-        k: usize,
-        params: Option<SearchParams>,
-    ) -> SearchResult<(ClassifiedHits, &ActivatedTier<'index, 'query>)> {
-        if params.is_some() || self.index.has_native_fast_hnsw() {
-            return self.search_tier_classified(EmbedderTierTag::Fast, k, params);
-        }
-        let tier = self.requested_tier(EmbedderTierTag::Fast)?;
-        // Activation and the configured search both read this index's single
-        // retained fast source. Use the query admitted to that source.
-        let classified = self.index.search_fast_classified_cancellable(
-            &tier.cx,
-            tier.query.vector(),
-            k,
-            None,
-        )?;
-        Ok((classified, tier))
     }
 
     fn requested_tier(
