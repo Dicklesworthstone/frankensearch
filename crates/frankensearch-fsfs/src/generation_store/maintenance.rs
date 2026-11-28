@@ -312,7 +312,8 @@ impl CompleteGenerationStore {
             path,
             id: id.to_owned(),
             manifest_sha256: manifest_sha256.to_owned(),
-            _pin: pin,
+            publication_pointer: None,
+            pin,
         })
     }
 
@@ -335,7 +336,7 @@ impl CompleteGenerationStore {
             };
             rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
                 .map_err(io::Error::from)?;
-            return Ok(Some(Arc::new(super::GenerationPin { _file: file })));
+            return Ok(Some(Arc::new(super::GenerationPin { file })));
         }
         pin_generation(&self.root, id)
     }
@@ -610,7 +611,7 @@ impl PreparedGenerationRestore {
         let lease = PublicationLease::acquire(&self.store.root)?;
         lease.fence("complete-generation restore entry")?;
         ensure_selection(&self.store.root, self.expected_selection.as_deref())?;
-        let target =
+        let mut target =
             self.store
                 .open_retained(cx, self.target.id(), self.target.manifest_sha256())?;
         validate(cx, target.path())?;
@@ -628,6 +629,7 @@ impl PreparedGenerationRestore {
             self.allow_genesis,
         )?;
         let temporary = stage_restore_pointer(cx, &self.store.root, &pointer)?;
+        target.publication_pointer = Some(pointer.into());
         checkpoint(cx)?;
         lease.fence("complete-generation restore publication")?;
         ensure_selection(&self.store.root, self.expected_selection.as_deref())?;

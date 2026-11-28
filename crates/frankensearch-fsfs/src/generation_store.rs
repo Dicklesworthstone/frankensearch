@@ -113,8 +113,10 @@ pub struct PublishedGeneration {
     path: PathBuf,
     id: String,
     manifest_sha256: String,
-    /// Held only for its lock; dropping the last clone releases the pin.
-    _pin: Option<Arc<GenerationPin>>,
+    /// Selection installed by this publication, including its activation ancestry.
+    /// Opening a historical bundle alone grants no post-publication collection.
+    publication_pointer: Option<Arc<[u8]>>,
+    pin: Option<Arc<GenerationPin>>,
 }
 
 impl PartialEq for PublishedGeneration {
@@ -133,7 +135,7 @@ impl Eq for PublishedGeneration {}
 /// and the kernel releases the pin when that process exits.
 #[derive(Debug)]
 struct GenerationPin {
-    _file: File,
+    file: File,
 }
 
 /// The collector owns the exclusive lock until it leaves the removal scope.
@@ -695,7 +697,8 @@ impl GenerationBuild {
             path: self.path,
             id: self.id,
             manifest_sha256,
-            _pin: pin,
+            publication_pointer: Some(pointer.into()),
+            pin,
         };
         install_selection(&self.store.root, &temporary)?;
         // No cancellation point follows the linearization point. An observed
@@ -1135,12 +1138,63 @@ impl CompleteGenerationStore {
         cx: &Cx,
         keep_predecessors: usize,
     ) -> SearchResult<RetentionReport> {
+        self.collect_with_receipt(cx, keep_predecessors, None)
+    }
+
+    /// Collect superseded bundles only while this exact publication is still selected.
+    /// A later restore of the same immutable bundle has a different activation.
+    /// The held reader pin also distinguishes a copied store at the same path.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::collect_retained`]. A stale or foreign
+    /// publication, or a bundle opened without a publication receipt, refuses
+    /// collection before removing any files.
+    #[cfg(unix)]
+    pub fn collect_after_publication(
+        &self,
+        cx: &Cx,
+        publication: &PublishedGeneration,
+        keep_predecessors: usize,
+    ) -> SearchResult<RetentionReport> {
+        self.collect_with_receipt(cx, keep_predecessors, Some(publication))
+    }
+
+    fn collect_with_receipt(
+        &self,
+        cx: &Cx,
+        keep_predecessors: usize,
+        receipt: Option<&PublishedGeneration>,
+    ) -> SearchResult<RetentionReport> {
         checkpoint(cx)?;
         self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation retention")?;
         let expected_selection = read_pointer(&self.root)?;
+        if let Some(receipt) = receipt
+            && (receipt.publication_pointer.is_none()
+                || receipt.publication_pointer.as_deref() != expected_selection.as_deref()
+                || receipt.path != self.root.join(GENERATIONS).join(receipt.id()))
+        {
+            return Err(self.retention_receipt_error());
+        }
         let selected = self.active(cx)?;
+        #[cfg(unix)]
+        if let Some(receipt) = receipt {
+            let pin_identity = |generation: &PublishedGeneration| -> SearchResult<(u64, u64)> {
+                let pin = generation
+                    .pin
+                    .as_ref()
+                    .ok_or_else(|| self.retention_receipt_error())?;
+                let metadata = pin.file.metadata()?;
+                Ok((metadata.dev(), metadata.ino()))
+            };
+            let active = selected
+                .as_ref()
+                .ok_or_else(|| self.retention_receipt_error())?;
+            if active != receipt || pin_identity(active)? != pin_identity(receipt)? {
+                return Err(self.retention_receipt_error());
+            }
+        }
         let plan = self.plan_retention(cx, keep_predecessors)?;
         if read_pointer(&self.root)? != expected_selection
             || plan.active.as_deref() != selected.as_ref().map(PublishedGeneration::id)
@@ -1197,6 +1251,16 @@ impl CompleteGenerationStore {
             File::open(&parent)?.sync_all()?;
         }
         Ok(report)
+    }
+
+    fn retention_receipt_error(&self) -> SearchError {
+        SearchError::InvalidConfig {
+            field: "generation_retention.publication".into(),
+            value: self.root.display().to_string(),
+            reason:
+                "collection requires the still-selected publication and its original reader pin"
+                    .into(),
+        }
     }
 }
 
@@ -1353,7 +1417,7 @@ fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPi
         };
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
             .map_err(|errno| SearchError::Io(std::io::Error::from(errno)))?;
-        Ok(Some(Arc::new(GenerationPin { _file: file })))
+        Ok(Some(Arc::new(GenerationPin { file })))
     }
     #[cfg(not(unix))]
     {
@@ -2161,6 +2225,53 @@ fn invalid(path: &Path, detail: &str) -> SearchError {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+
+    #[test]
+    fn collection_receipt_refuses_reselection_and_preserves_pinned_readers() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let pinned = publish(&store, &cx, "still in use");
+            let first = publish(&store, &cx, "restore target");
+            let second = publish(&store, &cx, "superseded").id().to_owned();
+            let before = generation_names(root.path());
+            assert!(store.collect_after_publication(&cx, &first, 0).is_err());
+            let GenerationPublication::Durable(restored) = store
+                .prepare_restore(&cx, &first)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected durable restore")
+            };
+            assert_eq!(restored, first);
+            assert!(store.collect_after_publication(&cx, &first, 0).is_err());
+            let reader = store
+                .open_retained(&cx, restored.id(), restored.manifest_sha256())
+                .unwrap();
+            assert!(store.collect_after_publication(&cx, &reader, 0).is_err());
+            assert_eq!(generation_names(root.path()), before);
+            let report = store.collect_after_publication(&cx, &restored, 0).unwrap();
+            assert_eq!(report.removed, [second]);
+            assert_eq!(report.pinned, [pinned.id()]);
+        });
+    }
+
+    #[test]
+    fn collection_receipt_requires_the_original_pin_even_for_the_same_descriptor() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "preserve this candidate"));
+            let selected = publish(&store, &cx, "selected");
+            let pin = root.path().join(READER_PINS).join(pin_name(selected.id()));
+            fs::rename(&pin, root.path().join("original-pin")).unwrap();
+            drop(open_pin_file(root.path(), selected.id()).unwrap());
+            let before = generation_names(root.path());
+            assert!(store.collect_after_publication(&cx, &selected, 0).is_err());
+            assert_eq!(generation_names(root.path()), before);
+        });
+    }
 
     #[test]
     fn live_admission_pins_the_original_store_during_path_replacement() {
