@@ -8611,9 +8611,7 @@ impl FsfsRuntime {
                 Self::bind_foreground_cli_cancellation(cx, self.cli_input.command, shutdown)?;
             return Box::pin(self.run_authority_search(cx)).await;
         }
-        if self.cli_input.generation_id.is_some()
-            || self.cli_input.generation_manifest_sha256.is_some()
-        {
+        if self.cli_input.retained_selection_requested() {
             // Library entry points must honor the same explicit selection as
             // main. This route validates the receipt before any legacy or
             // daemon read and never falls back to the mutable store root.
@@ -12730,24 +12728,13 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
-        self.cli_input.validate_retained_selection()?;
+        let selection = self.cli_input.retained_selection()?;
         let store = crate::generation_store::CompleteGenerationStore::open_with_profile(
             cx,
             root,
             frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
         )?;
-        let generation = match (
-            self.cli_input.generation_id.as_deref(),
-            self.cli_input.generation_manifest_sha256.as_deref(),
-        ) {
-            (Some(id), Some(digest)) => store.open_retained(cx, id, digest)?,
-            _ => store.active(cx)?.ok_or_else(|| {
-                complete_cli::complete_cli_error(
-                    "selection",
-                    "no complete generation has been published",
-                )
-            })?,
-        };
+        let generation = selection.open(cx, &store)?;
         let session = Self::load_complete_explain_session_at_root(store.root())?;
         if let Some(session) = &session
             && (session.schema_version != EXPLAIN_SESSION_SCHEMA_VERSION
@@ -28781,7 +28768,7 @@ impl FsfsRuntime {
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
         self.cli_input.validate_quality_only()?;
         self.cli_input.validate_retained_selection()?;
-        if self.cli_input.generation_id.is_some()
+        if self.cli_input.retained_selection_requested()
             && !matches!(command, CliCommand::Search | CliCommand::Explain)
         {
             return Err(complete_cli::complete_cli_error(
@@ -28854,9 +28841,7 @@ impl FsfsRuntime {
                 reason: "trusted authority receipt search requires CLI mode".to_owned(),
             });
         }
-        if self.cli_input.generation_id.is_some()
-            || self.cli_input.generation_manifest_sha256.is_some()
-        {
+        if self.cli_input.retained_selection_requested() {
             self.validate_command_inputs(CliCommand::Tui)?;
         }
         let shell_model = FsfsTuiShellModel::from_config(&self.config);
@@ -30857,6 +30842,7 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>
               --generation ID --manifest-sha256 HASH --index-dir STORE searches an exact retained generation locally.
               Copy both values from one trusted publication receipt. The same selectors support the follow-up explain command.
+              --previous --index-dir STORE searches the most recent distinct predecessor; also supported by explain.
               --authority-receipt PATH searches one trusted native fixed-authority generation locally.
               Add --authority-current-receipt HEAD to search an authenticated ancestor selected by --authority-receipt.
               --authority-mode lexical|fast|quality|full|partial selects its query tier; default follows the receipt (partial defaults to fast).

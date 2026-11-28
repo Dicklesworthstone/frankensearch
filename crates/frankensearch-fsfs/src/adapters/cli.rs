@@ -225,6 +225,8 @@ pub struct CliInput {
     pub target_path: Option<PathBuf>,
     /// Optional explicit index directory override for index/status commands.
     pub index_dir: Option<PathBuf>,
+    /// Select the most recent distinct predecessor from this store's activation history.
+    pub previous_generation: bool,
     /// Explicit retained generation from a trusted complete-store publication receipt.
     pub generation_id: Option<String>,
     /// Inventory digest paired with `generation_id` in the same trusted receipt.
@@ -299,7 +301,33 @@ pub struct CliInput {
     pub daemon_stop: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum RetainedSelection<'a> {
+    Current,
+    Previous,
+    Receipt { id: &'a str, digest: &'a str },
+}
+
 impl CliInput {
+    pub(crate) const fn retained_selection_requested(&self) -> bool {
+        self.previous_generation
+            || self.generation_id.is_some()
+            || self.generation_manifest_sha256.is_some()
+    }
+
+    pub(crate) fn retained_selection(&self) -> SearchResult<RetainedSelection<'_>> {
+        self.validate_retained_selection()?;
+        if self.previous_generation {
+            return Ok(RetainedSelection::Previous);
+        }
+        Ok(
+            match (&self.generation_id, &self.generation_manifest_sha256) {
+                (Some(id), Some(digest)) => RetainedSelection::Receipt { id, digest },
+                _ => RetainedSelection::Current,
+            },
+        )
+    }
+
     pub(crate) fn authority_selection_requested(&self) -> bool {
         self.authority_receipt.is_some()
             || self.authority_current_receipt.is_some()
@@ -332,12 +360,9 @@ impl CliInput {
             || self.authority_max_source_bytes == Some(0)
         {
             Some("authority image and source byte budgets must be positive")
-        } else if self.index_dir.is_some()
-            || self.generation_id.is_some()
-            || self.generation_manifest_sha256.is_some()
-        {
+        } else if self.index_dir.is_some() || self.retained_selection_requested() {
             Some(
-                "the trusted authority receipt selects its current root; omit --index-dir, --generation and --manifest-sha256",
+                "the trusted authority receipt selects its current root; omit --index-dir, --previous, --generation and --manifest-sha256",
             )
         } else if self.recover_source.is_some() || self.acquire_models {
             Some(
@@ -430,21 +455,26 @@ impl CliInput {
     }
 
     pub(crate) fn validate_retained_selection(&self) -> SearchResult<()> {
-        if self.generation_id.is_none() && self.generation_manifest_sha256.is_none() {
+        if !self.retained_selection_requested() {
             return Ok(());
         }
         let reason = if !matches!(self.command, CliCommand::Search | CliCommand::Explain) {
-            Some("--generation and --manifest-sha256 are only valid for search and explain")
-        } else if self.generation_id.as_ref().is_none_or(|id| id.len() != 60)
-            || self
-                .generation_manifest_sha256
-                .as_ref()
-                .is_none_or(|digest| {
-                    digest.len() != 64
-                        || !digest
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
+            Some("complete generation selectors are only valid for search and explain")
+        } else if self.previous_generation
+            && (self.generation_id.is_some() || self.generation_manifest_sha256.is_some())
+        {
+            Some("--previous cannot be combined with --generation or --manifest-sha256")
+        } else if !self.previous_generation
+            && (self.generation_id.as_ref().is_none_or(|id| id.len() != 60)
+                || self
+                    .generation_manifest_sha256
+                    .as_ref()
+                    .is_none_or(|digest| {
+                        digest.len() != 64
+                            || !digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    }))
         {
             Some(
                 "supply --generation ID and --manifest-sha256 SHA256 from the same trusted publication receipt",
@@ -467,7 +497,12 @@ impl CliInput {
         if let Some(reason) = reason {
             return Err(SearchError::InvalidConfig {
                 field: "cli.retained_generation".into(),
-                value: "--generation --manifest-sha256".into(),
+                value: if self.previous_generation {
+                    "--previous"
+                } else {
+                    "--generation --manifest-sha256"
+                }
+                .into(),
                 reason: reason.into(),
             });
         }
@@ -1188,6 +1223,16 @@ where
                 }
                 idx += 2;
             }
+            "--previous" => {
+                if std::mem::replace(&mut input.previous_generation, true) {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.retained_generation".into(),
+                        value: flag.into(),
+                        reason: "each retained-generation selector may be supplied once".into(),
+                    });
+                }
+                idx += 1;
+            }
             "--generation" | "--manifest-sha256" => {
                 let value = expect_value(&tokens, idx, flag)?.to_owned();
                 let field = if flag == "--generation" {
@@ -1280,8 +1325,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
         input.daemon = input.command == CliCommand::Search
             && input.recover_source.is_none()
             && input.authority_receipt.is_none()
-            && input.generation_id.is_none()
-            && input.generation_manifest_sha256.is_none();
+            && !input.retained_selection_requested();
     }
 
     #[cfg(not(unix))]
@@ -1533,7 +1577,7 @@ fn split_long_flag_values(tokens: Vec<String>) -> Vec<String> {
             literal_next = true;
         } else if let Some((flag, value)) = token.split_once('=')
             && flag.starts_with("--")
-            && flag != "--acquire-models"
+            && !matches!(flag, "--acquire-models" | "--previous")
             && is_known_cli_flag(flag)
         {
             split.push(flag.to_owned());
@@ -1549,6 +1593,7 @@ fn is_known_cli_flag(token: &str) -> bool {
     // Keep malformed consent flags in the flag parser. Otherwise an initial
     // `--acquire-models=false` could become a query plus a bare authorization.
     token.starts_with("--acquire-models=")
+        || token.starts_with("--previous=")
         || matches!(
             token,
             "--roots"
@@ -1604,6 +1649,7 @@ fn is_known_cli_flag(token: &str) -> bool {
                 | "--authority-max-image-bytes"
                 | "--authority-max-source-bytes"
                 | "--generation"
+                | "--previous"
                 | "--manifest-sha256"
                 | "--recover-source"
                 | "--acquire-models"
@@ -1663,6 +1709,80 @@ mod tests {
         assert_eq!(input.query.as_deref(), Some("query"));
         assert!(input.authority_mode.is_none());
         assert!(!input.daemon);
+    }
+
+    #[test]
+    fn previous_search_and_explain_are_local_and_refuse_ambiguous_selection() {
+        for args in [
+            vec![
+                "search",
+                "token",
+                "--previous",
+                "--index-dir=/store",
+                "--stream",
+            ],
+            vec!["explain", "R0", "--previous", "--index-dir=/store"],
+            vec!["s", "--previous", "--index-dir=/store", "token"],
+        ] {
+            let input = parse_cli_args(args).unwrap();
+            assert!(matches!(
+                input.retained_selection().unwrap(),
+                RetainedSelection::Previous
+            ));
+            assert!(!input.daemon);
+        }
+        for args in [
+            vec!["search", "q", "--previous"],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--index-dir=/store",
+                "--daemon",
+            ],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--index-dir=/store",
+                "--daemon-socket=/d",
+            ],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--index-dir=/store",
+                "--recover-source=/source",
+            ],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--index-dir=/store",
+                "--generation=x",
+            ],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--index-dir=/store",
+                "--authority-receipt=x",
+            ],
+            vec![
+                "search",
+                "q",
+                "--previous",
+                "--previous",
+                "--index-dir=/store",
+            ],
+            vec!["--previous=false", "--index-dir=/store"],
+            vec!["watch", "--previous", "--index-dir=/store"],
+        ] {
+            assert!(parse_cli_args(args.clone()).is_err(), "{args:?}");
+        }
+        let literal = parse_cli_args(["search", "--", "--previous"]).unwrap();
+        assert_eq!(literal.query.as_deref(), Some("--previous"));
+        assert!(!literal.previous_generation);
     }
 
     #[test]

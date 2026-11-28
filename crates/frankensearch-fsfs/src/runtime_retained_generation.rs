@@ -3,6 +3,24 @@
 // source of truth. The existing runtime source is left byte-for-byte intact.
 include!("runtime.rs");
 
+use crate::adapters::cli::RetainedSelection;
+
+impl RetainedSelection<'_> {
+    fn open(
+        self,
+        cx: &Cx,
+        store: &crate::generation_store::CompleteGenerationStore,
+    ) -> SearchResult<crate::generation_store::PublishedGeneration> {
+        match self {
+            Self::Current => store
+                .active(cx)?
+                .ok_or_else(|| missing_retained_selection(store.root())),
+            Self::Previous => store.open_previous(cx).map(|(generation, _)| generation),
+            Self::Receipt { id, digest } => store.open_retained(cx, id, digest),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetainedBuildKind {
     Index,
@@ -524,7 +542,7 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
     ) -> SearchResult<RetainedSearchReader> {
-        self.open_retained_search_selection(cx, store_root, None)
+        self.open_retained_search_selection(cx, store_root, RetainedSelection::Current)
             .await
     }
 
@@ -545,15 +563,22 @@ impl FsfsRuntime {
         generation_id: &str,
         manifest_sha256: &str,
     ) -> SearchResult<RetainedSearchReader> {
-        self.open_retained_search_selection(cx, store_root, Some((generation_id, manifest_sha256)))
-            .await
+        self.open_retained_search_selection(
+            cx,
+            store_root,
+            RetainedSelection::Receipt {
+                id: generation_id,
+                digest: manifest_sha256,
+            },
+        )
+        .await
     }
 
     async fn open_retained_search_selection(
         &self,
         cx: &Cx,
         store_root: &Path,
-        selection: Option<(&str, &str)>,
+        selection: RetainedSelection<'_>,
     ) -> SearchResult<RetainedSearchReader> {
         use crate::generation_store::CompleteGenerationStore;
 
@@ -564,12 +589,7 @@ impl FsfsRuntime {
             store_root,
             frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
         )?;
-        let generation = match selection {
-            Some((id, digest)) => store.open_retained(cx, id, digest)?,
-            None => store
-                .active(cx)?
-                .ok_or_else(|| missing_retained_selection(store.root()))?,
-        };
+        let generation = selection.open(cx, &store)?;
         self.open_retained_search_generation(cx, generation).await
     }
 

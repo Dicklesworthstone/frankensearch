@@ -841,6 +841,19 @@ fsfs recover --index-dir ./search-store \
   --generation "$GENERATION_ID" --manifest-sha256 "$MANIFEST_SHA256"
 ```
 
+Use a complete store's most recent distinct predecessor without copying its
+publication receipt:
+
+```bash
+fsfs search "connection pool" --previous --index-dir /work/search-store --stream --format jsonl
+fsfs explain R0 --previous --index-dir /work/search-store
+```
+
+The local query pins the generation identified by the current activation
+history for all phases, including source hydration. An unavailable predecessor
+or damaged history fails the request. A trusted explicit receipt remains
+usable independently of the active descriptor.
+
 To validate a target now and restore it later, save a preparation outside the
 store, then explicitly apply that exact preparation:
 

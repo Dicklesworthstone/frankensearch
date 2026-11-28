@@ -204,7 +204,7 @@ impl FsfsRuntime {
         };
         if matches!(effective_command, CliCommand::Search | CliCommand::Explain)
             && self.cli_input.recover_source.is_none()
-            && self.cli_input.generation_id.is_none()
+            && !self.cli_input.retained_selection_requested()
             && CompleteGenerationStore::legacy_migration_pending(&root)?
             && Self::read_index_sentinel(&root)?
                 .is_some_and(|sentinel| sentinel.generation_complete)
@@ -581,9 +581,7 @@ impl FsfsRuntime {
         // or a legacy fallback can initialize locks, pins, or artifact directories.
         crate::lifecycle::reject_sealed_ancestry(&root)?;
 
-        if self.cli_input.generation_id.is_some()
-            || self.cli_input.generation_manifest_sha256.is_some()
-        {
+        if self.cli_input.retained_selection_requested() {
             self.cli_input.validate_retained_selection()?;
             return Ok(Some(root));
         }
@@ -1273,14 +1271,8 @@ impl FsfsRuntime {
         cx: &Cx,
         root: &Path,
     ) -> SearchResult<RetainedSearchReader> {
-        self.cli_input.validate_retained_selection()?;
-        match (
-            self.cli_input.generation_id.as_deref(),
-            self.cli_input.generation_manifest_sha256.as_deref(),
-        ) {
-            (Some(id), Some(digest)) => self.open_historical_search(cx, root, id, digest).await,
-            _ => self.open_retained_search(cx, root).await,
-        }
+        self.open_retained_search_selection(cx, root, self.cli_input.retained_selection()?)
+            .await
     }
 
     /// Render one search against the already admitted reader. Source recovery
@@ -5498,6 +5490,81 @@ mod tests {
                     .contains("originalrelic")
             );
 
+            // The predecessor selector must reach the same ranked page and
+            // explanations in both buffered and streamed search. The current
+            // answer above deliberately contains different content and IDs.
+            let input = crate::adapters::cli::parse_cli_args([
+                "search",
+                "sharedtoken",
+                "--index-dir",
+                root.to_str().unwrap(),
+                "--previous",
+                "--filter=path:alpha.md",
+                "--format=json",
+            ])
+            .unwrap();
+            let mut previous = runtime.clone().with_cli_input(input);
+            assert!(!previous.cli_input.daemon);
+            output.clear();
+            Box::pin(previous.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let page: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(page["data"]["hits"], old_hits);
+            previous.cli_input.stream = true;
+            previous.cli_input.format = OutputFormat::Jsonl;
+            output.clear();
+            Box::pin(previous.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let frames = expansion_stream_frames(OutputFormat::Jsonl, &output);
+            let mut results = 0;
+            for frame in &frames {
+                if let StreamEvent::Result(result) = &frame.event {
+                    assert_eq!(result.item.path, "alpha.md");
+                    assert!(
+                        result
+                            .item
+                            .snippet
+                            .as_deref()
+                            .unwrap()
+                            .contains("originalrelic")
+                    );
+                    results += 1;
+                }
+            }
+            assert!(results > 0);
+            assert!(
+                matches!(frames.last().map(|f| &f.event), Some(StreamEvent::Terminal(end)) if end.status == StreamTerminalStatus::Completed)
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                selected
+            );
+            let previous_explain = runtime.clone().with_cli_input(
+                crate::adapters::cli::parse_cli_args([
+                    "explain",
+                    "R0",
+                    "--previous",
+                    "--index-dir",
+                    root.to_str().unwrap(),
+                    "--format=json",
+                ])
+                .unwrap(),
+            );
+            output.clear();
+            Box::pin(
+                previous_explain.run_complete_generation_explain_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ),
+            )
+            .await
+            .unwrap();
+            let page: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(page["data"]["query"], "sharedtoken");
+
             let mut explain = historical.clone();
             explain.cli_input.command = CliCommand::Explain;
             explain.cli_input.result_id = Some("R0".to_owned());
@@ -5532,6 +5599,17 @@ mod tests {
                 b"damaged selector\n",
             )
             .unwrap();
+            output.clear();
+            assert!(
+                Box::pin(previous.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output
+                ))
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
             output.clear();
             Box::pin(historical.run_complete_generation_search_with_writer(
                 &cx,
