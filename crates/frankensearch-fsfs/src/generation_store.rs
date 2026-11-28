@@ -952,7 +952,14 @@ impl CompleteGenerationStore {
             .transpose()?;
         let active = selection.as_ref().map(|selection| selection.id.clone());
         let retained = match selection {
-            Some(selection) => self.retention_predecessors(cx, selection, keep_predecessors)?,
+            Some(selection) => self
+                .activation_predecessors(cx, selection, keep_predecessors)?
+                .into_iter()
+                .map(|predecessor| {
+                    self.verify_retention_target(cx, &predecessor)?;
+                    Ok(predecessor.id)
+                })
+                .collect::<SearchResult<Vec<_>>>()?,
             None if history_has_objects(&self.root)? => {
                 return Err(retention_history_error(
                     &self.root,
@@ -1030,12 +1037,12 @@ impl CompleteGenerationStore {
         })
     }
 
-    fn retention_predecessors(
+    fn activation_predecessors(
         &self,
         cx: &Cx,
         mut selection: GenerationSelection,
         keep: usize,
-    ) -> SearchResult<Vec<String>> {
+    ) -> SearchResult<Vec<GenerationSelection>> {
         let mut retained = Vec::new();
         let mut generations =
             BTreeMap::from([(selection.id.clone(), selection.manifest_sha256.clone())]);
@@ -1070,9 +1077,8 @@ impl CompleteGenerationStore {
                     ));
                 }
             } else if keep > 0 {
-                self.verify_retention_target(cx, &predecessor)?;
                 generations.insert(predecessor.id.clone(), predecessor.manifest_sha256.clone());
-                retained.push(predecessor.id.clone());
+                retained.push(predecessor.clone());
             }
             if retained.len() == keep {
                 return Ok(retained);

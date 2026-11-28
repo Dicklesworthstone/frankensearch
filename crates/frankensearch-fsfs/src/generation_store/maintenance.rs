@@ -341,6 +341,43 @@ impl CompleteGenerationStore {
         pin_generation(&self.root, id)
     }
 
+    /// Open and pin the most recent distinct generation selected before this one.
+    ///
+    /// The current descriptor supplies the root of the bounded activation walk.
+    /// The predecessor's manifest and bundle must match the authenticated link.
+    /// Current bundle damage does not invalidate an intact descriptor and history.
+    /// The returned guard is for [`Self::resume_restore`]. It binds this target
+    /// to the exact observed activation, including after a same-bundle restore.
+    ///
+    /// # Errors
+    /// Refuses missing, malformed, legacy or unresolved history, lack of a
+    /// distinct predecessor, target damage, selection races, or cancellation.
+    pub fn open_previous(&self, cx: &Cx) -> SearchResult<(PublishedGeneration, String)> {
+        checkpoint(cx)?;
+        self.require_profile_admissible()?;
+        let pointer = selection_evidence(&self.root)?.ok_or_else(|| {
+            invalid(
+                &self.root,
+                "a previous generation requires an active selection",
+            )
+        })?;
+        let current = decode_pointer(&pointer, &self.root)?;
+        let previous = self
+            .activation_predecessors(cx, current, 1)?
+            .pop()
+            .ok_or_else(|| invalid(&self.root, "no distinct previous generation was selected"))?;
+        let target = self.open_retained(cx, &previous.id, &previous.manifest_sha256)?;
+        ensure_selection(&self.root, Some(&pointer))?;
+        checkpoint(cx)?;
+        let guard = restore_selection_sha256(
+            &self.root,
+            target.id(),
+            target.manifest_sha256(),
+            Some(&pointer),
+        );
+        Ok((target, guard))
+    }
+
     /// Prepare an intentional rollback or repair of a damaged/missing selection.
     ///
     /// The target must belong to this store and still match its trusted digest.
@@ -758,6 +795,52 @@ mod receipt_durability_tests {
             panic!("fixture publication must be durable"); // ubs:ignore — test assertion.
         };
         generation
+    }
+
+    #[test]
+    fn previous_restore_skips_same_bundle_activations_and_fences_the_observed_head() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            assert!(store.open_previous(&cx).is_err());
+            let first = publish(&store, &cx, b"previous");
+            assert!(store.open_previous(&cx).is_err());
+            let second = publish(&store, &cx, b"current");
+            let (target, old_guard) = store.open_previous(&cx).unwrap();
+            assert_eq!(target, first);
+
+            store
+                .prepare_restore(&cx, &second)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap();
+            let (target, guard) = store.open_previous(&cx).unwrap();
+            assert_eq!(target, first);
+            assert_ne!(guard, old_guard);
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &old_guard)
+                    .is_err()
+            );
+
+            // A damaged incumbent bundle can still identify an intact prior
+            // selection through its current descriptor and immutable history.
+            fs::write(second.path().join("payload"), b"damaged").unwrap();
+            assert!(store.active(&cx).is_err());
+            let (intact, current_guard) = store.open_previous(&cx).unwrap();
+            assert_eq!(intact, first);
+            assert_eq!(current_guard, guard);
+            store
+                .resume_restore(&cx, intact.id(), intact.manifest_sha256(), &guard)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(first));
+            assert!(
+                store.open_previous(&cx).is_err(),
+                "damaged predecessor must fail admission"
+            );
+        });
     }
 
     #[test]
