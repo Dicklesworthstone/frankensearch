@@ -777,6 +777,88 @@ fn authority_search_retains_its_admitted_generation_across_model_loading() {
 }
 
 #[test]
+fn authority_search_reads_authenticated_history_with_one_total_budget() {
+    run_test_with_cx(|cx| async move {
+        let fixture = Fixture::new(&cx, Topology::Fast).await;
+        let mut head = fixture.receipt.open(&cx, IMAGE_BUDGET).unwrap();
+        let mut previous_path = fixture.receipt_path.clone();
+        for (sequence, kind) in [(2, "retained_predecessor"), (3, "retained_ancestor")] {
+            let built = build(
+                &cx,
+                &fixture.parent.path().join(format!("work-{sequence}")),
+                Topology::Fast,
+                sequence,
+                (&fixture.fast, &fixture.quality),
+                vec![IndexableDocument::new("new-only", "different source")],
+            )
+            .await;
+            let head_path = fixture.parent.path().join(format!("head-{sequence}.json"));
+            let receipt = publish(
+                &cx,
+                &fixture.root,
+                &fixture.root_path,
+                &head_path,
+                &built,
+                Topology::Fast,
+                Some(&head),
+                0x60 + sequence,
+            );
+            head = receipt.open(&cx, IMAGE_BUDGET).unwrap();
+            let mut search = fixture.runtime(Some("fast"), "semantic-query", 1);
+            search.cli_input.authority_current_receipt = Some(head_path.clone());
+            let mut output = Vec::new();
+            search
+                .run_authority_search_with_writer_and_loader(&cx, &mut output, |tier| {
+                    assert_eq!(tier, EmbedderTierTag::Fast);
+                    ready(Ok(fixture.fast.clone() as Arc<dyn Embedder>))
+                })
+                .await
+                .unwrap();
+            let page = payload(&output);
+            assert_eq!(page["selection_kind"], kind);
+            assert_eq!(
+                page["selected_history_of"],
+                serde_json::json!(receipt.authority)
+            );
+            assert_eq!(
+                page["authority"],
+                serde_json::json!(fixture.receipt.authority)
+            );
+            assert_eq!(page["results"][0]["doc_id"], "fast-leader");
+            assert_eq!(page["results"][0]["metadata"]["version"], "original");
+            assert!(
+                page["results"][0]["snippet"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry guidance")
+            );
+
+            let head_bytes =
+                usize::try_from(head.retained_snapshot().retained_image_bytes().unwrap()).unwrap();
+            for (current_path, budget) in [(&head_path, head_bytes), (&previous_path, IMAGE_BUDGET)]
+            {
+                search.cli_input.authority_current_receipt = Some(current_path.clone());
+                search.cli_input.authority_max_image_bytes = Some(budget);
+                let mut refused = Vec::new();
+                let mut loads = 0;
+                assert!(
+                    search
+                        .run_authority_search_with_writer_and_loader(&cx, &mut refused, |_| {
+                            loads += 1;
+                            ready(Ok(fixture.fast.clone() as Arc<dyn Embedder>))
+                        })
+                        .await
+                        .is_err()
+                );
+                assert_eq!(loads, 0);
+                assert!(refused.is_empty());
+            }
+            previous_path = head_path;
+        }
+    });
+}
+
+#[test]
 fn authority_search_refuses_receipt_and_image_budget_before_loading_models() {
     run_test_with_cx(|cx| async move {
         let fixture = Fixture::new(&cx, Topology::Fast).await;

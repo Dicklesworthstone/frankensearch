@@ -207,6 +207,8 @@ pub struct CliInput {
     pub quality_only: bool,
     /// Explicit trusted native fixed-authority selection receipt for search.
     pub authority_receipt: Option<PathBuf>,
+    /// Independently trusted current receipt when searching an authenticated ancestor.
+    pub authority_current_receipt: Option<PathBuf>,
     /// Native receipt query mode: lexical, fast, quality, full, or partial.
     pub authority_mode: Option<String>,
     /// Maximum authenticated component bytes admitted for a native search.
@@ -300,6 +302,7 @@ pub struct CliInput {
 impl CliInput {
     pub(crate) fn authority_selection_requested(&self) -> bool {
         self.authority_receipt.is_some()
+            || self.authority_current_receipt.is_some()
             || self.authority_mode.is_some()
             || self.authority_max_image_bytes.is_some()
             || self.authority_max_source_bytes.is_some()
@@ -315,12 +318,12 @@ impl CliInput {
             Some(
                 "--authority-receipt supports search only; explain, mutation, watch, serve and daemon commands are not supported",
             )
-        } else if self
-            .authority_receipt
-            .as_ref()
-            .is_some_and(|path| path.as_os_str().is_empty())
+        } else if [&self.authority_receipt, &self.authority_current_receipt]
+            .into_iter()
+            .flatten()
+            .any(|path| path.as_os_str().is_empty())
         {
-            Some("--authority-receipt requires a nonempty trusted receipt path")
+            Some("authority receipt paths must be nonempty")
         } else if self.authority_mode.as_deref().is_some_and(|mode| {
             !matches!(mode, "lexical" | "fast" | "quality" | "full" | "partial")
         }) {
@@ -1135,17 +1138,18 @@ where
                 input.index_dir = Some(PathBuf::from(value));
                 idx += 2;
             }
-            "--authority-receipt" => {
+            "--authority-receipt" | "--authority-current-receipt" => {
                 let value = expect_value(&tokens, idx, flag)?;
-                if input
-                    .authority_receipt
-                    .replace(PathBuf::from(value))
-                    .is_some()
-                {
+                let slot = if flag == "--authority-receipt" {
+                    &mut input.authority_receipt
+                } else {
+                    &mut input.authority_current_receipt
+                };
+                if slot.replace(PathBuf::from(value)).is_some() {
                     return Err(SearchError::InvalidConfig {
                         field: "cli.authority_receipt".into(),
                         value: flag.into(),
-                        reason: "supply --authority-receipt only once".into(),
+                        reason: format!("supply {flag} only once"),
                     });
                 }
                 idx += 2;
@@ -1597,6 +1601,7 @@ fn is_known_cli_flag(token: &str) -> bool {
                 | "--config"
                 | "--index-dir"
                 | "--authority-receipt"
+                | "--authority-current-receipt"
                 | "--authority-mode"
                 | "--authority-max-image-bytes"
                 | "--authority-max-source-bytes"
@@ -1626,6 +1631,7 @@ mod tests {
                 "search",
                 "retained original query",
                 "--authority-receipt=selection.json",
+                "--authority-current-receipt=current.json",
                 "--authority-mode",
                 mode,
                 "--authority-max-image-bytes=1048576",
@@ -1640,6 +1646,10 @@ mod tests {
                 Some(Path::new("selection.json"))
             );
             assert_eq!(input.authority_mode.as_deref(), Some(mode));
+            assert_eq!(
+                input.authority_current_receipt.as_deref(),
+                Some(Path::new("current.json"))
+            );
             assert_eq!(input.authority_max_image_bytes, Some(1_048_576));
             assert_eq!(input.authority_max_source_bytes, Some(4096));
             assert_eq!(input.overrides.limit, Some(0));
@@ -1677,6 +1687,12 @@ mod tests {
             vec!["--authority-max-image-bytes", "0"],
             vec!["--authority-max-source-bytes", "-1"],
             vec!["--authority-receipt", "second.json"],
+            vec![
+                "--authority-current-receipt",
+                "a",
+                "--authority-current-receipt",
+                "b",
+            ],
             vec!["--authority-mode", "fast", "--authority-mode", "quality"],
         ] {
             let mut args = vec!["search", "query", "--authority-receipt", "selection.json"];
@@ -1685,6 +1701,12 @@ mod tests {
         }
         for args in [
             vec!["search", "query", "--authority-mode", "lexical"],
+            vec![
+                "search",
+                "query",
+                "--authority-current-receipt",
+                "current.json",
+            ],
             vec!["search", "query", "--authority-max-source-bytes", "4096"],
             vec!["search", "query", "--authority-max-image-bytes", "4096"],
             vec!["explain", "R1", "--authority-receipt", "selection.json"],

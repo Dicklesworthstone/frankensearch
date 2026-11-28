@@ -27,11 +27,22 @@ fsfs search "retry failed network requests" \
   --authority-mode full --format json
 ```
 
-The receipt supplies the root, expected current authority, immutable generation,
-and independent producer identities. It must identify the current selection
-when the request opens. Advancing the authority requires a new current receipt
-for subsequent requests; a query already admitted retains its original
+The receipt supplies the root, expected authority, immutable generation,
+and independent producer identities. By default it must identify the current
+selection when the request opens. A query already admitted retains its original
 generation through retrieval and source hydration.
+
+For historical search, supply the target receipt and a separately trusted
+current receipt for the same root. Both generations must fit the image budget.
+The response identifies the target generation and the head that authenticated it
+in `selected_history_of`. A stale head or unavailable ancestor fails admission
+before fsfs loads an embedding model.
+
+```sh
+fsfs search "retry timeout" --authority-mode lexical --format json \
+  --authority-receipt /absolute/path/to/native-receipts/g1.json \
+  --authority-current-receipt /absolute/path/to/native-receipts/g3.json
+```
 
 | Authority mode | Required topology and work |
 |---|---|
@@ -73,8 +84,7 @@ producers before Initial, so their Initial work also consumes this budget. The
 default is 500 ms; increase it in the configuration when cold quality loading
 needs more time. Expiration returns an error before any success payload.
 
-This route is for current-selection search. Native publication, updates,
-historical selection and recovery remain available through
+Native publication, updates and recovery remain available through
 `frankensearch-native`. Unsupported ordinary fsfs options are refused before
 model work, including `--stream`, daemon transport, filesystem filters, query
 expansion and reranking. JSON, JSONL and TOON return the native result payload

@@ -268,14 +268,18 @@ impl FsfsRuntime {
             .cli_input
             .authority_max_source_bytes
             .unwrap_or(DEFAULT_SOURCE_BYTES);
-        let snapshot = if cx.blocking_pool_handle().is_some() {
+        let current = self.cli_input.authority_current_receipt.as_deref();
+        let (_root, snapshot) = if cx.blocking_pool_handle().is_some() {
             let selected = receipt.clone();
             let context = cx.clone();
-            Self::search_blocking(cx, move || selected.open(&context, max_image_bytes)).await??
+            let current = current.map(std::path::Path::to_path_buf);
+            Self::search_blocking(cx, move || {
+                selected.open_read_selection(&context, current.as_deref(), max_image_bytes)
+            })
+            .await??
         } else {
-            receipt.open(cx, max_image_bytes)?
+            receipt.open_read_selection(cx, current, max_image_bytes)?
         };
-        let snapshot = Arc::new(snapshot);
         retained_search_checkpoint(cx)?;
         let total_documents =
             usize::try_from(snapshot.metadata().total_documents).map_err(|_| {
@@ -525,6 +529,15 @@ fn authority_payload(
         payload["candidates"] = serde_json::json!({
             "fast": candidates.fast, "quality": candidates.quality, "lexical": candidates.lexical,
         });
+    }
+    let retained = snapshot.retained_snapshot();
+    if let Some(current) = retained.selected_history_of() {
+        payload["selected_history_of"] = serde_json::json!(current.canonical_bytes().as_slice());
+        payload["selection_kind"] = if retained.selected_predecessor_of().is_some() {
+            serde_json::json!("retained_predecessor")
+        } else {
+            serde_json::json!("retained_ancestor")
+        };
     }
     if let NativeGenerationTopology::PartialQuality {
         quality_documents,

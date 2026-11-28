@@ -30858,6 +30858,7 @@ Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --q
               --generation ID --manifest-sha256 HASH --index-dir STORE searches an exact retained generation locally.
               Copy both values from one trusted publication receipt. The same selectors support the follow-up explain command.
               --authority-receipt PATH searches one trusted native fixed-authority generation locally.
+              Add --authority-current-receipt HEAD to search an authenticated ancestor selected by --authority-receipt.
               --authority-mode lexical|fast|quality|full|partial selects its query tier; default follows the receipt (partial defaults to fast).
               --authority-max-image-bytes N (default 268435456) and --authority-max-source-bytes N (default 16777216) bound admission and hydration.
               Native receipt search returns one final page with document IDs and retained-source snippets in any output format.
