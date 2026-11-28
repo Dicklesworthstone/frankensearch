@@ -74,7 +74,10 @@ topology so consumers can associate results with the receipt they supplied.
 The ordinary `--limit` controls the number of returned results.
 
 Opening a retained generation has a default 256 MiB image budget; source
-hydration has a separate 16 MiB budget. `--authority-max-image-bytes` and
+hydration has a separate 16 MiB budget per result page. Each hit charges its
+ID, complete title, canonical metadata, and the returned prefix of up to 480
+Unicode characters. A matching file can exceed the page budget when its display
+fields fit. Full-document exports still charge the complete body. `--authority-max-image-bytes` and
 `--authority-max-source-bytes` accept positive byte counts to change these
 bounds. They require `--authority-receipt`, as does `--authority-mode`.
 

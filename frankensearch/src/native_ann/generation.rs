@@ -631,6 +631,20 @@ pub(super) struct CompositeReaders {
     topology: NativeGenerationTopology,
 }
 
+/// Display fields copied from one retained document. The snippet is a prefix
+/// of the original content; the identifier, title and metadata are complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSourceSnippet {
+    /// Retained, case-sensitive document identifier.
+    pub id: String,
+    /// At most the requested number of Unicode scalar values of content.
+    pub snippet: String,
+    /// Complete nonempty stored title, if present.
+    pub title: Option<String>,
+    /// Complete canonical source metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
 impl NativeGenerationSnapshot {
     /// Admit the actual search components retained by a qualified root snapshot.
     ///
@@ -954,6 +968,36 @@ impl NativeGenerationSnapshot {
     ) -> SearchResult<Vec<Option<IndexableDocument>>> {
         self.readers
             .source_documents_by_ids(cx, doc_ids, max_source_bytes)
+    }
+
+    /// Hydrate ranked document previews without copying entire content fields.
+    ///
+    /// ID order, duplicates and absent rows follow [`Self::source_documents_by_ids`].
+    /// Each occurrence charges the complete stored ID, title, canonical metadata,
+    /// and at most `max_chars` Unicode scalar values of content to one shared
+    /// byte budget. The whole stored content must still be valid UTF-8.
+    ///
+    /// # Errors
+    /// Refuses invalid source, insufficient budget and cancellation as for full export.
+    pub fn source_snippets_by_ids(
+        &self,
+        cx: &Cx,
+        doc_ids: &[&str],
+        max_chars: usize,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<Option<NativeSourceSnippet>>> {
+        self.readers.read_selected_sources(
+            cx,
+            doc_ids,
+            max_source_bytes,
+            Some(max_chars),
+            |document| NativeSourceSnippet {
+                id: document.id,
+                snippet: document.content,
+                title: document.title,
+                metadata: document.metadata,
+            },
+        )
     }
 
     /// Prepare incremental upserts and deletes against this exact retained cohort.
@@ -2366,6 +2410,17 @@ impl CompositeReaders {
         doc_ids: &[&str],
         max_source_bytes: usize,
     ) -> SearchResult<Vec<Option<IndexableDocument>>> {
+        self.read_selected_sources(cx, doc_ids, max_source_bytes, None, std::convert::identity)
+    }
+
+    fn read_selected_sources<T>(
+        &self,
+        cx: &Cx,
+        doc_ids: &[&str],
+        max_source_bytes: usize,
+        content_chars: Option<usize>,
+        project: impl Fn(IndexableDocument) -> T,
+    ) -> SearchResult<Vec<Option<T>>> {
         let (snapshot, _, field_ids) = self.source_context(cx)?;
         let mut documents = Vec::new();
         documents
@@ -2378,13 +2433,15 @@ impl CompositeReaders {
                 documents.push(None);
                 continue;
             }
-            documents.push(Some(self.read_source_document(
+            let document = self.read_source_fields(
                 cx,
                 &snapshot,
                 field_ids,
                 doc_id,
                 &mut remaining_bytes,
-            )?));
+                content_chars,
+            )?;
+            documents.push(Some(project(document)));
         }
         checkpoint(cx, "native_ann.generation.source_complete")?;
         Ok(documents)
@@ -2398,6 +2455,18 @@ impl CompositeReaders {
         doc_id: &str,
         remaining_bytes: &mut usize,
     ) -> SearchResult<IndexableDocument> {
+        self.read_source_fields(cx, snapshot, field_ids, doc_id, remaining_bytes, None)
+    }
+
+    fn read_source_fields(
+        &self,
+        cx: &Cx,
+        snapshot: &KeeperSnapshot,
+        field_ids: [u16; 4],
+        doc_id: &str,
+        remaining_bytes: &mut usize,
+        content_chars: Option<usize>,
+    ) -> SearchResult<IndexableDocument> {
         let resolved = snapshot
             .resolve_document_id(doc_id)
             .map_err(|_| refused("source", "invalid-lexical-identity"))?
@@ -2405,16 +2474,26 @@ impl CompositeReaders {
         let mut values: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
         for (value, field_id) in values.iter_mut().zip(field_ids) {
             checkpoint(cx, "native_ann.generation.source_field")?;
-            let bytes = self
-                .lexical
-                .stored_field_value_bounded(field_id, resolved.global_docid, *remaining_bytes)
-                .map_err(|error| match error {
-                    QuillIndexError::StoredFieldBudgetExceeded { .. } => {
-                        refused("source", "stored-payload-limit")
-                    }
-                    _ => refused("source", "invalid-stored-field"),
-                })?
-                .ok_or_else(|| refused("source", "missing-stored-field"))?;
+            let bytes = match content_chars {
+                Some(chars) if field_id == field_ids[1] => self.lexical.stored_text_prefix_bounded(
+                    field_id,
+                    resolved.global_docid,
+                    chars,
+                    *remaining_bytes,
+                ),
+                _ => self.lexical.stored_field_value_bounded(
+                    field_id,
+                    resolved.global_docid,
+                    *remaining_bytes,
+                ),
+            }
+            .map_err(|error| match error {
+                QuillIndexError::StoredFieldBudgetExceeded { .. } => {
+                    refused("source", "stored-payload-limit")
+                }
+                _ => refused("source", "invalid-stored-field"),
+            })?
+            .ok_or_else(|| refused("source", "missing-stored-field"))?;
             *remaining_bytes = remaining_bytes
                 .checked_sub(bytes.len())
                 .ok_or_else(|| refused("source", "stored-payload-limit"))?;

@@ -651,7 +651,7 @@ fn authority_payload(
         .iter()
         .map(|result| result.doc_id.as_str())
         .collect();
-    let sources = snapshot.source_documents_by_ids(cx, &ids, max_source_bytes)?;
+    let sources = snapshot.source_snippets_by_ids(cx, &ids, SNIPPET_CHARS, max_source_bytes)?;
     if sources.len() != results.len() {
         return Err(refused(
             "source",
@@ -675,7 +675,7 @@ fn authority_payload(
         }
         hits.push(AuthoritySearchHit {
             result,
-            snippet: source.content.chars().take(SNIPPET_CHARS).collect(),
+            snippet: source.snippet,
             title: source.title,
             source_path: source.metadata.get("path").cloned(),
         });

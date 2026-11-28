@@ -53,6 +53,7 @@ mod scoring_tests;
 pub use generation::{
     NativeGenerationPreview, NativeGenerationQualityCompletionSource, NativeGenerationSnapshot,
     NativeGenerationSource, NativeGenerationTopology, NativeGenerationVectorSource,
+    NativeSourceSnippet,
 };
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;

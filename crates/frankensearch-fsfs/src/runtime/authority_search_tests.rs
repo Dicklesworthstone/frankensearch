@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
+use asupersync::Cx;
 use asupersync::test_utils::run_test_with_cx;
 use asupersync::time::{TimerDriverHandle, VirtualClock};
-use asupersync::{Budget, Cx};
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
@@ -39,6 +39,7 @@ use frankensearch_index::generation_root::{
     GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, QualifiedGenerationRoot,
 };
 
+use super::SNIPPET_CHARS;
 use crate::runtime::FsfsRuntime;
 use crate::{CliCommand, CliInput, FsfsConfig, OutputFormat};
 
@@ -450,20 +451,22 @@ fn payload(bytes: &[u8]) -> serde_json::Value {
     envelope["data"].clone()
 }
 
-fn timed_context(parent: &Cx) -> (Cx, Arc<VirtualClock>, TimerDriverHandle) {
+fn run_with_virtual_time<F: std::future::Future<Output = ()>>(
+    test: impl FnOnce(Cx, Arc<VirtualClock>, TimerDriverHandle) -> F,
+) {
     let clock = Arc::new(VirtualClock::new());
     let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
-    let cx = Cx::new_with_drivers(
-        parent.region_id(),
-        parent.task_id(),
-        Budget::INFINITE,
-        None,
-        None,
-        None,
-        Some(timer.clone()),
-        None,
-    );
-    (cx, clock, timer)
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_timer_driver(timer.clone())
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // Keep admission inline so each manual poll advances exactly as far
+        // as the selected model or the explicitly driven timer.
+        let cx = Cx::current().unwrap().with_blocking_pool_handle(None);
+        let _ambient = Cx::set_current(Some(cx.clone()));
+        test(cx, clock, timer).await;
+    });
 }
 
 #[test]
@@ -507,6 +510,53 @@ fn authority_search_lexical_reads_retained_source_without_loading_models() {
             fs::read(fixture.root_path.join("AUTHORITY")).unwrap(),
             authority_before
         );
+    });
+}
+
+#[test]
+fn authority_display_hydrates_unicode_snippets_under_a_page_budget() {
+    run_test_with_cx(|cx| async move {
+        let prefix = "🦀".repeat(SNIPPET_CHARS);
+        let content = format!("{prefix} {}", "afterpreview ".repeat(1024));
+        let fixture = Fixture::with_documents(
+            &cx,
+            Topology::Fast,
+            vec![IndexableDocument::new("a", content).with_title("document")],
+        )
+        .await;
+        let (_, snapshot) = fixture
+            .receipt
+            .open_read_selection(&cx, None, IMAGE_BUDGET)
+            .unwrap();
+        let budget = "a".len() + prefix.len() + "document".len() + "{}".len();
+        assert!(
+            snapshot
+                .source_documents_by_ids(&cx, &["a"], budget)
+                .is_err()
+        );
+        let rows = snapshot
+            .source_snippets_by_ids(&cx, &["a", "missing", "a"], SNIPPET_CHARS, budget * 2)
+            .unwrap();
+        assert_eq!(rows[0], rows[2]);
+        assert!(rows[1].is_none());
+        assert!(
+            snapshot
+                .source_snippets_by_ids(&cx, &["a", "a"], SNIPPET_CHARS, budget * 2 - 1)
+                .is_err()
+        );
+        let mut runtime = fixture.runtime(Some("lexical"), "afterpreview", 1);
+        runtime.cli_input.authority_max_source_bytes = Some(budget);
+        let mut output = Vec::new();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| {
+                panic!("lexical previews do not use a model")
+            })
+            .await
+            .unwrap();
+        let data = payload(&output);
+        assert_eq!(data["returned_hits"], 1);
+        assert_eq!(data["results"][0]["title"], "document");
+        assert_eq!(data["results"][0]["snippet"], prefix);
     });
 }
 
@@ -1294,16 +1344,14 @@ fn authority_stream_flushes_initial_before_loading_quality_and_never_replays_fas
 
 #[test]
 fn authority_search_quality_loading_obeys_the_virtual_deadline() {
-    run_test_with_cx(|cx| async move {
+    run_with_virtual_time(|cx, clock, timer| async move {
         let fixture = Fixture::new(&cx, Topology::Quality).await;
         let mut runtime = fixture.runtime(Some("quality"), "semantic-query", 1);
         runtime.config.search.quality_timeout_ms = 10;
-        let (timed, clock, timer) = timed_context(&cx);
-        let _ambient = Cx::set_current(Some(timed.clone()));
         let mut output = Vec::new();
         let mut loads = 0;
         let mut query = Box::pin(runtime.run_authority_search_with_writer_and_loader(
-            &timed,
+            &cx,
             &mut output,
             |tier| {
                 assert_eq!(tier, EmbedderTierTag::Quality);
@@ -1328,7 +1376,7 @@ fn authority_search_quality_loading_obeys_the_virtual_deadline() {
         assert_eq!(loads, 1);
         assert!(output.is_empty());
         assert!(timer.is_empty());
-        assert!(!timed.is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
         assert_eq!((fixture.fast.calls(), fixture.quality.calls()), (0, 0));
         fixture.receipt.open(&cx, IMAGE_BUDGET).unwrap();
     });
@@ -1336,7 +1384,7 @@ fn authority_search_quality_loading_obeys_the_virtual_deadline() {
 
 #[test]
 fn authority_search_model_loading_initial_and_refinement_share_one_budget() {
-    run_test_with_cx(|cx| async move {
+    run_with_virtual_time(|cx, clock, timer| async move {
         let fixture = Fixture::new(&cx, Topology::Full).await;
         for pending_initial in [false, true] {
             let mut fast = Producer::new(EmbedderTierTag::Fast);
@@ -1347,12 +1395,10 @@ fn authority_search_model_loading_initial_and_refinement_share_one_budget() {
             let quality = Arc::new(quality);
             let mut runtime = fixture.runtime(Some("full"), "semantic-query", 1);
             runtime.config.search.quality_timeout_ms = 10;
-            let (timed, clock, timer) = timed_context(&cx);
-            let _ambient = Cx::set_current(Some(timed.clone()));
             let mut output = Vec::new();
             let mut loaded = Vec::new();
             let mut query = Box::pin(runtime.run_authority_search_with_writer_and_loader(
-                &timed,
+                &cx,
                 &mut output,
                 |tier| {
                     loaded.push(tier);
@@ -1397,7 +1443,7 @@ fn authority_search_model_loading_initial_and_refinement_share_one_budget() {
             );
             assert!(output.is_empty());
             assert!(timer.is_empty());
-            assert!(!timed.is_cancel_requested());
+            assert!(!cx.is_cancel_requested());
         }
     });
 }
