@@ -1515,6 +1515,12 @@ fn residual_lane_upper_bound(
         + transformed.flat_f32_rounding_error
 }
 
+#[derive(Debug, Clone)]
+struct AdmittedSource {
+    binding: FsviV2IdentityBinding,
+    live_count: u64,
+}
+
 /// Fully-resident in-memory vector index with f16 quantization.
 ///
 /// All vectors are stored in a contiguous `Vec<f16>` in row-major order,
@@ -1584,12 +1590,12 @@ pub struct InMemoryVectorIndex {
     /// it is not a complete v2 generation or an embedding-space identity.
     /// Caller-built vectors and admitted v2 sources do not use this marker.
     legacy_publication_nonce: Option<u16>,
-    /// Complete binding of the exactly admitted source image, present only
+    /// Binding and witnessed live row count of the admitted source image, present only
     /// after [`Self::from_admitted_v2`]. This is source provenance: an F32
     /// artifact is converted into the resident F16 slab, so its storage
     /// contract does not describe the current heap representation.
     /// Caller-declared spaces and legacy vectors never manufacture this proof.
-    admitted_source_binding: Option<FsviV2IdentityBinding>,
+    admitted_source: Option<AdmittedSource>,
     /// Vector dimensionality.
     dimension: usize,
     /// Present only for an index loaded from an exactly admitted FSVI v2 image.
@@ -1735,7 +1741,7 @@ impl InMemoryVectorIndex {
             embedder_id: None,
             embedder_revision: None,
             legacy_publication_nonce: None,
-            admitted_source_binding: None,
+            admitted_source: None,
             dimension,
             residual_source_binding: None,
             exact_residual_sidecar: OnceLock::new(),
@@ -1816,8 +1822,12 @@ impl InMemoryVectorIndex {
     /// Returns vector decoding failures from the admitted artifact.
     pub fn from_admitted_v2(source: &ValidatedFsviBytes) -> SearchResult<Self> {
         let mut index = Self::from_open_index(&source.index)?;
-        index.admitted_source_binding = Some(source.identity_binding().clone());
-        index.residual_source_binding = Some(ResidualSourceBinding::from_witness(source.witness()));
+        let witness = source.witness();
+        index.admitted_source = Some(AdmittedSource {
+            binding: source.identity_binding().clone(),
+            live_count: witness.live_count,
+        });
+        index.residual_source_binding = Some(ResidualSourceBinding::from_witness(witness));
         Ok(index)
     }
 
@@ -2196,7 +2206,7 @@ impl InMemoryVectorIndex {
                 .identity_v2()
                 .is_none()
                 .then_some(index.publication_nonce()),
-            admitted_source_binding: None,
+            admitted_source: None,
             dimension,
             residual_source_binding: None,
             exact_residual_sidecar: OnceLock::new(),
@@ -2244,7 +2254,7 @@ impl InMemoryVectorIndex {
     /// seam such as the refresh identity-bound merge.
     #[must_use]
     pub const fn space_identity_is_attested(&self) -> bool {
-        self.admitted_source_binding.is_some()
+        self.admitted_source.is_some()
     }
 
     /// Complete binding of the immutable FSVI v2 source, when exactly admitted.
@@ -2254,7 +2264,18 @@ impl InMemoryVectorIndex {
     /// provenance, not a claim about this index's resident F16 representation.
     #[must_use]
     pub const fn admitted_source_binding(&self) -> Option<&FsviV2IdentityBinding> {
-        self.admitted_source_binding.as_ref()
+        match &self.admitted_source {
+            Some(source) => Some(&source.binding),
+            None => None,
+        }
+    }
+
+    /// Live row count witnessed by the admitted immutable FSVI v2 image.
+    #[must_use]
+    pub fn admitted_source_live_count(&self) -> Option<u64> {
+        self.admitted_source
+            .as_ref()
+            .map(|source| source.live_count)
     }
 
     /// Whether this index currently has a source-derived exact-residual
@@ -4732,6 +4753,7 @@ mod tests {
             "a caller-declared space is DECLARED, never header-attested (C4-write guards 2+8)"
         );
         assert_eq!(index.admitted_source_binding(), None);
+        assert_eq!(index.admitted_source_live_count(), None);
 
         // The identity-less constructor stays typed-absent: no fabrication.
         let (doc_ids, vectors) = identity_rows(dim, 3);
@@ -4743,6 +4765,7 @@ mod tests {
         );
         assert!(!legacy.space_identity_is_attested());
         assert_eq!(legacy.admitted_source_binding(), None);
+        assert_eq!(legacy.admitted_source_live_count(), None);
     }
 
     #[test]
@@ -4802,7 +4825,13 @@ mod tests {
         );
         assert_eq!(admitted.identity_binding(), &binding);
         assert_eq!(index.admitted_source_binding(), Some(&binding));
-        assert_eq!(index.clone().admitted_source_binding(), Some(&binding));
+        assert_eq!(
+            index.admitted_source_live_count(),
+            Some(admitted.witness().live_count)
+        );
+        let cloned = index.clone();
+        assert_eq!(cloned.admitted_source_binding(), Some(&binding));
+        assert_eq!(cloned.admitted_source_live_count(), Some(4));
         let two_tier = InMemoryTwoTierIndex::new(index, None).expect("admitted fast-only index");
         assert!(two_tier.fast_identity_is_attested());
         assert!(

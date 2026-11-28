@@ -22,9 +22,9 @@ use frankensearch_core::filter::{DocIdHashSet, IncludeDocIdsFilter, SearchFilter
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
-    DocId, FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase,
-    SearchResult, SpaceIdentityAdmission, TwoTierConfig, TwoTierMetrics, VectorHit,
-    ZeroSignalReason,
+    DocId, FusedHit, PhaseMetrics, RetrievalTopology, ScoreSource, ScoredResult, SearchCoverageV1,
+    SearchError, SearchPhase, SearchResult, SpaceIdentityAdmission, TierQueryCoverageV1,
+    TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
 use frankensearch_index::{
     ClassifiedHits, InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams, ValidatedFsviBytes,
@@ -188,6 +188,23 @@ fn independently_retrievable_quality(index: &InMemoryVectorIndex) -> bool {
             && index
                 .embedder_revision()
                 .is_some_and(|revision| !revision.is_empty()))
+}
+
+fn admitted_tier_coverage(
+    index: &InMemoryVectorIndex,
+    eligible_hits: &[VectorHit],
+) -> Option<TierQueryCoverageV1> {
+    let generation_sequence = index.admitted_source_binding()?.generation().sequence;
+    let live_count = index.admitted_source_live_count()?;
+    let candidates: AHashSet<_> = eligible_hits
+        .iter()
+        .map(|hit| hit.doc_id.as_str())
+        .collect();
+    Some(TierQueryCoverageV1::Witnessed {
+        generation_sequence,
+        live_count,
+        contributed_candidates: candidates.len() as u64,
+    })
 }
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -1259,6 +1276,17 @@ impl SyncTwoTierSearcher {
         metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.zero_signal = zero_signal;
         metrics.publish_vector_candidates(fast_hits.len(), hash_control);
+        if !want_phase && zero_signal != Some(ZeroSignalReason::ZeroNormQuery) {
+            metrics.coverage =
+                admitted_tier_coverage(self.index.fast_index(), &fast_hits).map(|fast| {
+                    let topology = if hash_control {
+                        RetrievalTopology::HashControl
+                    } else {
+                        RetrievalTopology::FastOnly
+                    };
+                    SearchCoverageV1::new(topology, fast, TierQueryCoverageV1::NotRequested)
+                });
+        }
         if hash_control && metrics.skip_reason.is_none() {
             // Same contract as the async searcher: hash vectors still run as
             // an explicit control path, but they are never unlabeled semantic
@@ -1479,6 +1507,15 @@ impl SyncTwoTierSearcher {
             // These are Phase-1 vectors because direct quality is the first
             // and only phase. The embedder and quality timing identify its tier.
             metrics.phase1_vectors_searched = index.record_count();
+            if !want_phase {
+                metrics.coverage = admitted_tier_coverage(index, &hits).map(|quality| {
+                    SearchCoverageV1::new(
+                        RetrievalTopology::QualityOnly,
+                        TierQueryCoverageV1::NotRequested,
+                        quality,
+                    )
+                });
+            }
         }
         metrics.zero_signal = zero_signal;
         metrics.vector_search_ms = metrics.quality_search_ms;
@@ -1656,6 +1693,7 @@ impl SyncTwoTierSearcher {
         let independent_quality = independently_retrievable_quality(quality_index);
         let mut lexical_refill_time = Duration::ZERO;
         let mut reconciled_zero_signal = None;
+        let mut refined_coverage = None;
         let quality_pool = if independent_quality {
             search_filtered_vectors(
                 &mut lexical_context,
@@ -1728,6 +1766,28 @@ impl SyncTwoTierSearcher {
                 }
                 fast_hits = fast_classified.hits;
                 let mut hits = classified.hits;
+                // These eligible pools came from ranked retrieval. The exact
+                // scores added below can complete blending evidence for them.
+                if !want_phase && let Some(quality) = admitted_tier_coverage(quality_index, &hits) {
+                    let fast = if fast_revoked.is_empty() {
+                        metrics
+                            .coverage
+                            .as_ref()
+                            .map(|initial| initial.fast.clone())
+                    } else {
+                        admitted_tier_coverage(self.index.fast_index(), &fast_hits)
+                    };
+                    let topology = if fast.is_some() {
+                        RetrievalTopology::FullProgressive
+                    } else {
+                        RetrievalTopology::QualityOnly
+                    };
+                    refined_coverage = Some(SearchCoverageV1::new(
+                        topology,
+                        fast.unwrap_or(TierQueryCoverageV1::NotRequested),
+                        quality,
+                    ));
+                }
                 let mut refined_fast_hits = fast_hits.clone();
                 complete_quality_evidence(&fast_hits, &mut hits, |missing| {
                     self.index
@@ -1842,6 +1902,9 @@ impl SyncTwoTierSearcher {
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
         if let Some(reason) = reconciled_zero_signal {
             metrics.zero_signal = Some(reason);
+        }
+        if let Some(coverage) = refined_coverage {
+            metrics.coverage = Some(coverage);
         }
 
         let blend_started = Instant::now();
@@ -3232,6 +3295,14 @@ mod tests {
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn tier_witness(generation_sequence: u64, live_count: u64, count: u64) -> TierQueryCoverageV1 {
+        TierQueryCoverageV1::Witnessed {
+            generation_sequence,
+            live_count,
+            contributed_candidates: count,
+        }
+    }
+
     /// Bind one synthetic vector to an explicitly synthetic identity.
     ///
     /// `explicit_test_model` is the sanctioned constructor for exactly this:
@@ -3543,6 +3614,15 @@ mod tests {
                     assert_eq!(serde_json::to_value(collected).unwrap(), serialized);
                     assert_eq!(metrics.phase2_vectors_searched, 2);
                     assert_eq!(metrics.incomplete_embeddings, 0);
+                    assert_eq!(
+                        metrics.coverage,
+                        attested.then(|| SearchCoverageV1::new(
+                            RetrievalTopology::FullProgressive,
+                            tier_witness(1, 1, 1),
+                            tier_witness(1, 3, 1),
+                        )),
+                        "the supplemental quality score must leave retrieval coverage unchanged"
+                    );
                 }
             }
         }
@@ -5306,7 +5386,7 @@ mod tests {
         let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
 
         // Positive control: the space this tier was written in.
-        let (results, _) = searcher
+        let (results, metrics) = searcher
             .search_collect(
                 &TieredQueryEmbeddings::fast_only(
                     BoundQueryEmbedding::new(vec![1.0, 0.0], fast_identity).expect("bind"),
@@ -5315,6 +5395,14 @@ mod tests {
             )
             .expect("the producing space is admitted");
         assert_eq!(results[0].doc_id, "a");
+        assert_eq!(
+            metrics.coverage,
+            Some(SearchCoverageV1::new(
+                RetrievalTopology::FastOnly,
+                tier_witness(11, 2, 2),
+                TierQueryCoverageV1::NotRequested,
+            ))
+        );
 
         // Same width, different space: refused even when zero signal or k=0
         // would otherwise avoid vector work.
@@ -5512,7 +5600,15 @@ mod tests {
             BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], fast_identity).expect("bind fast"),
             BoundQueryEmbedding::new(vec![0.0, 1.0, 0.0], quality_identity).expect("bind quality"),
         );
-        let (results, _) = searcher.search_collect(&query, 3).unwrap();
+        let (results, metrics) = searcher.search_collect(&query, 3).unwrap();
+        assert_eq!(
+            metrics.coverage,
+            Some(SearchCoverageV1::new(
+                RetrievalTopology::FullProgressive,
+                tier_witness(21, 2, 2),
+                tier_witness(21, 3, 3),
+            ))
+        );
         let ids: Vec<&str> = results.iter().map(|r| r.doc_id.as_str()).collect();
         assert!(
             ids.contains(&"doc-quality-only"),
@@ -5765,6 +5861,14 @@ mod tests {
             assert_eq!(metrics.semantic_candidates, 0);
             assert_eq!(metrics.hash_control_candidates, 2);
             assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert_eq!(
+                metrics.coverage,
+                Some(SearchCoverageV1::new(
+                    RetrievalTopology::HashControl,
+                    tier_witness(43, 2, 2),
+                    TierQueryCoverageV1::NotRequested,
+                ))
+            );
             assert_eq!(
                 metrics.skip_reason.as_deref(),
                 Some("non_semantic_fast_embedder_vector_control")
@@ -7274,6 +7378,19 @@ mod tests {
                     metrics.zero_signal,
                     Some(ZeroSignalReason::FilterEliminatedAll)
                 );
+                assert_eq!(
+                    metrics.coverage,
+                    attested.then(|| {
+                        let tier = tier_witness(1, 4, 0);
+                        let absent = TierQueryCoverageV1::NotRequested;
+                        if mode == "fast" {
+                            SearchCoverageV1::new(RetrievalTopology::FastOnly, tier, absent)
+                        } else {
+                            SearchCoverageV1::new(RetrievalTopology::QualityOnly, absent, tier)
+                        }
+                    }),
+                    "an exhausted admitted {mode} tier has a witnessed zero"
+                );
                 assert_eq!(*lexical.limits.lock().unwrap(), vec![2, 4]);
 
                 let unfiltered = Arc::new(LateRefillLexical::default());
@@ -7429,6 +7546,14 @@ mod tests {
                 } else {
                     Some(ZeroSignalReason::FilterEliminatedAll)
                 }
+            );
+            assert_eq!(
+                metrics.coverage,
+                Some(SearchCoverageV1::new(
+                    RetrievalTopology::FullProgressive,
+                    tier_witness(1, fast_rows.len() as u64, u64::from(include_tail)),
+                    tier_witness(1, 1, 0),
+                ))
             );
         }
     }
@@ -8550,6 +8675,14 @@ mod tests {
         assert_eq!(metrics.phase1_vectors_searched, 0);
         assert_eq!(metrics.phase2_vectors_searched, 2);
         assert_eq!(metrics.skip_reason, None);
+        assert_eq!(
+            metrics.coverage,
+            Some(SearchCoverageV1::new(
+                RetrievalTopology::QualityOnly,
+                TierQueryCoverageV1::NotRequested,
+                tier_witness(31, 2, 2),
+            ))
+        );
 
         let phases = searcher.search_iter(&query, 1).collect::<Vec<_>>();
         let [
@@ -8649,6 +8782,14 @@ mod tests {
                 assert_eq!(
                     metrics.skip_reason.as_deref(),
                     Some("quality_query_zero_norm")
+                );
+                assert_eq!(
+                    metrics.coverage,
+                    fast_signal.then(|| SearchCoverageV1::new(
+                        RetrievalTopology::FastOnly,
+                        tier_witness(32, 1, 1),
+                        TierQueryCoverageV1::NotRequested,
+                    ))
                 );
 
                 let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();

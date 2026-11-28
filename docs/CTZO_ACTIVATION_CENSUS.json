@@ -102,6 +102,32 @@
       "kind": "sync-tiered-admission",
       "consumes": ["TieredQueryEmbeddings", "BoundQueryEmbedding"],
       "slice": "4c (bd-sync-searcher-tiered-query-embeddings-dbp10)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "symbol": "fn search_initial",
+      "kind": "sync-fast-coverage",
+      "consumes": ["SearchCoverageV1", "TierQueryCoverageV1"],
+      "slice": "5 (C4)",
+      "note": "The in-memory tier retains the live count from its admitted FSVI v2 source witness."
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "symbol": "fn search_quality_only",
+      "kind": "sync-direct-quality-coverage",
+      "consumes": ["SearchCoverageV1", "TierQueryCoverageV1"],
+      "slice": "5 (C4)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "symbol": "fn search_refined",
+      "kind": "sync-refined-coverage",
+      "consumes": ["SearchCoverageV1", "TierQueryCoverageV1"],
+      "slice": "5 (C4)",
+      "note": "Successful refinement counts final eligible ranked hits before the supplemental scores used for blending."
     }
   ],
   "production_call_sites": [
@@ -144,6 +170,12 @@
       "callee": ".into_coverage(",
       "count": 4,
       "note": "Each path counts retained candidates after eligibility reconciliation, without searching again."
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "callee": "admitted_tier_coverage(",
+      "count": 4,
+      "note": "Initial fast, direct quality, progressive quality and any late fast replacement count the ranked pool without another search."
     }
   ]
 }
