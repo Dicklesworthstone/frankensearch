@@ -809,11 +809,14 @@ mod receipt_durability_tests {
             let (target, old_guard) = store.open_previous(&cx).unwrap();
             assert_eq!(target, first);
 
-            store
-                .prepare_restore(&cx, &second)
-                .unwrap()
-                .restore(&cx, |_, _| Ok(()))
-                .unwrap();
+            assert!(matches!(
+                store
+                    .prepare_restore(&cx, &second)
+                    .unwrap()
+                    .restore(&cx, |_, _| Ok(()))
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
             let (target, guard) = store.open_previous(&cx).unwrap();
             assert_eq!(target, first);
             assert_ne!(guard, old_guard);
@@ -830,11 +833,14 @@ mod receipt_durability_tests {
             let (intact, current_guard) = store.open_previous(&cx).unwrap();
             assert_eq!(intact, first);
             assert_eq!(current_guard, guard);
-            store
-                .resume_restore(&cx, intact.id(), intact.manifest_sha256(), &guard)
-                .unwrap()
-                .restore(&cx, |_, _| Ok(()))
-                .unwrap();
+            assert!(matches!(
+                store
+                    .resume_restore(&cx, intact.id(), intact.manifest_sha256(), &guard)
+                    .unwrap()
+                    .restore(&cx, |_, _| Ok(()))
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
             assert_eq!(store.active(&cx).unwrap(), Some(first));
             assert!(
                 store.open_previous(&cx).is_err(),

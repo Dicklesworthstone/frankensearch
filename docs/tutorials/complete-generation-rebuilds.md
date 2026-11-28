@@ -515,6 +515,29 @@ to 256 MiB. These bounds constrain payload and I/O, not peak memory. A missing
 or corrupt sidecar, unsupported artifact, or inadmissible store security profile
 is refused before copying begins.
 
+### Recover the previous selected generation
+
+A complete store records the activation that each publication replaced. To
+inspect the most recent distinct predecessor and preview it against its retained
+source and models, run:
+
+```sh
+fsfs recover --index-dir /work/search-store --previous \
+  --config /work/fsfs.toml --query "connection pooling"
+```
+
+For a separate approval or restart, add `--prepare --save-preparation FILE`,
+then use `--resume-file FILE --apply` with the same query and configuration.
+This pins the decision to the exact selection that was observed. To preview
+and restore in one invocation, use `--previous --apply`. Restoration records
+a new activation and preserves both bundles.
+
+This works with a damaged current bundle when the active descriptor and
+the required history links remain intact. It skips repeated selections of
+the same generation. The first publication has no predecessor. If the active
+descriptor, required history, or previous bundle is unavailable or corrupt,
+use an independently trusted target receipt or rebuild from source.
+
 ### Automatic retention and legacy conversion
 
 Every command that publishes a successor (`index`, `watch`, `append-batch`,

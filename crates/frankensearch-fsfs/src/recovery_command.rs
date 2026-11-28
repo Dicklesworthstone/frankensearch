@@ -41,6 +41,7 @@ const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_REPAIR_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 const HELP: &str =
     "fsfs recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
+fsfs recover --index-dir STORE --previous [--query TEXT] [--prepare|--apply]
 fsfs recover --index-dir STORE --rebuild-source SOURCE --query TEXT --prepare|--apply [OPTIONS]
 fsfs recover --index-dir STORE --rebuild-source SOURCE --query TEXT --resume-build FILE --prepare|--apply [OPTIONS]
 fsfs recover --index-dir STORE --resume-file FILE --apply [OPTIONS]
@@ -50,6 +51,8 @@ Inspect an explicitly receipted complete generation, even if FSFS-CURRENT is dam
 No directory scan chooses a recovery target. Models are never downloaded.
 The standalone fsfs-recover utility accepts the same options.
 
+  --previous          Inspect the most recent distinct generation from this store's activation
+                      history. --prepare or --apply binds that choice to the observed head.
   --config FILE       Use the normal fsfs configuration loader and model selection
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
@@ -144,6 +147,7 @@ enum RecoveryAction {
 
 #[derive(Clone, Debug)]
 enum RecoveryTarget {
+    Previous,
     Retained { generation: String, digest: String },
     Source(PathBuf),
 }
@@ -262,6 +266,7 @@ impl Options {
                 flag.as_str(),
                 "--index-dir"
                     | "--generation"
+                    | "--previous"
                     | "--manifest-sha256"
                     | "--rebuild-source"
                     | "--save-build"
@@ -290,6 +295,9 @@ impl Options {
             }
             if !seen.insert(flag.clone()) {
                 return Err(invalid(format!("duplicate {flag} is not allowed")));
+            }
+            if flag == "--previous" {
+                continue;
             }
             let selected_action = match flag.as_str() {
                 "--prepare" => Some(RecoveryAction::Prepare),
@@ -392,6 +400,21 @@ impl Options {
         }
         let root =
             root.ok_or_else(|| invalid("--index-dir is required; recovery never guesses a store"))?;
+        let previous = seen.contains("--previous");
+        if previous
+            && (generation.is_some()
+                || digest.is_some()
+                || rebuild_source.is_some()
+                || expected_selection_sha256.is_some()
+                || resume_file.is_some()
+                || repair_vectors
+                || repair_artifacts
+                || action == RecoveryAction::ConfirmDurability)
+        {
+            return Err(invalid(
+                "--previous selects a target from current history; use it with inspection, --prepare or --apply and omit manual receipts, repair and rebuild",
+            ));
+        }
         if save_build.is_some() || resume_build_file.is_some() {
             if (save_build.is_some() && resume_build_file.is_some())
                 || rebuild_source.is_none()
@@ -449,7 +472,9 @@ impl Options {
         } else {
             None
         };
-        let target = if let Some(source) = rebuild_source {
+        let target = if previous {
+            RecoveryTarget::Previous
+        } else if let Some(source) = rebuild_source {
             if !matches!(action, RecoveryAction::Prepare | RecoveryAction::Apply)
                 || generation.is_some()
                 || digest.is_some()
@@ -616,7 +641,9 @@ impl Options {
     fn receipt(&self) -> SearchResult<(&str, &str)> {
         match &self.target {
             RecoveryTarget::Retained { generation, digest } => Ok((generation, digest)),
-            RecoveryTarget::Source(_) => Err(invalid("this action requires a retained receipt")),
+            RecoveryTarget::Source(_) | RecoveryTarget::Previous => {
+                Err(invalid("this action requires a retained receipt"))
+            }
         }
     }
 }
@@ -893,6 +920,22 @@ async fn execute(
     // Refuse policy drift before acquiring the store, loading producers,
     // copying repair data or creating a source-rebuild candidate.
     let preview_requirement = preview_requirement(runtime, options)?;
+    // Pin the authenticated predecessor and capture the activation guard together.
+    // Never resolve "previous" a second time while loading models or previewing.
+    let previous = if matches!(options.target, RecoveryTarget::Previous) {
+        let store = CompleteGenerationStore::open_with_profile(
+            cx,
+            &options.root,
+            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
+        Some(store.open_previous(cx)?)
+    } else {
+        None
+    };
+    let target_receipt = || match &previous {
+        Some((target, _)) => Ok((target.id(), target.manifest_sha256())),
+        None => options.receipt(),
+    };
     if matches!(
         options.action,
         RecoveryAction::Prepare | RecoveryAction::Apply
@@ -911,8 +954,12 @@ async fn execute(
             } else {
                 runtime.prepare_retained_rebuild(cx, &options.root).await?
             }
-        } else if let Some(expected) = &options.expected_selection_sha256 {
-            let (generation, digest) = options.receipt()?;
+        } else if let Some(expected) = previous
+            .as_ref()
+            .map(|(_, guard)| guard)
+            .or(options.expected_selection_sha256.as_ref())
+        {
+            let (generation, digest) = target_receipt()?;
             runtime
                 .resume_retained_recovery(cx, &options.root, generation, digest, expected)
                 .await?
@@ -995,7 +1042,7 @@ async fn execute(
     } else {
         // Inspection never takes publication ownership and never replaces a
         // corrupt descriptor. The caller must separately authorize --apply.
-        let (generation, digest) = options.receipt()?;
+        let (generation, digest) = target_receipt()?;
         let mut reader = runtime
             .open_retained_search_from_receipt(cx, &options.root, generation, digest)
             .await?;
@@ -1051,7 +1098,7 @@ fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
         index_dir: Some(options.root.clone()),
         target_path: match &options.target {
             RecoveryTarget::Source(source) => Some(source.clone()),
-            RecoveryTarget::Retained { .. } => None,
+            RecoveryTarget::Retained { .. } | RecoveryTarget::Previous => None,
         },
         quiet: true,
         no_color: true,
@@ -1924,6 +1971,42 @@ mod tests {
         let query = Options::parse(input).unwrap();
         assert_eq!(query.action, RecoveryAction::Inspect);
         assert_eq!(query.query.as_deref(), Some("--prepare"));
+    }
+
+    #[test]
+    fn previous_accepts_preview_and_guarded_apply_and_refuses_competing_targets() {
+        let parse = |flags: &[&str]| {
+            Options::parse(
+                ["--index-dir", "store", "--previous"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .map(OsString::from)
+                    .collect(),
+            )
+        };
+        for flags in [
+            &[][..],
+            &["--query", "needle"],
+            &["--prepare", "--save-preparation", "previous.json"],
+            &["--query", "needle", "--apply"],
+        ] {
+            assert!(matches!(
+                parse(flags).unwrap().target,
+                RecoveryTarget::Previous
+            ));
+        }
+        for flags in [
+            &["--previous"][..],
+            &["--generation", "manual"],
+            &["--manifest-sha256", "manual"],
+            &["--apply", "--expected-selection-sha256", "manual"],
+            &["--apply", "--resume-file", "missing"],
+            &["--prepare", "--repair-artifacts"],
+            &["--rebuild-source", "source", "--query", "needle", "--apply"],
+            &["--confirm-durability"],
+        ] {
+            assert!(parse(flags).is_err(), "{flags:?}");
+        }
     }
 
     #[test]

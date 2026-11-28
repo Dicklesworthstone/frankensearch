@@ -144,8 +144,10 @@ fn command_help_and_usage_errors_do_not_create_a_store() {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("fsfs recover --index-dir STORE"));
         assert!(text.contains("--confirm-durability"));
+        assert!(text.contains("--previous"));
         for suffix in [
             vec!["--apply", "--apply"],
+            vec!["--previous"],
             vec!["--apply", "--confirm-durability"],
             vec!["--unknown"],
         ] {
@@ -729,6 +731,37 @@ fn exercise_source_rebuild(prepare_entry: RecoveryEntry, apply_entry: RecoveryEn
     assert_eq!(body(&output)["data"]["hits"][0]["path"], "alpha.md");
     assert_eq!(files(&target), sealed);
     assert!(!directory.path().join("missing-models").exists());
+
+    // A later publication can be unusable even though its activation descriptor
+    // still authenticates the last searchable generation. The original source
+    // and publication receipt are unnecessary for history-directed recovery.
+    let store_root = &root;
+    run_test_with_cx(|cx| async move {
+        let store = CompleteGenerationStore::open(&cx, store_root).unwrap();
+        let later = published(&store, &cx, b"later publication");
+        fs::write(later.path().join("payload"), b"damaged").unwrap();
+    });
+    let pointer = root.join(COMPLETE_GENERATION_POINTER);
+    let damaged_selection = fs::read(&pointer).unwrap();
+    for (entry, apply) in [(prepare_entry, false), (apply_entry, true)] {
+        let mut previous = entry.command();
+        configure(&mut previous);
+        previous.arg("--previous").args(original_policy);
+        if apply {
+            previous.arg("--apply");
+        }
+        let output = run(&mut previous, directory.path(), Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report = &body(&output)["data"];
+        assert_eq!(report["generation_id"], prepared["generation_id"]);
+        assert_eq!(report["selection_write_performed"], apply);
+        assert_eq!(report["preview"][0]["hits"][0]["path"], "alpha.md");
+        assert_eq!(fs::read(&pointer).unwrap() != damaged_selection, apply);
+    }
 }
 
 #[test]
