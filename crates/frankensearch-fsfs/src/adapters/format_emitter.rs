@@ -508,12 +508,15 @@ fn write_search_payload_csv<W: Write>(payload: &SearchPayload, writer: &mut W) -
     Ok(())
 }
 
-fn write_csv_row<W: Write>(writer: &mut W, fields: &[String]) -> SearchResult<()> {
+pub(crate) fn write_csv_row<W: Write, S: AsRef<str>>(
+    writer: &mut W,
+    fields: &[S],
+) -> SearchResult<()> {
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
             writer.write_all(b",").map_err(write_err)?;
         }
-        write_csv_field(writer, field)?;
+        write_csv_field(writer, field.as_ref())?;
     }
     writer.write_all(b"\n").map_err(write_err)
 }
@@ -693,7 +696,7 @@ fn truthy_env(value: &str) -> bool {
     !matches!(trimmed, "0" | "false" | "FALSE" | "False")
 }
 
-fn detect_terminal_width() -> usize {
+pub(crate) fn detect_terminal_width() -> usize {
     env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -806,7 +809,7 @@ pub(crate) fn focused_preview(snippet: &str, query_terms: &[String], max_chars: 
     truncate_for_width(&format!("…{}", words[start..].join(" ")), max_chars)
 }
 
-fn collect_query_terms(query: &str) -> Vec<String> {
+pub(crate) fn collect_query_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
         .map(str::to_ascii_lowercase)
@@ -835,7 +838,7 @@ fn highlight_query_terms(text: &str, query_terms: &[String], color_enabled: bool
         .join(" ")
 }
 
-fn write_err(source: io::Error) -> SearchError {
+pub(crate) fn write_err(source: io::Error) -> SearchError {
     SearchError::Io(source)
 }
 

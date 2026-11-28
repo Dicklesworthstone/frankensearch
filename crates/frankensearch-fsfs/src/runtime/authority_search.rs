@@ -22,13 +22,18 @@ use super::{
     FsfsRuntime, SearchFilterExpr, SearchStreamWriter, iso_timestamp_now, pressure_timestamp_ms,
     retained_search_checkpoint,
 };
-use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
+use crate::adapters::format_emitter::{
+    emit_envelope, emit_stream_frame, meta_for_format, with_buffered_output,
+};
 use crate::config::DegradationOverrideMode;
 use crate::output_schema::{OutputEnvelope, output_error_from};
 use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
     terminal_event_completed, terminal_event_from_error,
 };
+
+#[path = "authority_search_output.rs"]
+mod output;
 
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -154,17 +159,8 @@ impl FsfsRuntime {
                 load()
             }
         };
-        if self.cli_input.stream {
-            // The frame emitter flushes each record and owns partial writes.
-            return self
-                .run_authority_search_with_writer_and_loader(cx, &mut io::stdout(), load)
-                .await;
-        }
-        let mut writer = io::BufWriter::new(io::stdout());
-        self.run_authority_search_with_writer_and_loader(cx, &mut writer, load)
-            .await?;
-        writer.flush()?;
-        Ok(())
+        self.run_authority_search_with_writer_and_loader(cx, &mut io::stdout(), load)
+            .await
     }
 
     fn validate_authority_policy(&self, mode: AuthorityMode) -> SearchResult<()> {
@@ -266,16 +262,27 @@ impl FsfsRuntime {
         if !self.cli_input.stream {
             let started = Instant::now();
             return self
-                .execute_authority_query(cx, load, |payload| {
+                .execute_authority_query(cx, load, |payload, snapshot| {
                     let elapsed_ms =
                         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let envelope = OutputEnvelope::success(
-                        payload,
-                        meta_for_format("search", self.cli_input.format)
-                            .with_duration_ms(elapsed_ms),
-                        iso_timestamp_now(),
-                    );
-                    emit_envelope(&envelope, self.cli_input.format, writer)
+                    with_buffered_output(writer, |writer| {
+                        match self.cli_input.format {
+                            crate::OutputFormat::Table => {
+                                return output::write_table(&payload, snapshot, elapsed_ms, writer);
+                            }
+                            crate::OutputFormat::Csv => {
+                                return output::write_csv(&payload, snapshot, writer);
+                            }
+                            _ => {}
+                        }
+                        let envelope = OutputEnvelope::success(
+                            payload,
+                            meta_for_format("search", self.cli_input.format)
+                                .with_duration_ms(elapsed_ms),
+                            iso_timestamp_now(),
+                        );
+                        emit_envelope(&envelope, self.cli_input.format, writer)
+                    })
                 })
                 .await;
         }
@@ -304,7 +311,7 @@ impl FsfsRuntime {
         );
         let result = async {
             send(&mut writer, StreamEvent::Started(started), None)?;
-            self.execute_authority_query(cx, load, |page| {
+            self.execute_authority_query(cx, load, |page, _snapshot| {
                 let AuthorityPage {
                     mut evidence,
                     mode,
@@ -370,7 +377,7 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         mut load: F,
-        mut publish: impl FnMut(AuthorityPage) -> SearchResult<()>,
+        mut publish: impl FnMut(AuthorityPage, &NativeGenerationSnapshot) -> SearchResult<()>,
     ) -> SearchResult<()>
     where
         F: FnMut(EmbedderTierTag) -> Fut,
@@ -601,7 +608,7 @@ impl FsfsRuntime {
                 if defer_quality && !quality_started {
                     let payload = hydrate(page.0, page.1, page.2).await?;
                     retained_search_checkpoint(cx)?;
-                    publish(payload)?;
+                    publish(payload, &snapshot)?;
                     retained_search_checkpoint(cx)?;
                     quality_runtime.quality_budget_started_at = Some(cx.now());
                     let producer = quality_runtime
@@ -630,7 +637,7 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         let payload = hydrate(phase, results, candidates).await?;
         retained_search_checkpoint(cx)?;
-        publish(payload)
+        publish(payload, &snapshot)
     }
 }
 

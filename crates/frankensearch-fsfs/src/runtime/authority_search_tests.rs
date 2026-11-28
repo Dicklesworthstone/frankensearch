@@ -548,7 +548,7 @@ fn authority_display_hydrates_unicode_snippets_under_a_page_budget() {
         runtime.cli_input.authority_max_source_bytes = Some(budget);
         let mut output = Vec::new();
         runtime
-            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| {
+            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| async {
                 panic!("lexical previews do not use a model")
             })
             .await
@@ -664,6 +664,81 @@ fn authority_filters_rank_only_matching_ids_in_every_lane_and_phase() {
 }
 
 #[test]
+fn authority_search_default_table_and_csv_return_ranked_documents() {
+    run_test_with_cx(|cx| async move {
+        let docs = vec![
+            IndexableDocument::new("notes/alpha.rs", "retry retry")
+                .with_title("A, \"quoted\"\nnext\x1b[2J")
+                .with_metadata("path", "src/a,b.rs"),
+            IndexableDocument::new("notes/beta.rs", "retry briefly"),
+        ];
+        let fixture = Fixture::with_documents(&cx, Topology::Fast, docs).await;
+        let mut runtime = fixture.runtime(Some("lexical"), "retry", 10);
+        runtime.cli_input = crate::adapters::cli::parse_cli_args([
+            "search",
+            "retry",
+            "--authority-mode",
+            "lexical",
+            "--authority-receipt",
+            fixture.receipt_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(runtime.cli_input.format, OutputFormat::Table);
+        let no_model = |_| async { panic!("lexical display loaded a model") };
+        let mut out = Vec::new();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut out, no_model)
+            .await
+            .unwrap();
+        let table = std::str::from_utf8(&out).unwrap();
+        assert!(table.contains("2 results for \"retry\""));
+        assert!(table.contains("lexical / initial") && table.contains("current"));
+        let fingerprint =
+            super::super::sha256_digest_hex(fixture.receipt.authority().unwrap().fingerprint());
+        assert!(table.contains(&fingerprint));
+        assert!(table.contains("1. notes/") && table.contains("2. notes/"));
+        assert!(table.contains("notes/alpha.rs") && table.contains("notes/beta.rs"));
+        assert!(table.contains("[Lexical]") && table.contains("lexical="));
+        assert!(table.contains("src/a,b.rs") && table.contains(r#""quoted"\nnext"#));
+        assert!(!table.contains('\x1b') && !table.contains("data_json"));
+
+        runtime.cli_input.format = OutputFormat::Csv;
+        out.clear();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut out, no_model)
+            .await
+            .unwrap();
+        let csv = std::str::from_utf8(&out).unwrap();
+        let (header, rows) = csv.split_once('\n').unwrap();
+        let header = header.to_owned();
+        assert!(
+            header.contains("authority_sha256")
+                && header.contains("rank,doc_id,title,source_path,score,score_source")
+        );
+        assert_eq!(rows.matches(&fingerprint).count(), 2);
+        assert!(rows.contains(",1,notes/") && rows.contains(",2,notes/"));
+        assert!(rows.contains("\"A, \"\"quoted\"\"\nnext\x1b[2J\",\"src/a,b.rs\""));
+        assert_eq!(rows.matches(",Lexical,").count(), 2);
+
+        runtime.cli_input.filter = Some("path:missing".into());
+        out.clear();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut out, no_model)
+            .await
+            .unwrap();
+        assert_eq!(out, format!("{header}\n").as_bytes());
+        runtime.cli_input.format = OutputFormat::Table;
+        out.clear();
+        runtime
+            .run_authority_search_with_writer_and_loader(&cx, &mut out, no_model)
+            .await
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        assert!(table.contains("0 results") && table.contains("Eligible documents  0 of 2"));
+    });
+}
+
+#[test]
 fn authority_filter_rejects_unknown_grammar_and_admits_empty_membership() {
     run_test_with_cx(|cx| async move {
         let fixture = Fixture::new(&cx, Topology::Full).await;
@@ -671,7 +746,7 @@ fn authority_filter_rejects_unknown_grammar_and_admits_empty_membership() {
         runtime.cli_input.filter = Some("metadata:lang".into());
         let mut output = Vec::new();
         let result = runtime
-            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| {
+            .run_authority_search_with_writer_and_loader(&cx, &mut output, |_| async {
                 panic!("invalid filter loaded a model")
             })
             .await;

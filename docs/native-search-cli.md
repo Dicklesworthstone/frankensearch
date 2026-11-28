@@ -114,8 +114,11 @@ Native publication, updates and recovery remain available through
 `frankensearch-native`. Unsupported ordinary fsfs options are refused before
 model work, including daemon transport, query
 expansion and reranking. JSON, JSONL and TOON return the native result payload
-inside the normal fsfs envelope; table and CSV use the generic envelope
-rendering. The existing `fsfs explain` command is not a native rank-explanation
+inside the normal fsfs envelope. The default table shows ranked hits, scores,
+snippets and the selected generation. CSV emits one row per hit, with the
+document ID, title, source path, score provenance and available per-tier scores.
+Both formats identify the retained authority and, for historical queries, the
+head that authenticated it. The existing `fsfs explain` command is not a native rank-explanation
 adapter: the native fused result does not yet expose the original per-arm rank
 evidence needed by that command. The native CLI also supports source scopes
 and retained-source reranking.
