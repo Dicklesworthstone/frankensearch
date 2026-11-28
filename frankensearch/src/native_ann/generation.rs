@@ -1488,13 +1488,17 @@ impl NativeGenerationSnapshot {
         k: usize,
         pool: Option<BlockingPoolHandle>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        let quality = match self.topology() {
-            NativeGenerationTopology::PartialQuality { .. } => self.readers.partial_quality()?,
-            _ => self.readers.full_quality()?,
-        };
+        let quality = self.deferred_quality_owner()?;
         Ok(self
             .search_tier_progressive(cx, EmbedderTierTag::Fast, fast, text, k, pool)?
             .with_deferred_quality(quality))
+    }
+
+    pub(super) fn deferred_quality_owner(&self) -> SearchResult<&Arc<NativeAnnIndex>> {
+        match self.topology() {
+            NativeGenerationTopology::PartialQuality { .. } => self.readers.partial_quality(),
+            _ => self.readers.full_quality(),
+        }
     }
 
     /// Search the retained primary tier with vector traversal on the caller's
@@ -2276,8 +2280,28 @@ impl CompositeReaders {
                 .try_reserve_exact(live_count)
                 .map_err(|_| refused("source", "allocation-failed"))?;
         }
-        let mut seen_live = 0;
         let mut remaining_bytes = max_source_bytes;
+        self.visit_live_ids(cx, |id| {
+            if id.starts_with(prefix) {
+                documents.push(self.read_source_document(
+                    cx,
+                    &snapshot,
+                    field_ids,
+                    id,
+                    &mut remaining_bytes,
+                )?);
+            }
+            Ok(())
+        })?;
+        Ok(documents)
+    }
+
+    pub(super) fn visit_live_ids(
+        &self,
+        cx: &Cx,
+        mut visit: impl FnMut(&str) -> SearchResult<()>,
+    ) -> SearchResult<()> {
+        let mut seen_live = 0;
         for physical_row in 0..self.vector.owner.record_count() {
             checkpoint(cx, "native_ann.generation.source_row")?;
             let row = self
@@ -2285,26 +2309,15 @@ impl CompositeReaders {
                 .owner
                 .row(physical_row)
                 .map_err(|_| refused("source", "invalid-vector-row"))?;
-            if !row.flags().is_live() {
-                continue;
+            if row.flags().is_live() {
+                seen_live += 1;
+                visit(row.doc_id())?;
             }
-            seen_live += 1;
-            if !row.doc_id().starts_with(prefix) {
-                continue;
-            }
-            documents.push(self.read_source_document(
-                cx,
-                &snapshot,
-                field_ids,
-                row.doc_id(),
-                &mut remaining_bytes,
-            )?);
         }
-        if seen_live != live_count {
+        if seen_live != self.metadata.total_documents {
             return Err(refused("source", "live-count-mismatch"));
         }
-        checkpoint(cx, "native_ann.generation.source_complete")?;
-        Ok(documents)
+        checkpoint(cx, "native_ann.generation.source_complete")
     }
 
     pub(super) fn has_live_document(&self, id: &str) -> SearchResult<bool> {

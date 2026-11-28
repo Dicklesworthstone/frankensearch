@@ -66,6 +66,14 @@ pub struct NativeScopedHybridIndex<'a> {
 /// retains its existing approximate recall and physical-row semantics. This is
 /// query scoping, not revocation of a previously issued reader or scope.
 pub struct NativeScopedGenerationSnapshot {
+    query: NativeGenerationQueryScope,
+    documents: Arc<BTreeMap<String, IndexableDocument>>,
+}
+
+/// Search membership frozen from the live document IDs of one admitted generation.
+/// Building this scope reads only row identifiers. Stored fields remain on the
+/// snapshot and can be fetched separately for the returned hits.
+pub struct NativeGenerationQueryScope {
     snapshot: Arc<NativeGenerationSnapshot>,
     lexical: ScopedLexical<'static>,
 }
@@ -194,6 +202,30 @@ impl PreparedNativeGenerationScope {
 }
 
 impl NativeGenerationSnapshot {
+    /// Select live document IDs before lexical ranking, vector retrieval and fusion.
+    /// The predicate runs once per live row. Only matching IDs are retained.
+    /// This also supports schemas without the canonical stored source fields.
+    ///
+    /// # Errors
+    /// Propagates cancellation, invalid rows or inconsistent live counts.
+    pub fn scope_by_doc_id(
+        self: &Arc<Self>,
+        cx: &Cx,
+        mut accept: impl FnMut(&str) -> bool,
+    ) -> SearchResult<NativeGenerationQueryScope> {
+        let mut allowed = BTreeSet::new();
+        self.scope_readers().visit_live_ids(cx, |id| {
+            if accept(id) {
+                allowed.insert(id.to_owned());
+            }
+            Ok(())
+        })?;
+        Ok(NativeGenerationQueryScope::new(
+            Arc::clone(self),
+            Arc::new(allowed),
+        ))
+    }
+
     /// Freeze a source predicate over this exact retained authority generation.
     ///
     /// The complete source export must fit `max_source_bytes` before the first
@@ -385,7 +417,7 @@ impl NativeScopedGenerationPreview {
     #[must_use]
     pub fn document(&self, id: &str) -> Option<&IndexableDocument> {
         if self.lexical.allowed.contains(id) {
-            self.lexical.index.document(id)
+            self.lexical.index.cached_document(id)
         } else {
             None
         }
@@ -671,7 +703,7 @@ pub(in crate::native_ann) fn quality_provenance(
     Ok(())
 }
 
-impl NativeScopedGenerationSnapshot {
+impl NativeGenerationQueryScope {
     /// Lazily query exactly one tier inside this retained generation's scope.
     ///
     /// Membership is frozen before retrieval, fusion, hydration and optional
@@ -721,20 +753,33 @@ impl NativeScopedGenerationSnapshot {
         }
     }
 
-    fn from_membership(
-        snapshot: Arc<NativeGenerationSnapshot>,
-        membership: GenerationScopeMembership,
-    ) -> Self {
+    fn new(snapshot: Arc<NativeGenerationSnapshot>, allowed: Arc<BTreeSet<String>>) -> Self {
         Self {
             lexical: ScopedLexical {
-                index: ScopeSource::Authority {
-                    snapshot: Arc::clone(&snapshot),
-                    documents: membership.documents,
-                },
-                allowed: membership.allowed,
+                index: ScopeSource::Authority(Arc::clone(&snapshot)),
+                allowed,
             },
             snapshot,
         }
+    }
+
+    /// Start a scoped fast search and bind its retained quality owner after Initial.
+    /// Both phases use the same ID membership and lexical candidate window.
+    ///
+    /// # Errors
+    /// Refuses single-tier generations, mismatched producers and cancellation.
+    pub fn search_progressive_with_deferred_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let quality = self.snapshot.deferred_quality_owner()?;
+        Ok(self
+            .search_tier_progressive(cx, EmbedderTierTag::Fast, fast, text, k, pool)?
+            .with_deferred_quality(quality))
     }
 
     /// Number of source documents eligible in this scope, not query matches.
@@ -749,11 +794,84 @@ impl NativeScopedGenerationSnapshot {
         self.lexical.allowed.is_empty()
     }
 
+    /// Search this frozen source scope using only retained lexical scores.
+    ///
+    /// Membership is applied before the result limit, including when excluded
+    /// documents occupy the entire initial candidate window. The immutable
+    /// Quill reader may widen through the complete cohort to fill a selective
+    /// scope; only the final window's snapshot is used for winner hydration.
+    /// No model, vector scoring, source export or predicate evaluation runs.
+    /// Returned results retain raw BM25 scores and have no vector addresses or
+    /// semantic scores. Empty scopes and zero limits still check cancellation.
+    ///
+    /// # Errors
+    /// Propagates lexical query, hydration and cancellation failures, or an
+    /// inconsistent result outside the retained live cohort or frozen scope.
+    pub async fn search_lexical_text(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.snapshot
+            .scoped_lexical_text(cx, &self.lexical, text, k.min(self.len()))
+            .await
+    }
+}
+
+impl NativeScopedGenerationSnapshot {
+    /// Borrow the frozen ID membership for retrieval, including deferred quality.
+    /// The source-backed scope continues to own its stored documents.
+    #[must_use]
+    pub const fn query_scope(&self) -> &NativeGenerationQueryScope {
+        &self.query
+    }
+
+    /// Search one tier inside the frozen source membership.
+    ///
+    /// # Errors
+    /// Propagates the identity, topology, budget and cancellation errors of
+    /// [`NativeGenerationQueryScope::search_tier_progressive`].
+    pub fn search_tier_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        tier: EmbedderTierTag,
+        embedder: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.query
+            .search_tier_progressive(cx, tier, embedder, text, k, pool)
+    }
+
+    fn from_membership(
+        snapshot: Arc<NativeGenerationSnapshot>,
+        membership: GenerationScopeMembership,
+    ) -> Self {
+        Self {
+            query: NativeGenerationQueryScope::new(snapshot, membership.allowed),
+            documents: membership.documents,
+        }
+    }
+
+    /// Number of source documents eligible in this scope, not query matches.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.query.len()
+    }
+
+    /// Whether no source document is eligible.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
     /// Resolve an eligible document from this scope's original source inventory.
     #[must_use]
     pub fn document(&self, id: &str) -> Option<&IndexableDocument> {
-        if self.lexical.allowed.contains(id) {
-            self.lexical.index.document(id)
+        if self.query.lexical.allowed.contains(id) {
+            self.documents.get(id)
         } else {
             None
         }
@@ -776,9 +894,9 @@ impl NativeScopedGenerationSnapshot {
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.generation_scope.narrow")?;
         let mut allowed = BTreeSet::new();
-        for id in self.lexical.allowed.iter() {
+        for id in self.query.lexical.allowed.iter() {
             checkpoint(cx, "native_ann.generation_scope.narrow_document")?;
-            let document = self.lexical.index.document(id).ok_or_else(|| {
+            let document = self.documents.get(id).ok_or_else(|| {
                 invalid(
                     "scope.source",
                     "missing-document",
@@ -793,11 +911,11 @@ impl NativeScopedGenerationSnapshot {
         }
         checkpoint(cx, "native_ann.generation_scope.narrow_complete")?;
         Ok(Self {
-            snapshot: Arc::clone(&self.snapshot),
-            lexical: ScopedLexical {
-                index: self.lexical.index.clone(),
-                allowed: Arc::new(allowed),
-            },
+            query: NativeGenerationQueryScope::new(
+                Arc::clone(&self.query.snapshot),
+                Arc::new(allowed),
+            ),
+            documents: Arc::clone(&self.documents),
         })
     }
 
@@ -818,16 +936,16 @@ impl NativeScopedGenerationSnapshot {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let mut results = collect(self.snapshot.scoped_progressive(
+        let mut results = collect(self.query.snapshot.scoped_progressive(
             cx,
             embedder,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k.min(self.len()),
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
         )?)
         .await?;
-        if self.snapshot.tier() == EmbedderTierTag::Quality {
+        if self.query.snapshot.tier() == EmbedderTierTag::Quality {
             for result in &mut results {
                 checkpoint(cx, "native_ann.generation_scope.quality_result")?;
                 if let Some(score) = result.fast_score.take() {
@@ -856,19 +974,19 @@ impl NativeScopedGenerationSnapshot {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let mut results = collect(self.snapshot.scoped_progressive_on_pool(
+        let mut results = collect(self.query.snapshot.scoped_progressive_on_pool(
             cx,
             embedder,
             None,
             false,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
             pool,
         )?)
         .await?;
-        if self.snapshot.tier() == EmbedderTierTag::Quality {
+        if self.query.snapshot.tier() == EmbedderTierTag::Quality {
             quality_provenance(cx, &mut results)?;
         }
         Ok(results)
@@ -891,13 +1009,13 @@ impl NativeScopedGenerationSnapshot {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let mut results = collect(self.snapshot.scoped_quality_progressive(
+        let mut results = collect(self.query.snapshot.scoped_quality_progressive(
             cx,
             embedder,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
         )?)
         .await?;
         for result in &mut results {
@@ -926,15 +1044,15 @@ impl NativeScopedGenerationSnapshot {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<Vec<ScoredResult>> {
-        let mut results = collect(self.snapshot.scoped_progressive_on_pool(
+        let mut results = collect(self.query.snapshot.scoped_progressive_on_pool(
             cx,
             embedder,
             None,
             true,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
             pool,
         )?)
         .await?;
@@ -997,14 +1115,14 @@ impl NativeScopedGenerationSnapshot {
         text: &'a str,
         k: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.snapshot.scoped_progressive_with_quality(
+        self.query.snapshot.scoped_progressive_with_quality(
             cx,
             fast,
             quality,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
         )
     }
 
@@ -1024,15 +1142,15 @@ impl NativeScopedGenerationSnapshot {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.snapshot.scoped_progressive_on_pool(
+        self.query.snapshot.scoped_progressive_on_pool(
             cx,
             fast,
             Some(quality),
             false,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
             pool,
         )
     }
@@ -1054,14 +1172,14 @@ impl NativeScopedGenerationSnapshot {
         text: &'a str,
         k: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.snapshot.scoped_partial_quality_progressive(
+        self.query.snapshot.scoped_partial_quality_progressive(
             cx,
             fast,
             quality,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
             None,
         )
     }
@@ -1080,40 +1198,30 @@ impl NativeScopedGenerationSnapshot {
         k: usize,
         pool: BlockingPoolHandle,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.snapshot.scoped_partial_quality_progressive(
+        self.query.snapshot.scoped_partial_quality_progressive(
             cx,
             fast,
             quality,
-            &self.lexical,
+            &self.query.lexical,
             text,
             k,
-            Arc::clone(&self.lexical.allowed),
+            Arc::clone(&self.query.lexical.allowed),
             Some(pool),
         )
     }
 
-    /// Search this frozen source scope using only retained lexical scores.
-    ///
-    /// Membership is applied before the result limit, including when excluded
-    /// documents occupy the entire initial candidate window. The immutable
-    /// Quill reader may widen through the complete cohort to fill a selective
-    /// scope; only the final window's snapshot is used for winner hydration.
-    /// No model, vector scoring, source export or predicate evaluation runs.
-    /// Returned results retain raw BM25 scores and have no vector addresses or
-    /// semantic scores. Empty scopes and zero limits still check cancellation.
+    /// Search the frozen source membership using retained lexical scores.
     ///
     /// # Errors
-    /// Propagates lexical query, hydration and cancellation failures, or an
-    /// inconsistent result outside the retained live cohort or frozen scope.
+    /// Propagates retrieval, hydration and cancellation errors from
+    /// [`NativeGenerationQueryScope::search_lexical_text`].
     pub async fn search_lexical_text(
         &self,
         cx: &Cx,
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        self.snapshot
-            .scoped_lexical_text(cx, &self.lexical, text, k.min(self.len()))
-            .await
+        self.query.search_lexical_text(cx, text, k).await
     }
 }
 
@@ -1500,10 +1608,7 @@ async fn collect(mut stream: NativeProgressiveSearch<'_>) -> SearchResult<Vec<Sc
 enum ScopeSource<'a> {
     Single(&'a NativeBuiltHybridIndex),
     Sharded(&'a NativeBuiltShardedHybridIndex),
-    Authority {
-        snapshot: Arc<NativeGenerationSnapshot>,
-        documents: Arc<BTreeMap<String, IndexableDocument>>,
-    },
+    Authority(Arc<NativeGenerationSnapshot>),
     Preview {
         preview: Arc<NativeGenerationPreview>,
         documents: Arc<BTreeMap<String, IndexableDocument>>,
@@ -1515,7 +1620,7 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.lexical(),
             Self::Sharded(index) => index.lexical(),
-            Self::Authority { snapshot, .. } => snapshot.scoped_lexical(),
+            Self::Authority(snapshot) => snapshot.scoped_lexical(),
             Self::Preview { preview, .. } => preview.scoped_lexical(),
         }
     }
@@ -1526,7 +1631,7 @@ impl ScopeSource<'_> {
         let count = match self {
             Self::Single(index) => return Ok(index.vectors().documents().len()),
             Self::Sharded(index) => return Ok(index.vectors().document_count()),
-            Self::Authority { snapshot, .. } => snapshot.metadata().total_documents,
+            Self::Authority(snapshot) => snapshot.metadata().total_documents,
             Self::Preview { preview, .. } => preview.metadata().total_documents,
         };
         usize::try_from(count)
@@ -1535,19 +1640,18 @@ impl ScopeSource<'_> {
 
     fn has_live_document(&self, id: &str) -> SearchResult<bool> {
         match self {
-            Self::Authority { snapshot, .. } => snapshot.scope_readers().has_live_document(id),
+            Self::Authority(snapshot) => snapshot.scope_readers().has_live_document(id),
             Self::Preview { preview, .. } => preview.scope_readers().has_live_document(id),
-            Self::Single(_) | Self::Sharded(_) => Ok(self.document(id).is_some()),
+            Self::Single(_) | Self::Sharded(_) => Ok(self.cached_document(id).is_some()),
         }
     }
 
-    fn document(&self, id: &str) -> Option<&IndexableDocument> {
+    fn cached_document(&self, id: &str) -> Option<&IndexableDocument> {
         match self {
             Self::Single(index) => index.vectors().document(id),
             Self::Sharded(index) => index.vectors().document(id),
-            Self::Authority { documents, .. } | Self::Preview { documents, .. } => {
-                documents.get(id)
-            }
+            Self::Authority(_) => None,
+            Self::Preview { documents, .. } => documents.get(id),
         }
     }
 }

@@ -8233,9 +8233,20 @@ mod qualified_rollback {
                     .filter(|hit| hit.doc_id.starts_with("included-"))
                     .collect();
                 assert_eq!(expected_keyword.len(), 2);
+                let mut visited_ids = Vec::new();
+                let id_scope = retained
+                    .scope_by_doc_id(&cx, |id| {
+                        visited_ids.push(id.to_owned());
+                        id.starts_with("included-")
+                    })
+                    .unwrap();
+                assert_eq!(visited_ids.len(), documents.len());
+                assert_eq!(id_scope.len(), 2);
                 for k in [1, 2, usize::MAX] {
                     let expected = &expected_keyword[..k.min(expected_keyword.len())];
                     let keyword = scope.search_lexical_text(&cx, "needle", k).await.unwrap();
+                    assert_same_scored_results(&keyword, expected);
+                    let keyword = id_scope.search_lexical_text(&cx, "needle", k).await.unwrap();
                     assert_same_scored_results(&keyword, expected);
                     assert_same_scored_results(
                         &prepared_scope
@@ -8259,6 +8270,13 @@ mod qualified_rollback {
                     .await
                     .unwrap();
                 assert_eq!(filtered.len(), 2);
+                let id_filtered = id_scope
+                    .search_tier_progressive(&cx, tier, provider.as_ref(), "needle", 2, None)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_same_scored_results(&id_filtered, &filtered);
                 assert_same_scored_results(
                     &prepared_scope
                         .search_text(&cx, provider.as_ref(), "needle", 2)
